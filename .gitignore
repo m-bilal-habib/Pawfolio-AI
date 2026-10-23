@@ -1,4 +1,5 @@
 # User specific & specs
+VoxSOAP_UI_TrackA.md
 VoxSOAP_Guard.md
 Gemini.md
 
@@ -66,3 +67,5 @@ desktop.ini
 *.tmp
 *.temp
 *.bak
+
+rea-evidence/

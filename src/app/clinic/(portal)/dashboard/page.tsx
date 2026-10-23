@@ -4,6 +4,7 @@ import { motion } from "framer-motion";
 import { CalendarDays, ClipboardList, ListTodo, Sparkles, Users } from "lucide-react";
 import Link from "next/link";
 import { AIDraftPanel } from "@/components/cards";
+import { DashboardRecordButton } from "@/components/vox-soap/DashboardRecordButton";
 import { EmptyState, StatCard, staggerChild, staggerParent } from "@/components/ui";
 import { roleDisplayName, useAuth } from "@/lib/auth";
 import { aiDrafts, appointments, careTasks, intakeTasks, registrationQueue } from "@/lib/data";
@@ -123,6 +124,11 @@ export default function ClinicDashboard() {
           )}
         </div>
       </div>
+
+      {/* Scribenote-style one-tap voice recording entry (opens the capture-
+          hardened New Recording panel; routes to the VoxSOAP workspace for
+          review on completion). Hidden for Receptionists per FR-6. */}
+      <DashboardRecordButton />
     </div>
   );
 }
