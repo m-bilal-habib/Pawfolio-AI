@@ -597,7 +597,7 @@ export const UploadAudioPanel: React.FC<{
                 'the AI service could not finish this audio within its retry budget.'}{' '}
               — every key and model candidate was already tried automatically. Press{' '}
               <span className="font-bold">↻ Retry transcription</span> to re-send this exact file
-              without recording anything again — brief demand spikes on Google's side usually
+              without recording anything again — brief demand spikes on Google&apos;s side usually
               clear within minutes, and the retry lands on whichever model is serving.
             </div>
           )}

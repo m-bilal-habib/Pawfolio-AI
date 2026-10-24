@@ -33,7 +33,7 @@ const ALLOWED_TAGS = new Set([
 export function sanitizeRichTextHtml(html: string): string {
   return String(html ?? '')
     .replace(/<(script|style|iframe|object|embed|svg)\b[\s\S]*?<\/\1>/gi, '')
-    .replace(/<([a-zA-Z0-9]+)([^>]*)>/g, (_m, tag: string, _attrs: string) => {
+    .replace(/<([a-zA-Z0-9]+)([^>]*)>/g, (_m, tag: string) => {
       const t = tag.toLowerCase();
       if (t === 'br' || t === 'hr') return t === 'br' ? '<br>' : '';
       return ALLOWED_TAGS.has(t) ? `<${t}>` : '';

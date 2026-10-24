@@ -222,7 +222,6 @@ export function RichTextEditor(props: {
   minHeight?: number;
 }) {
   const {
-    sectionKey,
     sectionLabel,
     initialHtml,
     readOnly = false,

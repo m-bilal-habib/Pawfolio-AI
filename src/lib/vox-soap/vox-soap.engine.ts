@@ -11,6 +11,7 @@ import {
   GroundedSoapExtractionSchema,
 } from './vox-soap.schema';
 import {
+  PatientSnapshotContext,
   StaffSessionContext,
   VoxSoapVisitRecord,
 } from './vox-soap.types';
