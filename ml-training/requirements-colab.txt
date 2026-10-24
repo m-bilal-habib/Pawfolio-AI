@@ -1,14 +1,10 @@
 # Pinned Colab training dependencies for the VoxSOAP ML experiment
 # (feature/voxsoap-model-integration.md §7.1.5).
 #
-# Install EXACTLY these versions in the notebook (Stage 2). Do not upgrade
-# packages mid-run after a successful experiment. The notebook prints every
-# installed version into the run manifest so results stay reproducible.
-#
-# These pins were recorded 2026-01 while planning (peft 0.18.1 released
-# 2026-01-09 per PyPI). Colab preinstalls its own torch stack — the notebook
-# verifies torch/CUDA compatibility and FAILS CLEARLY on any resolver error
-# instead of silently continuing.
+# Install EXACTLY these versions in the notebook (Stage 2 reads THIS FILE -
+# single source of truth). Every pin below was verified to exist on PyPI on
+# 2026-10-24 via the registry JSON API (this caught two pins that never
+# existed: jiwer==3.1.1, librosa==0.10.4).
 
 transformers==4.48.3
 datasets==3.3.2
@@ -16,21 +12,26 @@ accelerate==1.3.0
 peft==0.18.1
 evaluate==0.4.3
 jiwer==3.1.0
-librosa==0.10.4
-soundfile==0.12.1
+librosa==0.10.2.post1
+soundfile==0.13.1
 sentencepiece==0.2.0
 protobuf==5.29.3
-bitsandbytes==0.45.0
+bitsandbytes==0.49.2
 
-# Notes:
-# - jiwer 3.1.1 does NOT exist on PyPI (confirmed by the first Colab smoke run
-#   on 2026-10-24; only 3.1.0 exists in the 3.1 line) - pinned to 3.1.0.
+# Pin rationale (verified on PyPI 2026-10-24, release dates in brackets):
+# - transformers 4.48.3 [2025-02] is contemporary with the 0.45.x bitsandbytes
+#   line; peft 0.18.1 [2026-01] is contemporary with the 0.49.x line.
+# - bitsandbytes: 0.45.0 -> 0.49.2 because Colab's torch is 2.11.0+cu130 and
+#   0.49.2 [2026-02] is the newest release from the peft-0.18.1 era. Still
+#   UNVERIFIED at runtime until Stage 12 of the next notebook run - if it
+#   fails, record the error and re-pin against the newest release (0.50.2).
+# - librosa 0.10.2.post1 [2024-05]: 0.10.4 was never published on PyPI
+#   (registry 404; the librosa line jumps 0.10.2.post1 -> 0.11.0), and the
+#   1.0.0 major [2026-08] is intentionally NOT pinned.
+# - soundfile 0.12.1 -> 0.13.1 [2025-01]: FLAC decode (FLEURS) is proven on
+#   the 0.13.x line by notebook Stages 6/7 (runs 2-3).
 # - torch/torchaudio come from the Colab preinstalled GPU image; we do NOT
 #   pin them here to avoid breaking the preinstalled CUDA build.
 # - bitsandbytes is Linux/Colab-only (QLoRA). It is intentionally absent from
 #   any Windows/local requirements until a serving target is chosen (Phase 4).
-# - 0.45.0 vs Colab's torch 2.11.0+cu130 is an UNVERIFIED combination (runs 1-2
-#   never got here because pip aborted earlier). If Stage 12 reports a
-#   bitsandbytes runtime error, bump this pin to the latest release and re-run
-#   Stage 2; record the decision in the run report.
-# - huggingface_hub is installed transitively with transformers.
+# - huggingface_hub is installed transitively with transformers/datasets.

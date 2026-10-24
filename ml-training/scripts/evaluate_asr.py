@@ -51,12 +51,18 @@ def normalize_for_wer(text: str) -> str:
 
 
 def load_eval_rows(path: str, cap: Optional[int]) -> List[Dict[str, Any]]:
-    from datasets import load_from_disk
+    from datasets import Audio, load_from_disk
 
     if not os.path.exists(path):
         print(f"[EVAL-SKIP] prepared eval dataset missing: {path} - run the ASR prep stage first.")
         sys.exit(2)
     ds = load_from_disk(path)
+    # Same decode rule as training: raw bytes via decode=False + our soundfile
+    # decode, independent of the installed datasets major.
+    try:
+        ds = ds.cast_column("audio", Audio(decode=False))
+    except Exception as cast_err:
+        print(f"[EVAL-WARN] cast_column(audio, decode=False) failed ({cast_err}); keeping default decoding.")
     rows = [dict(r) for r in ds]
     if cap:
         rows = rows[:cap]

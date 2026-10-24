@@ -109,11 +109,20 @@ def ensure_audio_dict(audio: Any) -> Optional[Dict[str, Any]]:
 
 
 def validate_prepared_dataset(path: str, split_name: str) -> Any:
-    from datasets import load_from_disk
+    from datasets import Audio, load_from_disk
 
     if not os.path.exists(path):
         hard_fail(f"Prepared dataset '{split_name}' missing at {path} - run the prep stage first.")
     ds = load_from_disk(path)
+    # Read audio as RAW BYTES (decode=False) and decode through the SAME
+    # soundfile path the prep stage used. Datasets majors disagree on decoded
+    # audio shapes and newer majors hand back lazy decoder objects even for
+    # load_from_disk rows (observed in runs 2-3) - do not leave row decoding
+    # to the installed datasets version.
+    try:
+        ds = ds.cast_column("audio", Audio(decode=False))
+    except Exception as cast_err:
+        print(f"[WARN] cast_column(audio, decode=False) failed ({cast_err}); keeping default decoding.")
     missing = REQUIRED_COLUMNS - set(ds.column_names)
     if missing:
         hard_fail(f"Prepared dataset '{split_name}' is missing columns {sorted(missing)}: found {ds.column_names}")
