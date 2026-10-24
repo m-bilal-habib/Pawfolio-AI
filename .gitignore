@@ -69,3 +69,15 @@ desktop.ini
 *.bak
 
 rea-evidence/
+
+# ML training & inference artifacts — weights, raw audio, datasets, caches,
+# checkpoints and export archives are NEVER committed (feature contract §6).
+ml-training/artifacts/
+ml-training/data/
+ml-training/cache/
+ml-training/checkpoints/
+ml-service/models/
+*.safetensors
+*.pt
+*.onnx
+*.ckpt

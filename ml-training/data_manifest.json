@@ -1,0 +1,118 @@
+{
+  "$schema_note": "Pawfolio AI VoxSOAP ML data manifest (feature/voxsoap-model-integration.md §4.7). This file is the PLANNING-TIME manifest. The Colab notebook (Stage 4) rewrites it at runtime with the exact Hub revision SHA, live license strings, discovered split names/fields, and actual row counts. A source whose status is BLOCKED_LICENSE_REVIEW or SKIP_PERMISSION_NOT_VERIFIED must not be used for training, model selection, or a released model.",
+  "manifest_version": 1,
+  "created_phase": "Phase 1 (training assets and dataset audit)",
+  "created_by": "coding agent per approved Phase 0 gate, 2026-01",
+  "runtime_verification": {
+    "status": "NOT EXECUTED",
+    "note": "All 'planning_time' values below come from the dataset metadata reviewed while planning the feature document; they are NOT substituted for a live check. inspect_datasets.py / the notebook Stage 4 must capture hub_revision_sha and re-verify every card before any training stage."
+  },
+  "gates_policy": {
+    "allowed_status_values": ["APPROVED", "APPROVED_OPTIONAL", "BLOCKED_LICENSE_REVIEW", "SKIP_PERMISSION_NOT_VERIFIED"],
+    "rule": "A dataset is usable only with APPROVED (or APPROVED_OPTIONAL and explicitly included) status recorded for the CURRENT hub revision. Only the project owner may upgrade a BLOCKED/SKIP status after verifying the license/permission themselves; the agent records, never authorizes."
+  },
+  "sources": [
+    {
+      "dataset_id": "Tushar9802/medscribe-soap-712",
+      "url": "https://huggingface.co/datasets/Tushar9802/medscribe-soap-712",
+      "purpose": "Small starting corpus of English medical encounter-to-SOAP examples for experimenting with structured, source-grounded SOAP formatting and explicit treatment of undocumented details.",
+      "planning_time": {
+        "license_statement": "MIT (per dataset card at planning time)",
+        "reported_splits": "separate train/validation/test files/splits",
+        "reported_fields": "encounter text and structured SOAP; EXACT split names and column names NOT verified yet",
+        "row_count": "~712 total per card (verify at runtime)"
+      },
+      "hub_revision_sha": "TO_CAPTURE_AT_RUNTIME",
+      "license_status": "APPROVED",
+      "license_status_note": "Engineering prototype only, and only after inspect_datasets.py re-verifies the card/license/splits at the training revision.",
+      "domain_mismatch": "HUMAN medical data, not veterinary. Usable to test FORMAT behavior only. A model trained on this alone must NOT be described as a veterinary model, and cannot validate veterinary medical knowledge or clinical suitability.",
+      "attribution": "Recorded at runtime from the card; MIT requires license inclusion in any redistribution.",
+      "role": { "train": "yes", "validation": "yes", "final_test": "respected from the official test split; never merged into training" },
+      "rows_consumed": { "status": "NOT EXECUTED" },
+      "transformations": "Mapped to the normalized {input, target, source_dataset, source_split, source_row_id} schema by prepare_soap_data.py after runtime field discovery; no ground-truth rewriting."
+    },
+    {
+      "dataset_id": "omi-health/medical-dialogue-to-soap-summary",
+      "url": "https://huggingface.co/datasets/omi-health/medical-dialogue-to-soap-summary",
+      "purpose": "Synthetic doctor/patient dialogue mapped to SOAP-like summaries (larger alternative SOAP source).",
+      "planning_time": {
+        "license_statement": "Card reports 9,250 train / 500 validation / 250 test and mentions permission from the original NoteChat dataset authors is required for further use",
+        "reported_fields": "dialogue, soap, prompt, messages, messages_nosystem (verify at runtime)"
+      },
+      "hub_revision_sha": "TO_CAPTURE_AT_RUNTIME",
+      "license_status": "SKIP_PERMISSION_NOT_VERIFIED",
+      "license_status_note": "MANDATORY permission gate. Departed until the project owner confirms and records permission from the original NoteChat authors. Training, model-selection evaluation, and released models must not use it.",
+      "domain_mismatch": "Human medical, synthetic dialogue; same veterinary mismatch as all SOAP sources.",
+      "role": { "train": "NO", "validation": "NO", "final_test": "NO" },
+      "rows_consumed": { "status": "BLOCKED — 0 rows used" }
+    },
+    {
+      "dataset_id": "UmarRamzan/common-voice-urdu-processed",
+      "url": "https://huggingface.co/datasets/UmarRamzan/common-voice-urdu-processed",
+      "purpose": "Audio/transcript pairs for Urdu ASR.",
+      "planning_time": {
+        "license_statement": "The derived dataset page did NOT clearly display a license in the metadata seen during planning",
+        "reported_fields": "audio, sentence, path, variant; ~9.4k rows in the train viewer (verify at runtime)"
+      },
+      "hub_revision_sha": "TO_CAPTURE_AT_RUNTIME",
+      "license_status": "BLOCKED_LICENSE_REVIEW",
+      "license_status_note": "Do not assume a license from the fact that the data is public. The derivative's terms AND the underlying Mozilla Common Voice terms must be verified. Until then this source is excluded from all training stages (first pipeline tests run on google/fleurs).",
+      "domain_mismatch": "General-domain speech; not veterinary recordings (no medication brands/dosages/code-switch guarantee).",
+      "role": { "train": "NO until license verified", "validation": "NO until license verified", "final_test": "NO until license verified" },
+      "rows_consumed": { "status": "BLOCKED — 0 rows used" }
+    },
+    {
+      "dataset_id": "google/fleurs",
+      "url": "https://huggingface.co/datasets/google/fleurs",
+      "purpose": "Licensed audio/transcript pairs for Urdu (Pakistan) and US-English ASR; default source for the first pipeline smoke test and held-out measurement.",
+      "planning_time": {
+        "license_statement": "CC-BY-4.0 (per dataset card at planning time)",
+        "reported_configs": "ur_pk and en_us (confirm both exist in the current revision before training)",
+        "reported_splits": "train / validation / test (confirm actual names at runtime)"
+      },
+      "hub_revision_sha": "TO_CAPTURE_AT_RUNTIME",
+      "license_status": "APPROVED",
+      "license_status_note": "Pending runtime confirmation of the card and the two config names. REQUIRED attribution: CC-BY-4.0 attribution text must be carried in the training manifest and any redistribution.",
+      "domain_mismatch": "General speech corpus (narrations), not veterinary appointment recordings; alone it does not prove recognition of medication brands, dosages, or Urdu-English code-switching.",
+      "role": { "train": "capped subsets only (start tiny)", "validation": "official validation split for tuning decisions", "final_test": "official test split stays untouched until final measurement" },
+      "rows_consumed": { "status": "NOT EXECUTED" },
+      "transformations": "Audio decoded/resampled to the model's expected format by the processor; transcripts kept verbatim (no auto-correction)."
+    },
+    {
+      "dataset_id": "Mavkif/Roman-Urdu-Parl-split",
+      "url": "https://huggingface.co/datasets/Mavkif/Roman-Urdu-Parl-split",
+      "purpose": "Paired Urdu-script / Roman-Urdu text for the SEPARATE transliteration/normalization task (Model C).",
+      "planning_time": {
+        "license_statement": "Apache-2.0 (per card at planning time)",
+        "reported_fields": "paired 'Urdu text' and 'Roman-Urdu text' columns; ~6.33M rows in the train viewer; CSV files; LARGE repository"
+      },
+      "hub_revision_sha": "TO_CAPTURE_AT_RUNTIME",
+      "license_status": "APPROVED",
+      "license_status_note": "MUST be streamed (never load the full CSV into memory/pandas). Only small capped subsets per official split; preserve the provided train/validation/test strategy. Runtime re-verification required.",
+      "domain_mismatch": "General/parliamentary text — may not reflect natural veterinary speech; name/medicine transliteration behavior must be evaluated separately by a fluent speaker before relying on it.",
+      "role": { "train": "capped subset, separate task files only", "validation": "official split", "final_test": "official split only" },
+      "rows_consumed": { "status": "NOT EXECUTED" },
+      "transformations": "Whitespace normalization only (must not strip meaningful Urdu characters, punctuation, or medicine names). No fake aligned audio/transcript pairs are ever created from this data."
+    },
+    {
+      "dataset_id": "Redgerd/roman-urdu-alpaca-qa-mix",
+      "url": "https://huggingface.co/datasets/Redgerd/roman-urdu-alpaca-qa-mix",
+      "purpose": "OPTIONAL supplementary instruction/QA experiment for text normalization. NOT for the first release by default.",
+      "planning_time": {
+        "license_statement": "Apache-2.0; ~1,489 rows; typical fields instruction/input/output (verify actual record keys before mapping)",
+        "constraints": "Not an audio/transcript dataset and not a clean Urdu-to-Roman parallel set. Training on it must never be claimed to make Whisper transcribe audio in Roman Urdu."
+      },
+      "hub_revision_sha": "TO_CAPTURE_AT_RUNTIME",
+      "license_status": "APPROVED_OPTIONAL",
+      "license_status_note": "Excluded from the first release. If included in a later experiment, its contribution must be recorded separately in the run manifest.",
+      "domain_mismatch": "Mixed instruction text; veterinary mismatch plus not speech-parallel data.",
+      "role": { "train": "optional separate experiment only", "validation": "within its own experiment", "final_test": "none" },
+      "rows_consumed": { "status": "NOT EXECUTED (default: excluded)" }
+    }
+  ],
+  "veterinary_benchmark": {
+    "status": "TO BE PROVIDED BY PROJECT OWNER",
+    "note": "Public general corpora are not adequate to evaluate the final Pawfolio task (§8.3). A separate synthetic/de-identified veterinary consultation set (English, Urdu, code-switching, meds/doses/negation, missing vitals, noise, cat/dog cases) must be reviewed by a qualified veterinarian BEFORE being used as a benchmark, and must be kept out of training. The dataset pipeline must not ingest real Pawfolio patient records by default."
+  },
+  "runtime_instructions": "Stage 4 of ml-training/notebooks/voxsoap_ml_training.ipynb captures hub revisions, licenses, splits, and fields into ml-training/reports/data_manifest_runtime.json (or overwrites this file when --in-place is passed) and aborts any training stage whose gate is not APPROVED/APPROVED_OPTIONAL for the current revision."
+}
