@@ -88,6 +88,10 @@ Scripts are independently runnable on a GPU machine (see each file's docstring h
 
 ## Honest status — read before citing anything
 
+- **Phase 1 gate (2026-10-24): CONFIRMED by owner** — model candidates: `openai/whisper-small` + LoRA (ASR),
+  `Qwen/Qwen2.5-3B-Instruct` + QLoRA NF4 (SOAP drafts); constraint: free-tier Colab, zero spend.
+  `omi-health/...` (permission) and `UmarRamzan/common-voice-urdu-processed` (license) stay blocked until
+  the owner verifies and records them via `inspect_datasets.py --record-license-decision`.
 - [ ] Notebook: **NOT EXECUTED** by the coding agent (no Colab access from the feature workspace).
 - [ ] No training has happened; there are **no model artifacts** anywhere in this repo.
 - [ ] `evaluate_asr`/`evaluate_soap` numbers: **none exist yet** — nothing was fabricated.
