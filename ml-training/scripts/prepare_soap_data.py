@@ -59,11 +59,65 @@ def normalize_text(text: str) -> str:
     return re.sub(r"\s+", " ", str(text or "")).strip()
 
 
-def stable_row_id(dataset_id: str, split: str, row: Dict[str, Any], fields: Tuple[str, str]) -> str:
+def stable_row_id(dataset_id: str, split: str, row: Dict[str, Any], fields: Optional[Tuple[str, str]]) -> str:
     """Deterministic, non-sensitive row identifier for the manifest."""
-    joined = "|".join(str(row.get(f, "")) for f in fields) or str(sorted(row.items()))
+    if fields is not None:
+        joined = "|".join(str(row.get(f, "")) for f in fields)
+    else:
+        # chat format: hash the serialized message structure (no raw text reuse)
+        joined = json.dumps(row.get("messages"), ensure_ascii=False, default=str)[:2048]
     digest = hashlib.sha256(f"{dataset_id}|{split}|{joined}".encode("utf-8")).hexdigest()
     return digest[:16]
+
+
+def flatten_content(content: Any) -> str:
+    """Chat `content` may be a plain string or a list of typed parts."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: List[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                text = item.get("text", item.get("content", ""))
+                if isinstance(text, str):
+                    parts.append(text)
+        return "\n".join(parts)
+    return str(content or "")
+
+
+def extract_chat_pair(messages: Any) -> Optional[Tuple[str, str]]:
+    """Map a chat-style example to (user-turn input, assistant-turn target).
+
+    The MedScribe corpus exposes ONLY a `messages` column (observed live in the
+    2026-10-24 smoke run: keys == ['messages']). Standard layout is a list of
+    {role, content} items; user turns become the encounter text and assistant
+    turns become the SOAP draft. Missing halves reject the row explicitly.
+    """
+    if messages is None or not isinstance(messages, list):
+        return None
+    user_parts: List[str] = []
+    assistant_parts: List[str] = []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        role = str(msg.get("role", "")).lower()
+        content = flatten_content(msg.get("content", "")).strip()
+        if not content:
+            continue
+        if role == "user":
+            user_parts.append(content)
+        elif role == "assistant":
+            assistant_parts.append(content)
+    if not user_parts or not assistant_parts:
+        return None
+    return "\n".join(user_parts).strip(), "\n".join(assistant_parts).strip()
+
+
+def is_chat_messages_produce(probe: Dict[str, Any]) -> bool:
+    msgs = probe.get("messages")
+    return isinstance(msgs, list) and len(msgs) > 0
 
 
 def discover_fields(sample: Dict[str, Any]) -> Optional[Tuple[str, str]]:
@@ -97,7 +151,8 @@ def quality_gate(text: str, split: str, counters: Dict[str, int]) -> bool:
 def process_split(
     dataset_id: str,
     split: str,
-    fields: Tuple[str, str],
+    chat_mode: bool,
+    fields: Optional[Tuple[str, str]],
     caps: Dict[str, int],
     seen_hashes: set,
     rng: random.Random,
@@ -118,10 +173,16 @@ def process_split(
         if caps.get(split) and taken >= caps[split]:
             break
         try:
-            raw_in, raw_tgt = row.get(fields[0]), row.get(fields[1])
-            if not isinstance(raw_in, str) or not isinstance(raw_tgt, str):
-                raise ValueError("fields missing or non-text")
-            src_text, tgt_text = normalize_text(raw_in), normalize_text(raw_tgt)
+            if chat_mode:
+                pair = extract_chat_pair(row.get("messages"))
+                if pair is None:
+                    raise ValueError("chat row missing user/assistant halves")
+                src_text, tgt_text = normalize_text(pair[0]), normalize_text(pair[1])
+            else:
+                raw_in, raw_tgt = row.get((fields or ("input", "target"))[0]), row.get((fields or ("input", "target"))[1])
+                if not isinstance(raw_in, str) or not isinstance(raw_tgt, str):
+                    raise ValueError("fields missing or non-text")
+                src_text, tgt_text = normalize_text(raw_in), normalize_text(raw_tgt)
             pair = f"{src_text}\n@@SOAP@@\n{tgt_text}"
             digest = hashlib.sha256(pair.encode("utf-8")).hexdigest()
             if digest in seen_hashes:
@@ -203,12 +264,38 @@ def main() -> int:
     if probe is None:
         print("[DATA-ERROR] could not read a single record - verify dataset id/split.")
         return 2
-    fields = discover_fields(probe)
-    if fields is None:
-        print(f"[DATA-ERROR] no input/target text fields discovered. Keys: {list(probe.keys())}")
-        return 2
-    print(f"[DISCOVER] mapping input='{fields[0]}' target='{fields[1]}' - verify with a sample below")
-    print(json.dumps({k: str(probe[k])[:160] for k in probe}, ensure_ascii=False, indent=2))
+
+    if is_chat_messages_produce(probe):
+        # MedScribe exposes ONLY a 'messages' column (seen live 2026-10-24).
+        chat_mode = True
+        first_pair = extract_chat_pair(probe.get("messages"))
+        if first_pair is None:
+            preview = [
+                f"role={m.get('role')},content_type={type(m.get('content')).__name__}"
+                for m in probe.get("messages", [])
+                if isinstance(m, dict)
+            ]
+            print(f"[DATA-ERROR] 'messages' rows lack a trainable user+assistant pair. Roles seen: {preview}")
+            print("[DATA-ERROR] paste this preview to the agent to extend the mapping before training.")
+            return 2
+        discovered = {
+            "format": "chat_messages",
+            "input": "messages[user turns joined]",
+            "target": "messages[assistant turns joined]",
+        }
+        print(f"[DISCOVER] chat-format OK; roles={[m.get('role') for m in probe['messages'] if isinstance(m, dict)]}")
+        print(f"[DISCOVER] user preview: {first_pair[0][:140]!r}")
+        print(f"[DISCOVER] assistant (SOAP) preview: {first_pair[1][:140]!r}")
+        fields = None
+    else:
+        chat_mode = False
+        fields = discover_fields(probe)
+        if fields is None:
+            print(f"[DATA-ERROR] no input/target text fields discovered. Keys: {list(probe.keys())}")
+            return 2
+        discovered = {"format": "text_columns", "input": fields[0], "target": fields[1]}
+        print(f"[DISCOVER] mapping input='{fields[0]}' target='{fields[1]}' - verify with a sample below")
+        print(json.dumps({k: str(probe[k])[:160] for k in probe}, ensure_ascii=False, indent=2))
 
     rng = random.Random(args.seed)
     seen_hashes: set = set()
@@ -219,7 +306,7 @@ def main() -> int:
     }
     written = {}
     for split in OFFICIAL_SPLITS:
-        rows = process_split(args.dataset, split, fields, caps, seen_hashes, rng, counters)
+        rows = process_split(args.dataset, split, chat_mode, fields, caps, seen_hashes, rng, counters)
         path = os.path.join(args.out_dir, f"soap_{split}.jsonl")
         os.makedirs(args.out_dir, exist_ok=True)
         with open(path, "w", encoding="utf-8") as handle:
@@ -230,7 +317,7 @@ def main() -> int:
 
     report = {
         "dataset_id": args.dataset,
-        "discovered_fields": {"input": fields[0], "target": fields[1]},
+        "discovered_fields": discovered,
         "accepted": counters["Accepted"],
         "rejected": counters["Rejected"],
         "caps": caps,

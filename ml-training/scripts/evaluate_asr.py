@@ -69,6 +69,21 @@ def load_eval_rows(path: str, cap: Optional[int]) -> List[Dict[str, Any]]:
     return usable
 
 
+def ensure_audio_dict(audio: Any) -> Optional[Dict[str, Any]]:
+    """Decode audio uniformly (datasets >=3.3 may yield lazy AudioDecoder objects)."""
+    if isinstance(audio, dict):
+        return audio
+    decode_fn = getattr(audio, "decode", None)
+    if callable(decode_fn):
+        try:
+            out = decode_fn()
+        except Exception:
+            return None
+        if isinstance(out, dict) and out.get("array") is not None:
+            return out
+    return None
+
+
 def transcription_model(base_id: str, revision: str, adapter: Optional[str]):
     import torch
     from transformers import AutoModelForSpeechSeq2Seq, WhisperProcessor
@@ -83,7 +98,7 @@ def transcription_model(base_id: str, revision: str, adapter: Optional[str]):
     model = model.to(device)
     model.eval()
     try:
-        model.generation_config.language, model.generation_config.task = "<|ur|>", "transcribe"
+        model.generation_config.language, model.generation_config.task = "urdu", "transcribe"
         model.generation_config.forced_decoder_ids = None
     except Exception as err:  # noqa: BLE001
         print(f"[WARN] generation config not pinned: {err}")
@@ -153,7 +168,7 @@ def main() -> int:
 
     for index, row in enumerate(rows):
         try:
-            audio = row["audio"]
+            audio = ensure_audio_dict(row.get("audio"))
             if audio is None or audio.get("array") is None:
                 preservation["decode_failures"] = preservation.get("decode_failures", 0) + 1
                 continue

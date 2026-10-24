@@ -15,7 +15,7 @@ datasets==3.3.2
 accelerate==1.3.0
 peft==0.18.1
 evaluate==0.4.3
-jiwer==3.1.1
+jiwer==3.1.0
 librosa==0.10.4
 soundfile==0.12.1
 sentencepiece==0.2.0
@@ -23,6 +23,8 @@ protobuf==5.29.3
 bitsandbytes==0.45.0
 
 # Notes:
+# - jiwer 3.1.1 does NOT exist on PyPI (confirmed by the first Colab smoke run
+#   on 2026-10-24; only 3.1.0 exists in the 3.1 line) - pinned to 3.1.0.
 # - torch/torchaudio come from the Colab preinstalled GPU image; we do NOT
 #   pin them here to avoid breaking the preinstalled CUDA build.
 # - bitsandbytes is Linux/Colab-only (QLoRA). It is intentionally absent from

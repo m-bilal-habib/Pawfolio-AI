@@ -20,7 +20,8 @@
         "license_statement": "MIT (per dataset card at planning time)",
         "reported_splits": "separate train/validation/test files/splits",
         "reported_fields": "encounter text and structured SOAP; EXACT split names and column names NOT verified yet",
-        "row_count": "~712 total per card (verify at runtime)"
+        "row_count": "~712 total per card (verify at runtime)",
+        "smoke_run_observation": "Live check in Colab run 20261024-163114 OVERTURNED the planning assumption: the train split exposes ONLY a 'messages' chat column (keys == ['messages']). prepare_soap_data.py maps user turns -> input and assistant turns -> SOAP target (chat branch added 2026-10-24), and Stage 5's peek validates the roles before any training attempt."
       },
       "hub_revision_sha": "TO_CAPTURE_AT_RUNTIME",
       "license_status": "APPROVED",

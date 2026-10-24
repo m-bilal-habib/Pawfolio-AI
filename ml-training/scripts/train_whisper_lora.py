@@ -71,6 +71,26 @@ def check_gpu() -> Dict[str, Any]:
     }
 
 
+def ensure_audio_dict(audio: Any) -> Optional[Dict[str, Any]]:
+    """Decode audio uniformly across datasets versions.
+
+    datasets >= 3.3 may hand back a lazy AudioDecoder object instead of the
+    decoded dict; invite the supported decode path instead of assuming a shape.
+    Returns a dict with 'array' and 'sampling_rate', or None when unusable.
+    """
+    if isinstance(audio, dict):
+        return audio
+    decode_fn = getattr(audio, "decode", None)
+    if callable(decode_fn):
+        try:
+            out = decode_fn()
+        except Exception:
+            return None
+        if isinstance(out, dict) and out.get("array") is not None:
+            return out
+    return None
+
+
 def validate_prepared_dataset(path: str, split_name: str) -> Any:
     from datasets import load_from_disk
 
@@ -83,11 +103,10 @@ def validate_prepared_dataset(path: str, split_name: str) -> Any:
     if len(ds) == 0:
         hard_fail(f"Prepared dataset '{split_name}' contains zero rows.")
     # Spot-decode the first row to FAIL EARLY on audio decoder problems (§7.3.6).
-    first = ds[0]
-    audio = first["audio"]
-    if audio is None or audio.get("array") is None:
+    first = ensure_audio_dict(ds[0].get("audio"))
+    if first is None:
         hard_fail(f"First '{split_name}' row failed audio decoding - do not start training on broken audio.")
-    print(f"[OK] {split_name}: {len(ds)} rows; first sample rate={audio.get('sampling_rate')} Hz")
+    print(f"[OK] {split_name}: {len(ds)} rows; first sample rate={first.get('sampling_rate')} Hz")
     return ds
 
 
@@ -135,9 +154,9 @@ def main() -> int:
 
     def collate(batch):
         # One feature-extractor call for the whole batch: input arrays were
-        # resampled to 16 kHz mono by the PREP stage (never assumed - audio
-        # keeps its recorded sampling_rate and we pass it explicitly).
-        speech = [torch.tensor(r["audio"]["array"], dtype=torch.float32) for r in batch]
+        # resampled to 16 kHz mono by the PREP stage (never assumed - the audio
+        # decoder path is normalized via ensure_audio_dict before use).
+        speech = [torch.tensor(ensure_audio_dict(r["audio"])["array"], dtype=torch.float32) for r in batch]
         feats = processor.feature_extractor(
             speech, sampling_rate=16000, return_tensors="pt", padding=True
         ).input_features
@@ -169,7 +188,7 @@ def main() -> int:
         compute_metrics=None,
     )
     try:
-        model.generation_config.language = "<|ur|>"
+        model.generation_config.language = "urdu"
         model.generation_config.task = "transcribe"
         model.generation_config.forced_decoder_ids = None
     except Exception as gen_err:  # noqa: BLE001
