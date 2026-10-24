@@ -83,3 +83,6 @@ ml-service/models/
 *.ckpt
 __pycache__/
 *.pyc
+# Colab upload zips must live OUTSIDE ml-training (never committed; never re-zipped recursively)
+ML_TRAINING_UPLOAD.zip
+ml-training/*.zip

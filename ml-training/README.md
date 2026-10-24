@@ -52,7 +52,7 @@ python scripts/inspect_datasets.py \
 
 1. Create the local target folder: `D:\Pawfolio AI\ml-training\artifacts\` on Windows.
 2. In Colab: **Runtime → Change runtime type → GPU**.
-3. Upload **the whole `ml-training` folder**, or zip it and upload as `ML_TRAINING_UPLOAD.zip`, so `/content/ml-training/scripts/*.py` and `/content/ml-training/data_manifest.json` exist. Stage 0 verifies the payload and stops with clear instructions if it is missing.
+3. Zip **the whole `ml-training` folder** — but place the zip OUTSIDE it (e.g. `D:\Pawfolio AI\ML_TRAINING_UPLOAD.zip`), so the archive never contains itself — then upload it to `/content/`. Stage 0 verifies the payload (`/content/ml-training/scripts/*.py` and `data_manifest.json`) and stops with clear instructions if anything is missing.
 4. Run all cells top-to-bottom. Stage 1 aborts immediately if no GPU is attached.
 5. Stage 2 installs the exact pins from `requirements-colab.txt` and records versions; if pip fails, adjust pins (never upgrade mid-run) and re-run Stage 2.
 6. Stage 4 writes `reports/data_manifest_runtime_*.json` with live revisions/licenses; every later stage re-checks the gates it needs.
