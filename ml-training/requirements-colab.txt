@@ -29,4 +29,8 @@ bitsandbytes==0.45.0
 #   pin them here to avoid breaking the preinstalled CUDA build.
 # - bitsandbytes is Linux/Colab-only (QLoRA). It is intentionally absent from
 #   any Windows/local requirements until a serving target is chosen (Phase 4).
+# - 0.45.0 vs Colab's torch 2.11.0+cu130 is an UNVERIFIED combination (runs 1-2
+#   never got here because pip aborted earlier). If Stage 12 reports a
+#   bitsandbytes runtime error, bump this pin to the latest release and re-run
+#   Stage 2; record the decision in the run report.
 # - huggingface_hub is installed transitively with transformers.

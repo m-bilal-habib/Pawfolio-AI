@@ -74,11 +74,28 @@ def check_gpu() -> Dict[str, Any]:
 def ensure_audio_dict(audio: Any) -> Optional[Dict[str, Any]]:
     """Decode audio uniformly across datasets versions.
 
-    datasets >= 3.3 may hand back a lazy AudioDecoder object instead of the
-    decoded dict; invite the supported decode path instead of assuming a shape.
-    Returns a dict with 'array' and 'sampling_rate', or None when unusable.
+    Handles: dict with 'array' (already decoded), dict with 'bytes' (raw file -
+    decode via soundfile; version-proof against lazy-decoder majors), and lazy
+    decoder objects (best-effort). Returns a dict with 'array' and
+    'sampling_rate', or None when unusable.
     """
     if isinstance(audio, dict):
+        if audio.get("array") is not None:
+            return audio
+        raw = audio.get("bytes")
+        if raw:
+            import io
+
+            import numpy as np
+            import soundfile as sf
+            try:
+                data, sr = sf.read(io.BytesIO(raw), dtype="float32")
+            except Exception:
+                return None
+            data = np.asarray(data, dtype=np.float32)
+            if data.ndim == 2:
+                data = data.mean(axis=1).astype(np.float32)
+            return {"array": data, "sampling_rate": int(sr)}
         return audio
     decode_fn = getattr(audio, "decode", None)
     if callable(decode_fn):

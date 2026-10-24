@@ -70,8 +70,32 @@ def load_eval_rows(path: str, cap: Optional[int]) -> List[Dict[str, Any]]:
 
 
 def ensure_audio_dict(audio: Any) -> Optional[Dict[str, Any]]:
-    """Decode audio uniformly (datasets >=3.3 may yield lazy AudioDecoder objects)."""
+    """Decode audio uniformly (raw {bytes,path} via soundfile is version-proof).
+
+    datasets majors disagree on streaming audio shapes (dict vs lazy
+    AudioDecoder); this normalizes all supported shapes or returns None.
+    """
     if isinstance(audio, dict):
+        if isinstance(audio.get("array"), (list, tuple)) or (audio.get("array") is not None and not hasattr(audio.get("array"), "shape")):
+            import numpy as np
+
+            return {"array": np.asarray(audio["array"], dtype=np.float32), "sampling_rate": int(audio.get("sampling_rate") or 0)}
+        if audio.get("array") is not None:
+            return audio
+        raw = audio.get("bytes")
+        if raw:
+            import io
+
+            import numpy as np
+            import soundfile as sf
+            try:
+                data, sr = sf.read(io.BytesIO(raw), dtype="float32")
+            except Exception:
+                return None
+            data = np.asarray(data, dtype=np.float32)
+            if data.ndim == 2:
+                data = data.mean(axis=1).astype(np.float32)
+            return {"array": data, "sampling_rate": int(sr)}
         return audio
     decode_fn = getattr(audio, "decode", None)
     if callable(decode_fn):
