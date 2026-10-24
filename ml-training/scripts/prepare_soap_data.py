@@ -171,7 +171,7 @@ def gate_refuses(dataset_id: str, manifest: Optional[Dict[str, Any]]) -> Optiona
 
 def main() -> int:
     global near_cache, MIN_CHARS, MAX_CHARS
-    near_cache: List[str] = []
+    near_cache = []
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     parser.add_argument("--dataset", default=DEFAULT_DATASET)
     parser.add_argument("--manifest", default=None, help="runtime manifest produced by Stage 4")

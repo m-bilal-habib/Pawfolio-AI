@@ -81,3 +81,5 @@ ml-service/models/
 *.pt
 *.onnx
 *.ckpt
+__pycache__/
+*.pyc
