@@ -25,6 +25,18 @@ Usage:
 """
 from __future__ import annotations
 
+# Run-5 lesson (BEFORE any transformers import anywhere in this process):
+# transformers reads USE_TF/USE_FLAX from the environment at import time and
+# its TF-availability gates can end up importing Colab's TensorFlow, which
+# hard-crashes on a protobuf gencode/runtime mismatch when protobuf gets
+# downgraded (run 5: gencode 6.31.1 vs pinned runtime 5.29.3). This pipeline
+# is pure PyTorch - force the honest backends off first.
+# (TRANSFORMERS_NO_TF is NOT a real flag in transformers 4.48.3 - verified.)
+import os as _boot_os
+
+_boot_os.environ.setdefault("USE_TF", "0")
+_boot_os.environ.setdefault("USE_FLAX", "0")
+
 import argparse
 import datetime as _dt
 import hashlib
@@ -143,6 +155,7 @@ def main() -> int:
     parser.add_argument("--base-model", default="openai/whisper-small")
     parser.add_argument("--base-model-revision", default="main")
     parser.add_argument("--epochs", type=float, default=1.0, help="single epoch proves the loop first (§5)")
+    parser.add_argument("--steps-per-report", type=int, default=25, help="trainer logging interval in optimiser steps (documented in the usage example - was never declared, crashed Stage 9 in run 5 after line 203 used it)")
     parser.add_argument("--learning-rate", type=float, default=1.2e-4)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--grad-accum", type=int, default=2)

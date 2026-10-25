@@ -10,6 +10,10 @@
 # librosa==0.10.4 (both never published); the WHEEL-TAG check caught
 # sentencepiece==0.2.0 (52 wheels, none beyond cp312 -> doomed source build
 # on py3.13, run 4).
+#
+# DELIBERATE ABSENCES (both runtime-owned on Colab, both guarded by Stage 2
+# PIN-GUARDs so they can never quietly re-enter this file):
+#   torch / torchao / protobuf - see the rationale below.
 
 transformers==4.48.3
 datasets==3.3.2
@@ -20,7 +24,6 @@ jiwer==3.1.0
 librosa==0.10.2.post1
 soundfile==0.13.1
 sentencepiece==0.2.1
-protobuf==5.29.3
 bitsandbytes==0.49.2
 
 # Pin rationale (registry-verified on PyPI 2026-10-24, release dates in brackets):
@@ -35,16 +38,28 @@ bitsandbytes==0.49.2
 #   (registry 404; the line jumps 0.10.2.post1 -> 0.11.0), and the 1.0.0
 #   major [2026-08] is intentionally NOT pinned.
 # - soundfile 0.12.1 -> 0.13.1 [2025-01]: soundfile FLAC decode is proven
-#   live in notebook Stages 6/7 (runs 2-4), though on the runtime's
-#   PREINSTALLED soundfile - Stage 2 had failed first, so runs 2-4 never
-#   actually installed a pinned soundfile. 0.13.1 is pinned for determinism
-#   and ships py2.py3-none-manylinux_2_28 wheels (py3.13-usable).
+#   live in notebook Stages 6/7 (runs 2-5) - runs 2-4 decoded on the
+#   runtime's PREINSTALLED soundfile (Stage 2 had failed first in those
+#   runs), run 5 decoded on the pinned 0.13.1. Wheels are
+#   py2.py3-none-manylinux_2_28 (py3.13-usable).
 # - sentencepiece 0.2.0 -> 0.2.1 [2025-08] [RUN-4 FIX]: 0.2.0's wheels stop
 #   at cp312, so Colab's py3.13 pip fell back to a C++/CMake source build,
 #   failed, and (pip being atomic per invocation) rolled back the WHOLE
 #   transaction - leaving jiwer/bitsandbytes uninstalled for Stages 8/12.
 #   0.2.1 ships cp313-cp313-manylinux_2_27.manylinux_2_28_x86_64 wheels
-#   (registry-verified). 0.2.2 [2026-07] is also verified, as a fallback.
+#   (registry-verified; installed and verified live in run 5, Stage 2).
+#   0.2.2 [2026-07] is also verified, as a fallback.
+# - protobuf: RUNTIME-OWNED [RUN-5 FIX]. Colab's TensorFlow is compiled
+#   against its image's protobuf gencode (6.31.1 on the current image). Our
+#   5.29.3 pin downgraded the RUNTIME below that gencode major and the
+#   transformers Trainer import path crashed hard:
+#   "Detected mismatched Protobuf Gencode/Runtime major versions ... gencode
+#   6.31.1 runtime 5.29.3" (Stages 9/12, run 5). Registry check: NO pinned
+#   package requires protobuf as a RUNTIME dep (transformers/peft list it
+#   only under extras, which a plain `pip install -r` never installs), so
+#   leaving it unpinned keeps the working preinstalled pair. Stage 2
+#   hard-fails if protobuf ever reappears in this file, and records the
+#   runtime's protobuf version in the environment report.
 # - torchao is intentionally NOT pinned [RUN-4 FIX]: Colab preinstalls
 #   torchao==0.10.0, and peft 0.18.1 raises an unconditional ImportError
 #   (torchao<=0.16 unsupported) inside get_peft_model() even though this
@@ -52,6 +67,11 @@ bitsandbytes==0.49.2
 #   absence BEFORE any peft import - we use bitsandbytes, not torchao.
 # - torch/torchaudio come from the Colab preinstalled GPU image; we do NOT
 #   pin them here to avoid breaking the preinstalled CUDA build.
+# - USE_TF=0 / USE_FLAX=0 are forced OFF at runtime (notebook cell 1 and the
+#   train/eval scripts, before any transformers import): transformers
+#   4.48.3 honors these env vars and the TF-availability gates are the only
+#   reason Colab's TensorFlow would ever be imported by this pipeline.
+#   (TRANSFORMERS_NO_TF is not a real flag in 4.48.3 - verified in source.)
 # - bitsandbytes is Linux/Colab-only (QLoRA). It is intentionally absent from
 #   any Windows/local requirements until a serving target is chosen (Phase 4).
 # - Transitive binaries verified py3.13 wheel-safe (2026-10-24): tokenizers

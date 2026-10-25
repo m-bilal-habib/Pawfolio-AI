@@ -22,6 +22,18 @@ Usage:
 """
 from __future__ import annotations
 
+# Run-5 lesson (BEFORE any transformers import anywhere in this process):
+# transformers reads USE_TF/USE_FLAX from the environment at import time and
+# its TF-availability gates can end up importing Colab's TensorFlow, which
+# hard-crashes on a protobuf gencode/runtime mismatch when protobuf gets
+# downgraded (run 5: gencode 6.31.1 vs pinned runtime 5.29.3). This pipeline
+# is pure PyTorch - force the honest backends off first.
+# (TRANSFORMERS_NO_TF is NOT a real flag in transformers 4.48.3 - verified.)
+import os as _boot_os
+
+_boot_os.environ.setdefault("USE_TF", "0")
+_boot_os.environ.setdefault("USE_FLAX", "0")
+
 import argparse
 import datetime as _dt
 import json
@@ -183,7 +195,7 @@ def main() -> int:
         print("[ENV-ERROR] jiwer not installed - pinned in requirements-colab.txt.")
         return 2
 
-    rows = load_eval_rows(args.eval_dataset, args.sample-cap)
+    rows = load_eval_rows(args.eval_dataset, args.sample_cap)
     model, processor, device = transcription_model(args.base_model, args.base_model_revision, args.adapter)
 
     preserve_terms = [t.strip() for t in args.preserve_terms.split(",") if t.strip()]
