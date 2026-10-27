@@ -165,6 +165,8 @@ def main() -> int:
     parser.add_argument("--lora-r", type=int, default=16)
     parser.add_argument("--export-dir", default="../exports/soap")
     parser.add_argument("--out-name", default="soap-lora-v1")
+    parser.add_argument("--model-scale", choices=["smoke", "full"], default="smoke",
+                        help="honest scale tag recorded in the training manifest; serving surfaces it in every response")
     args = parser.parse_args()
 
     print("[ENV] checking GPU...")
@@ -302,6 +304,7 @@ def main() -> int:
             "bnb_4bit_use_double_quant": True,
         },
         "lora": {"r": args.lora_r, "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj"]},
+        "model_scale": args.model_scale,
         "train_rows": len(train_examples),
         "val_rows": len(val_examples),
         "mask_rejected_rows": rejected,

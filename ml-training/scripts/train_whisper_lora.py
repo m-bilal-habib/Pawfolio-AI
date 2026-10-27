@@ -161,6 +161,13 @@ def main() -> int:
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--grad-accum", type=int, default=2)
     parser.add_argument("--lora-r", type=int, default=8)
+    parser.add_argument("--lora-targets", default="q_proj,v_proj",
+                        help="comma-separated attention modules to LoRA (phase 3 full run passes q_proj,k_proj,v_proj,o_proj)")
+    parser.add_argument("--eval-steps", type=int, default=50,
+                        help="trainer eval interval in steps (phase-3 scale: runs actually fire; smoke epochs were too short)")
+    parser.add_argument("--warmup-ratio", type=float, default=0.05)
+    parser.add_argument("--model-scale", choices=["smoke", "full"], default="smoke",
+                        help="honest scale tag recorded in the training manifest; serving surfaces it in every response")
     parser.add_argument("--export-dir", default="../exports/asr")
     parser.add_argument("--out-name", default="whisper-lora-ur")
     args = parser.parse_args()
@@ -184,9 +191,10 @@ def main() -> int:
         model.config.suppress_tokens = []
 
     # LoRA on the attention projections - compatible with whisper-small.
+    lora_targets = [t.strip() for t in args.lora_targets.split(",") if t.strip()]
     lora_cfg = LoraConfig(
         r=args.lora_r, lora_alpha=args.lora_r * 2, lora_dropout=0.05,
-        target_modules=["q_proj", "v_proj"], bias="none",
+        target_modules=lora_targets, bias="none",
     )
     model = get_peft_model(model, lora_cfg)
     model.print_trainable_parameters()
@@ -264,7 +272,8 @@ def main() -> int:
         bf16=False,
         logging_steps=args.steps_per_report,
         eval_strategy="steps",
-        eval_steps=100,
+        eval_steps=args.eval_steps,
+        warmup_ratio=args.warmup_ratio,
         save_total_limit=2,
         remove_unused_columns=False,
         predict_with_generate=False,
@@ -317,7 +326,8 @@ def main() -> int:
         "component": "asr_whisper_lora",
         "base_model_id": args.base_model,
         "base_model_revision": args.base_model_revision,
-        "lora": {"r": args.lora_r, "target_modules": ["q_proj", "v_proj"], "alpha": args.lora_r * 2},
+        "lora": {"r": args.lora_r, "target_modules": lora_targets, "alpha": args.lora_r * 2},
+        "model_scale": args.model_scale,
         "epochs": args.epochs,
         "train_rows": len(train_ds),
         "val_rows": len(val_ds),
