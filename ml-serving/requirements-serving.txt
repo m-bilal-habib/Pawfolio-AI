@@ -1,0 +1,19 @@
+# VoxSOAP ML serving - Phase 4 scaffold API layer.
+# Installable on any Python >= 3.11 (also on the current 32-bit 3.15, which is
+# used ONLY for the mocked contract tests - it cannot run real inference).
+fastapi>=0.110
+uvicorn>=0.29
+python-multipart>=0.0.9
+httpx>=0.27
+pytest>=8.0
+
+# ---- REAL INFERENCE layer (NOT installable under the 32-bit interpreter) ----
+# Requires a 64-bit interpreter with a CUDA torch build (Windows) or Colab.
+#   torch            (CUDA build per platform; never pinned here)
+#   transformers>=4.44
+#   peft>=0.11
+#   accelerate
+#   numpy
+#   soundfile
+# protobuf is intentionally NOT pinned here (runtime-owned dependency; see the
+# check_run9 / stage-2 notes in the feature contract reports).

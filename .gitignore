@@ -19,6 +19,7 @@ Gemini.md
 
 # Testing
 /coverage
+.pytest_cache/
 
 # Debug and runtime logs
 npm-debug.log*
@@ -77,6 +78,7 @@ ml-training/data/
 ml-training/cache/
 ml-training/checkpoints/
 ml-service/models/
+ml-serving/models/
 *.safetensors
 *.pt
 *.onnx
