@@ -190,6 +190,23 @@ def main() -> int:
     )
     model = get_peft_model(model, lora_cfg)
     model.print_trainable_parameters()
+
+    # Run-7 lesson (PEFT + gradient checkpointing on Whisper is a graph killer):
+    # reentrant checkpointing drops the autograd graph when NO checkpointed
+    # input requires grad. enable_input_require_grads() only covers the
+    # DECODER embeddings (get_input_embeddings()); the audio encoder's conv1
+    # input is NOT covered by it, so a forward hook makes conv1 outputs
+    # require grad explicitly (this is what "None of the inputs have
+    # requires_grad=True / grads will be None" was warning about in run 7).
+    # Path note, source-checked on peft 0.18.1: peft_model.model resolves to
+    # the WhisperForConditionalGeneration (LoraModel.model), whose .model is
+    # the inner WhisperModel holding .encoder.conv1.
+    model.enable_input_require_grads()
+
+    def _make_inputs_require_grad(module, _input, output):
+        output.requires_grad_(True)
+
+    model.get_base_model().model.encoder.conv1.register_forward_hook(_make_inputs_require_grad)
     model.config.use_cache = False
 
     def collate(batch):
@@ -229,7 +246,16 @@ def main() -> int:
         per_device_train_batch_size=args.batch_size,
         per_device_eval_batch_size=args.batch_size,
         gradient_accumulation_steps=args.grad_accum,
-        gradient_checkpointing=True,
+        # Run-7 lesson: gradient_checkpointing=True + PEFT LoRA on Whisper
+        # crashed loss.backward() at step 0 ("element 0 of tensors does not
+        # require grad and does not have a grad_fn") - reentrant checkpointing
+        # saw grad-free inputs on the encoder path. Whisper-small is 242M
+        # params; fp16 activations at batch 4 cost well under the 14.56 GB T4,
+        # so checkpointing stays OFF (also faster). The conv1/embedding
+        # input-grad hooks above stay wired: if checkpointing is ever needed
+        # for memory, re-enable together with
+        # gradient_checkpointing_kwargs={"use_reentrant": False}.
+        gradient_checkpointing=False,
         num_train_epochs=args.epochs,
         learning_rate=args.learning_rate,
         # T4 (Turing): fp16 AMP with fp32 base weights (autocast handles casts
@@ -258,18 +284,30 @@ def main() -> int:
         model.config.forced_decoder_ids = None
     except Exception as gen_err:  # noqa: BLE001
         print(f"[WARN] generation_config language could not be pinned: {gen_err}")
-    # Run-6 pre-train smoke check: batch the first four rows and run ONE
-    # forward pass under the same fp16 AMP the Trainer will use. Any collate
-    # or dtype bug must crash HERE loudly (shape ValueError / NaN loss),
-    # never silently inside trainer.train().
+    # Run-6/7 pre-train smoke check: one batch, one fp16 forward AND one
+    # backward under the exact conditions the Trainer will use. Run 7 passed
+    # the forward but crashed at step 0 of trainer.train() during
+    # loss.backward() - so the backward path is proved HERE, loudly: loss must
+    # carry a grad_fn and LoRA parameters must receive gradients, otherwise
+    # trainer.train() is never started.
     smoke_n = min(4, len(train_ds))
     smoke = collate([train_ds[i] for i in range(smoke_n)])
-    with torch.cuda.amp.autocast(enabled=True, dtype=torch.float16):
+    with torch.amp.autocast("cuda", enabled=True, dtype=torch.float16):
         smoke_out = model(**{k: v.to(model.device) for k, v in smoke.items()})
-        smoke_loss = float(smoke_out.loss)
+    if not smoke_out.loss.requires_grad:
+        hard_fail("smoke loss has no grad_fn - backward cannot reach the LoRA adapters (run-7 crash class); check the input-require-grad wiring.")
+    smoke_out.loss.backward()
+    grad_params = [
+        name for name, p in model.named_parameters()
+        if p.requires_grad and p.grad is not None and float(p.grad.abs().sum()) > 0.0
+    ]
+    if not grad_params:
+        hard_fail("smoke backward populated NO gradients on any trainable parameter - LoRA wiring is broken; fix before trainer.train().")
+    smoke_loss = float(smoke_out.loss.detach().item())
     if not torch.isfinite(torch.tensor(smoke_loss)) or smoke_loss <= 0.0:
         hard_fail(f"smoke forward produced a non-finite/non-positive loss ({smoke_loss}) - collate or labels are broken; fix BEFORE the training loop.")
-    print(f"[SMOKE-OK] collate + single fp16 forward on {smoke_n} rows, loss={smoke_loss:.4f}")
+    model.zero_grad(set_to_none=True)
+    print(f"[SMOKE-OK] fp16 forward + backward on {smoke_n} rows, loss={smoke_loss:.4f}, grads on {len(grad_params)} trainable params")
 
     trainer.train()
     trainer.save_model(out_dir)
