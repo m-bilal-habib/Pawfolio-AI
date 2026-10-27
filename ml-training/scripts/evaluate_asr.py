@@ -78,7 +78,7 @@ def load_eval_rows(path: str, cap: Optional[int]) -> List[Dict[str, Any]]:
     rows = [dict(r) for r in ds]
     if cap:
         rows = rows[:cap]
-    usable = [r for r in rows if str(r.get("sentence", "")).strip()]
+    usable = [r for r in rows if str(r.get("text", "")).strip()]
     skipped = len(rows) - len(usable)
     if not usable:
         print("[EVAL-SKIP] no rows with a non-empty reference transcript.")
@@ -142,21 +142,42 @@ def transcription_model(base_id: str, revision: str, adapter: Optional[str]):
     try:
         model.generation_config.language, model.generation_config.task = "urdu", "transcribe"
         model.generation_config.forced_decoder_ids = None
+        # run 6: `task="transcribe"` and a stale config-level forced_decoder_ids
+        # conflict; clear BOTH config surfaces, not just generation_config.
+        model.config.forced_decoder_ids = None
     except Exception as err:  # noqa: BLE001
         print(f"[WARN] generation config not pinned: {err}")
     return model, processor, device
 
 
 def transcribe(model: Any, processor: Any, device: str, audio: Any) -> str:
+    """One-row transcription with the run-6 dtype/mask fixes applied.
+
+    The model is loaded in fp16 on CUDA while WhisperFeatureExtractor emits
+    fp32 - casting BOTH device AND dtype silences the
+    `Input type (float) and bias type (c10::Half) should be the same` failure
+    seen on all 25 Stage-8 rows in run 6. The attention mask is passed
+    explicitly (pad token == eos token warning suppressor), and language/task
+    are pinned per call so no stale config forces a decoder conflict.
+    Evaluated store content is ur_pk only -> language="urdu" (matches training).
+    """
     import torch
 
     import numpy as np
 
     speech = np.asarray(audio["array"], dtype=np.float32)
-    kwargs = {"sampling_rate": 16000, "return_tensors": "pt"}
-    feats = processor.feature_extractor(speech, **kwargs).input_features.to(device)
+    feats = processor.feature_extractor(
+        speech,
+        sampling_rate=16000,
+        return_attention_mask=True,
+        return_tensors="pt",
+    )
+    input_features = feats.input_features.to(device=model.device, dtype=model.dtype)
+    gen_kwargs: Dict[str, Any] = {"max_new_tokens": 256, "language": "urdu", "task": "transcribe"}
+    if getattr(feats, "attention_mask", None) is not None:
+        gen_kwargs["attention_mask"] = feats.attention_mask.to(model.device)
     with torch.no_grad():
-        ids = model.generate(feats, max_new_tokens=256)
+        ids = model.generate(input_features=input_features, **gen_kwargs)
     return processor.tokenizer.batch_decode(ids, skip_special_tokens=True)[0]
 
 
@@ -218,7 +239,7 @@ def main() -> int:
             raw_hyp = transcribe(model, processor, device, audio).strip()
             latencies.append(time.perf_counter() - start)
             audio_seconds.append(len(audio["array"]) / float(audio.get("sampling_rate") or 16000))
-            raw_reference = str(row.get("sentence", ""))
+            raw_reference = str(row.get("text", ""))
             raw_refs.append(raw_reference)
             raw_hyps.append(raw_hyp)
             refs.append(normalize_for_wer(raw_reference))

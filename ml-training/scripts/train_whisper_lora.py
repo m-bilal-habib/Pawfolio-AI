@@ -3,9 +3,10 @@
 
 Runs ONLY on license-cleared rows from the gate-approved sources. ASR samples
 are consumed from a locally prepared Hugging Face dataset (saved by the
-notebook's prep stage) that already contains:
-    audio (16 kHz mono arrays), sentence (verbatim reference transcript),
-    source_dataset, source_split, source_row_id.
+notebook's prep stage, run-6 canonical schema) that already contains:
+    audio (16 kHz mono float32 arrays), text (verbatim reference transcript).
+Provenance (source_dataset/split/row_id) lives in the prep report, not in
+the store - see the Stage 7 notebook cell.
 
 Gates and rules enforced:
   * HARD FAIL with a clear message when no CUDA device is visible (§7.1.3).
@@ -46,7 +47,7 @@ import platform
 import sys
 from typing import Any, Dict, List, NoReturn, Optional
 
-REQUIRED_COLUMNS = {"audio", "sentence"}
+REQUIRED_COLUMNS = {"audio", "text"}
 
 
 def _utc_stamp() -> str:
@@ -192,14 +193,32 @@ def main() -> int:
     model.config.use_cache = False
 
     def collate(batch):
-        # One feature-extractor call for the whole batch: input arrays were
-        # resampled to 16 kHz mono by the PREP stage (never assumed - the audio
-        # decoder path is normalized via ensure_audio_dict before use).
-        speech = [torch.tensor(ensure_audio_dict(r["audio"])["array"], dtype=torch.float32) for r in batch]
+        # Run-6 hardening: speech must be a PYTHON LIST of 1D contiguous
+        # float32 arrays of possibly different lengths. A batched 2D/object
+        # numpy array sent WhisperFeatureExtractor into np.asarray and crashed
+        # with "inhomogeneous shape". Audio is mono/16k from Stage 7's store,
+        # but never assumed: decode, mono-merge and sampling rates are asserted.
+        import numpy as np
+
+        speech, srs = [], set()
+        for r in batch:
+            audio = ensure_audio_dict(r["audio"])
+            if audio is None or audio.get("array") is None:
+                hard_fail("collate received a row whose audio failed to decode - rerun Stage 7 (asr_capped_training_prep).")
+            arr = np.asarray(audio["array"], dtype=np.float32)
+            if arr.ndim > 1:
+                arr = arr.mean(axis=-1)
+            speech.append(np.ascontiguousarray(arr.reshape(-1), dtype=np.float32))
+            srs.add(int(audio.get("sampling_rate") or 0))
+        if srs != {16000}:
+            hard_fail(f"collate saw mixed/unknown sampling rates {sorted(srs)} - Stage 7 must normalize every row to 16 kHz.")
+        # Deterministic 30 s window: padding="max_length" fixes the feature
+        # shape (3000 frames) across the batch/eval/checkpoint paths, per the
+        # Whisper length convention (480,000 samples @ 16 kHz).
         feats = processor.feature_extractor(
-            speech, sampling_rate=16000, return_tensors="pt", padding=True
+            speech, sampling_rate=16000, return_tensors="pt", padding="max_length"
         ).input_features
-        label_rows = [{"input_ids": processor.tokenizer(r["sentence"]).input_ids} for r in batch]
+        label_rows = [{"input_ids": processor.tokenizer(r["text"]).input_ids} for r in batch]
         labels = processor.tokenizer.pad(label_rows, padding=True, return_tensors="pt")["input_ids"]
         labels = labels.masked_fill(labels == processor.tokenizer.pad_token_id, -100)
         return {"input_features": feats, "labels": labels}
@@ -213,6 +232,10 @@ def main() -> int:
         gradient_checkpointing=True,
         num_train_epochs=args.epochs,
         learning_rate=args.learning_rate,
+        # T4 (Turing): fp16 AMP with fp32 base weights (autocast handles casts
+        # cleanly); bf16 on the T4 is emulated and dramatically slower (run 6).
+        fp16=True,
+        bf16=False,
         logging_steps=args.steps_per_report,
         eval_strategy="steps",
         eval_steps=100,
@@ -230,8 +253,24 @@ def main() -> int:
         model.generation_config.language = "urdu"
         model.generation_config.task = "transcribe"
         model.generation_config.forced_decoder_ids = None
+        # run 6: stale config-level forced_decoder_ids conflicts with task= -
+        # clear BOTH config surfaces (same treatment the eval script got).
+        model.config.forced_decoder_ids = None
     except Exception as gen_err:  # noqa: BLE001
         print(f"[WARN] generation_config language could not be pinned: {gen_err}")
+    # Run-6 pre-train smoke check: batch the first four rows and run ONE
+    # forward pass under the same fp16 AMP the Trainer will use. Any collate
+    # or dtype bug must crash HERE loudly (shape ValueError / NaN loss),
+    # never silently inside trainer.train().
+    smoke_n = min(4, len(train_ds))
+    smoke = collate([train_ds[i] for i in range(smoke_n)])
+    with torch.cuda.amp.autocast(enabled=True, dtype=torch.float16):
+        smoke_out = model(**{k: v.to(model.device) for k, v in smoke.items()})
+        smoke_loss = float(smoke_out.loss)
+    if not torch.isfinite(torch.tensor(smoke_loss)) or smoke_loss <= 0.0:
+        hard_fail(f"smoke forward produced a non-finite/non-positive loss ({smoke_loss}) - collate or labels are broken; fix BEFORE the training loop.")
+    print(f"[SMOKE-OK] collate + single fp16 forward on {smoke_n} rows, loss={smoke_loss:.4f}")
+
     trainer.train()
     trainer.save_model(out_dir)
     processor.save_pretrained(out_dir)

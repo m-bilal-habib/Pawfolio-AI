@@ -22,7 +22,7 @@ Usage:
         --train-jsonl ../data/soap/soap_train.jsonl \
         --val-jsonl   ../data/soap/soap_validation.jsonl \
         --base-model  Qwen/Qwen2.5-3B-Instruct \
-        --epochs 1 --max-samples 400 \
+        --epochs 1 --max-samples 100 --max-seq-tokens 768 \
         --export-dir ../exports/soap --out-name soap-lora-v1
 """
 from __future__ import annotations
@@ -97,7 +97,8 @@ def load_jsonl(path: str, limit: Optional[int]) -> List[Dict[str, Any]]:
     return rows
 
 
-def build_example(tokenizer: Any, source_text: str, target_text: str) -> Optional[Dict[str, List[int]]]:
+def build_example(tokenizer: Any, source_text: str, target_text: str,
+                  max_len: Optional[int] = None) -> Optional[Dict[str, List[int]]]:
     """Tokenize one supervised example, masking the prompt.
 
     Implementation notes:
@@ -106,7 +107,11 @@ def build_example(tokenizer: Any, source_text: str, target_text: str) -> Optiona
       * the script ASSERTS that full_ids starts with prompt_ids; when the
         tokenizer's template does not guarantee that prefix property, the
         example is rejected (counted) instead of silently training on a
-        misaligned mask.
+        misaligned mask,
+      * run-6 smoke cap: when max_len is set, sequences are truncated at the
+        RIGHT tail AFTER that assertion - the prompt stays fully masked with
+        -100 and the assistant target is simply shortened (counted as
+        'truncated', never silently corrupted).
     """
     prompt_text = tokenizer.apply_chat_template(
         [
@@ -131,7 +136,15 @@ def build_example(tokenizer: Any, source_text: str, target_text: str) -> Optiona
     if full_text[: len(prompt_text)] != prompt_text:
         return None
     labels = [-100] * len(prompt_text) + full_text[len(prompt_text):]
-    return {"input_ids": full_text, "labels": labels, "prompt_len": len(prompt_text)}
+    truncated = False
+    if max_len and len(full_text) > max_len:
+        truncated = True
+        # Run-6 smoke cap documented: right-tail truncation AFTER the
+        # mask-prefix assertion. The prompt span stays fully masked (-100);
+        # only the assistant target is shortened. Counted, never silent.
+        full_text = full_text[:max_len]
+        labels = labels[:max_len]
+    return {"input_ids": full_text, "labels": labels, "prompt_len": len(prompt_text), "truncated": truncated}
 
 
 def main() -> int:
@@ -142,7 +155,10 @@ def main() -> int:
                         help="3B-class QLoRA candidate; verify current license/tokenizer/memory before committing (§5)")
     parser.add_argument("--base-model-revision", default="main")
     parser.add_argument("--epochs", type=float, default=1.0)
-    parser.add_argument("--max-samples", type=int, default=400)
+    parser.add_argument("--max-samples", type=int, default=100,
+                        help="SMOKE cap (run-6): 100 rows keeps stage 12 around ~10 min on a free T4")
+    parser.add_argument("--max-seq-tokens", type=int, default=768,
+                        help="SMOKE runtime cap: cap chat-template token sequences at this length (right-tail truncation AFTER the mask-prefix assertion)")
     parser.add_argument("--learning-rate", type=float, default=2e-4)
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--grad-accum", type=int, default=4)
@@ -161,7 +177,7 @@ def main() -> int:
     try:
         import bitsandbytes  # noqa: F401 - required for QLoRA 4-bit quantization
     except ImportError:
-        hard_fail("bitsandbytes is not installed (required for QLoRA). pip install bitsandbytes==0.45.0")
+        hard_fail("bitsandbytes is not installed (required for QLoRA). pip install bitsandbytes==0.49.2")
 
     train_rows = load_jsonl(args.train_jsonl, args.max_samples)
     val_rows = load_jsonl(args.val_jsonl, max(16, args.max_samples // 10))
@@ -176,19 +192,23 @@ def main() -> int:
 
     train_examples: List[Dict[str, Any]] = []
     rejected = 0
+    truncated_long = 0
     prompts_total = 0
     for row in train_rows:
-        example = build_example(tokenizer, row["input"], row["target"])
+        example = build_example(tokenizer, row["input"], row["target"], args.max_seq_tokens)
         if example is None:
             rejected += 1
             continue
         train_examples.append(example)
+        truncated_long += int(example["truncated"])
         prompts_total += example["prompt_len"]
     if not train_examples:
         hard_fail("No training example passed the mask-prefix assertion - tokenizer template mismatch.")
-    val_examples = [e for e in (build_example(tokenizer, r["input"], r["target"]) for r in val_rows) if e]
+    val_examples = [e for e in (build_example(tokenizer, r["input"], r["target"], args.max_seq_tokens)
+                                 for r in val_rows) if e]
     print(f"[MASK] assistant-only labels over {len(train_examples)} examples; "
           f"{rejected} rejected on template-prefix mismatch; "
+          f"{truncated_long} truncated at --max-seq-tokens {args.max_seq_tokens}; "
           f"{prompts_total} prompt tokens masked to -100")
 
     def collate(batch: List[Dict[str, Any]]):
@@ -210,7 +230,11 @@ def main() -> int:
 
     # Summarize the masked-objective decision in the trainer log (contract §5).
     from transformers import AutoModelForCausalLM, BitsAndBytesConfig
-    compute_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    # T4 (Turing) has NO bf16 tensor cores - `is_bf16_supported()` still
+    # reports True and the code fell back to slow bf16 emulation, which made
+    # the 200-row smoke epoch take ~49 minutes (run 5). Force fp16: bf16
+    # compute + fp16 AMP is the verified fast path on the free-Colab T4.
+    compute_dtype = torch.float16
     quant_config_bnb = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",
@@ -246,8 +270,10 @@ def main() -> int:
         eval_strategy="steps",
         eval_steps=50,
         save_total_limit=2,
-        bf16=torch.cuda.is_bf16_supported(),
-        fp16=not torch.cuda.is_bf16_supported(),
+        # T4 (Turing): fp16 AMP only. The old `bf16=is_bf16_supported()` line
+        # resolved to bf16=True on the T4 and made the smoke epoch 6x slower.
+        fp16=True,
+        bf16=False,
         report_to=[],
         lr_scheduler_type="cosine",
         warmup_ratio=0.03,
