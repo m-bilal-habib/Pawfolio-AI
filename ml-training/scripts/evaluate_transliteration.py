@@ -67,10 +67,19 @@ def main() -> int:
     parser.add_argument("--report", default="../reports/roman_eval.json")
     args = parser.parse_args()
 
-    import jiwer
+import jiwer
     import torch
     from peft import PeftModel
     from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+
+    def _strip_leading_sentinels(text: str) -> str:
+        # Same convention as train_transliteration_lora.py (run-11): aligned
+        # targets begin with '<extra_id_0>', so decoded text does too; strip
+        # before metrics and serving.
+        parts = text.split()
+        while parts and parts[0].startswith("<extra_id_"):
+            parts.pop(0)
+        return " ".join(parts).strip()
 
     cases: List[Dict[str, Any]] = []
     with open(args.cases, "r", encoding="utf-8") as fh:
@@ -117,7 +126,8 @@ def main() -> int:
             with torch.no_grad():
                 out = model.generate(input_ids=ids, max_new_tokens=args.max_new_tokens,
                                      num_beams=1, do_sample=False)
-            pred = tokenizer.batch_decode(out, skip_special_tokens=True)[0].strip()
+            raw = tokenizer.batch_decode(out, skip_special_tokens=True)[0].strip()
+            pred = _strip_leading_sentinels(raw)
             latencies.append(time.perf_counter() - t0)
             refs.append(rec["roman"])
             hyps.append(pred)
@@ -127,6 +137,7 @@ def main() -> int:
                     "urdu": rec["urdu"],
                     "roman_reference": rec["roman"],
                     "roman_prediction": pred,
+                    "raw_prediction": raw,
                     "reviewer (BLANK - fluent speaker)": "",
                     "acceptable_0to7": "",
                     "notes (free text)": "",
@@ -141,12 +152,16 @@ def main() -> int:
     exact = sum(1 for r, h in zip(refs, hyps) if normalize(r) == normalize(h))
     exact_raw = sum(1 for r, h in zip(refs, hyps) if r == h)
     cer = jiwer.cer([normalize(r) for r in refs], [normalize(h) for h in hyps])
+    leader_rate = sum(1 for h in hyps if h == _strip_leading_sentinels(h)) / max(1, len(hyps))
+    leader_rate = 1.0 - leader_rate  # fraction whose raw began with a sentinel
 
     report: Dict[str, Any] = {
         "evaluated_component": "roman_urdu_transliteration",
         "base_model": args.base_model,
         "adapter": args.adapter,
         "normalization": NORMALIZATION_NOTE,
+        "postprocess": "strip leading '<extra_id_N>' tokens from decoded predictions (mt5 span-corruption target-prefix alignment)",
+        "sentinel_leader_rate": round(leader_rate, 4),
         "n_pairs": len(refs),
         "exact_match_norm": round(exact / len(refs), 4),
         "exact_match_raw": round(exact_raw / len(refs), 4),

@@ -45,6 +45,24 @@ from typing import Any, Dict, List, NoReturn
 # evaluate_transliteration.py - the EXACT SAME prefix must be used in serving).
 TASK_PREFIX = "transliterate to roman urdu: "
 
+# mt5 span-corruption alignment (run-11): every mt5 pretraining decoder
+# sequence starts "<pad> <extra_id_0> ...", so the first generated token has an
+# overwhelming <extra_id_0> prior baked into the base model. Run-10 proved that
+# LoRA (3 epochs, fp32, lr 1e-4) cannot fight it: train loss stalled at
+# ~ln(vocab_size)=12.43 (near-uniform over the 250k vocab) with every probe
+# prediction sentinel-headed. Instead of fighting, ALIGN: targets are prefixed
+# with the sentinel (matching mt5's own pretraining output format) and decoded
+# text is stripped of sentinels downstream (evaluate_transliteration.py and
+# serving whisper/roman decode use the same convention).
+TARGET_PREFIX = "<extra_id_0>"
+
+
+def _strip_leading_sentinels(text: str) -> str:
+    parts = text.split()
+    while parts and parts[0].startswith("<extra_id_"):
+        parts.pop(0)
+    return " ".join(parts).strip()
+
 
 def _utc_stamp() -> str:
     return _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -108,6 +126,8 @@ def main() -> int:
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--grad-accum", type=int, default=2)
     parser.add_argument("--lora-r", type=int, default=16)
+    parser.add_argument("--lora-targets", default="q,k,v,o",
+                        help="T5 attention module names; run-11: q,k,v,o (run-10 used only q,v)")
     parser.add_argument("--max-source-tokens", type=int, default=128)
     parser.add_argument("--max-target-tokens", type=int, default=128)
     parser.add_argument("--steps-per-report", type=int, default=25)
@@ -133,12 +153,17 @@ def main() -> int:
 
     tokenizer = AutoTokenizer.from_pretrained(args.base_model, revision=args.base_model_revision, use_fast=True)
 
+    # The whole run-11 remediation hangs on '<extra_id_0>' being ONE real token.
+    sent_ids = tokenizer(TARGET_PREFIX, add_special_tokens=False).input_ids
+    if len(sent_ids) != 1:
+        hard_fail(f"target prefix '{TARGET_PREFIX}' must tokenize to exactly one id; got {sent_ids}")
+
     inputs_ids: List[List[int]] = []
     labels_ids: List[List[int]] = []
     skipped = 0
     for rec in train_rows:
         src = tokenizer(TASK_PREFIX + rec["urdu"], truncation=True, max_length=args.max_source_tokens).input_ids
-        tgt = tokenizer(rec["roman"], truncation=True, max_length=args.max_target_tokens).input_ids
+        tgt = tokenizer(TARGET_PREFIX + " " + rec["roman"], truncation=True, max_length=args.max_target_tokens).input_ids
         if not src or not tgt:
             skipped += 1
             continue
@@ -165,7 +190,7 @@ def main() -> int:
     val_ds = [
         {
             "input_ids": tokenizer(TASK_PREFIX + r["urdu"], truncation=True, max_length=args.max_source_tokens).input_ids,
-            "labels": tokenizer(r["roman"], truncation=True, max_length=args.max_target_tokens).input_ids,
+            "labels": tokenizer(TARGET_PREFIX + " " + r["roman"], truncation=True, max_length=args.max_target_tokens).input_ids,
         }
         for r in val_rows
         if tokenizer(TASK_PREFIX + r["urdu"]).input_ids and tokenizer(r["roman"]).input_ids
@@ -175,10 +200,12 @@ def main() -> int:
     model = AutoModelForSeq2SeqLM.from_pretrained(args.base_model, revision=args.base_model_revision)
     model.config.use_cache = False
 
-    # T5 attention modules are named q/k/v/o as plain Linear layers.
+    # T5/mt5 attention modules are named q/k/v/o as plain Linear layers;
+    # run-11 widens LoRA from [q, v] to all four attention planes for capacity.
+    lora_targets = [s.strip() for s in args.lora_targets.split(",") if s.strip()]
     lora_cfg = LoraConfig(
         r=args.lora_r, lora_alpha=args.lora_r * 2, lora_dropout=0.05,
-        target_modules=["q", "v"], bias="none",
+        target_modules=lora_targets, bias="none",
     )
     model = get_peft_model(model, lora_cfg)
     model.print_trainable_parameters()
@@ -248,15 +275,16 @@ def main() -> int:
                         truncation=True, max_length=args.max_source_tokens).input_ids.to(model.device)
         with torch.no_grad():
             out = model.generate(input_ids=ids, max_new_tokens=64, num_beams=1, do_sample=False)
-        pred = tokenizer.batch_decode(out, skip_special_tokens=True)[0].strip()
-        probe_results.append({"expected": str(rec["roman"])[:120], "generated": pred[:120]})
-        if pred and "<extra_id" not in pred:
+        raw = tokenizer.batch_decode(out, skip_special_tokens=True)[0].strip()
+        pred = _strip_leading_sentinels(raw)
+        probe_results.append({"expected": str(rec["roman"])[:120], "generated_raw": raw[:140], "generated": pred[:120]})
+        if pred:
             probe_collapsed = False
     print(f"[QUALITY-PROBE] collapsed={probe_collapsed}: {json.dumps(probe_results)[:1500]}")
     if probe_collapsed:
-        print("[WARN][QUALITY-PROBE] EVERY probe prediction is empty or a span-corruption sentinel "
-              "('extra_id') output - the adapter learned nothing usable. Saved for diagnostics ONLY; "
-              "serving must NOT point at this adapter and the next run needs the remediated recipe.")
+        print("[WARN][QUALITY-PROBE] EVERY probe prediction is empty after stripping the leading span-corruption "
+              "sentinels - the adapter learned nothing usable. Saved for diagnostics ONLY; serving must NOT point "
+              "at this adapter.")
 
     out_dir = os.path.join(args.export_dir, args.out_name)
     os.makedirs(out_dir, exist_ok=True)
@@ -269,8 +297,10 @@ def main() -> int:
         "objective": "seq2seq transliteration urdu->roman; task prefix recorded in TASK_PREFIX",
         "task_prefix": TASK_PREFIX,
         "training_source": "Mavkif/Roman-Urdu-Parl-split (Apache-2.0; parliamentary text, NOT veterinary speech)",
-        "lora": {"r": args.lora_r, "target_modules": ["q", "v"], "alpha": args.lora_r * 2},
+        "lora": {"r": args.lora_r, "target_modules": lora_targets, "alpha": args.lora_r * 2},
         "model_scale": args.model_scale,
+        "target_prefix": TARGET_PREFIX,
+        "target_prefix_note": "aligned with mt5 span-corruption pretraining format; decoded text is stripped of leading sentinels downstream (evaluator + serving).",
         "dtype": "fp32",
         "train_rows": len(inputs_ids),
         "val_rows": len(val_ds),
