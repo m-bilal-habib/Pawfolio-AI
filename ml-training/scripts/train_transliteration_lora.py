@@ -36,6 +36,7 @@ _boot_os.environ.setdefault("USE_FLAX", "0")
 import argparse
 import datetime as _dt
 import json
+import os
 import platform
 import sys
 from typing import Any, Dict, List, NoReturn
@@ -170,7 +171,7 @@ def main() -> int:
         if tokenizer(TASK_PREFIX + r["urdu"]).input_ids and tokenizer(r["roman"]).input_ids
     ]
 
-    # fp32 base + fp16 AMP (T4/T5-family rationale in module docstring).
+    # PURE fp32 (run-9 collapse evidence; rationale in module docstring).
     model = AutoModelForSeq2SeqLM.from_pretrained(args.base_model, revision=args.base_model_revision)
     model.config.use_cache = False
 
@@ -182,7 +183,7 @@ def main() -> int:
     model = get_peft_model(model, lora_cfg)
     model.print_trainable_parameters()
 
-    # Pre-train smoke check: ONE fp16-AMP forward + backward, grads proven on
+    # Pre-train smoke check: ONE fp32 forward + backward, grads proven on
     # LoRA params (same loud pre-loop proof as the ASR/SOAP scripts).
     smoke_n = min(4, len(train_ds))
     smoke = collate(train_ds[:smoke_n])
