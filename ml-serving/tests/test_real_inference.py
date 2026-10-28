@@ -44,7 +44,7 @@ def test_real_transcribe_with_phase2_adapter(app, client, wav16k):
     assert body["serving_mode"] == "real-provider"
     assert body["provider"] == "ml"
     assert isinstance(body["text"], str)
-    assert body["model_scale"].startswith("SMOKE(assumed")
+    assert body["model_scale"].startswith(("FULL", "SMOKE(assumed"))
 
 
 def test_real_roman_stays_501_until_model_c_lands(client):

@@ -10,10 +10,12 @@ official splits preserved). mT5-small + LoRA is the DEFAULT CANDIDATE so the
 experiment stays single-GPU/Colab-viable; the contract allows reconsidering
 with hardware evidence.
 
-Dtype decision (T4/Turing): fp32 base weights + fp16 AMP autocast - same
-hybrid as the ASR/SOAP scripts. DIRECT fp16 weights on the T5 family have a
-documented NaN history, and the T4 has no bf16 tensor cores, so AMP-fp16 with
-fp32 masters is the honest fast path here too.
+Dtype decision (run-9 remediation): PURE fp32. The mT5/T5 family is
+officially not tested with fp16, and the run-9 adapter collapsed under the
+previous fp32-masters + fp16-AMP recipe at lr 5e-4 to emitting ONLY the
+span-corruption sentinel '<extra_id_0>' (exact_match 0.0, CER 0.9142, all 20
+review rows sentinel-only - see reports/run9_artifacts_verification_*.md).
+mt5-small trains comfortably in fp32 on the T4, so no AMP is used.
 
 Usage:
     python train_transliteration_lora.py \
@@ -100,15 +102,16 @@ def main() -> int:
     parser.add_argument("--max-samples", type=int, default=2000,
                         help="train cap; notebook passes CONFIG_KNOBS['ROMAN_URDU_TRAIN']")
     parser.add_argument("--max-val-samples", type=int, default=300)
-    parser.add_argument("--learning-rate", type=float, default=5e-4,
-                        help="higher than ASR/SOAP defaults: LoRA on a small enc-dec text task")
+    parser.add_argument("--learning-rate", type=float, default=1e-4,
+                        help="run-10 remediation: 5e-4 under fp16-AMP collapsed to sentinel output in run 9")
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--grad-accum", type=int, default=2)
     parser.add_argument("--lora-r", type=int, default=16)
     parser.add_argument("--max-source-tokens", type=int, default=128)
     parser.add_argument("--max-target-tokens", type=int, default=128)
     parser.add_argument("--steps-per-report", type=int, default=25)
-    parser.add_argument("--eval-steps", type=int, default=125)
+    parser.add_argument("--eval-steps", type=int, default=50,
+                        help="earlier eval points than run-9's 125 so a collapse is visible in logs")
     parser.add_argument("--model-scale", choices=["smoke", "full"], default="smoke",
                         help="honest scale tag recorded in the training manifest")
     parser.add_argument("--export-dir", default="../exports/roman")
@@ -183,8 +186,7 @@ def main() -> int:
     # LoRA params (same loud pre-loop proof as the ASR/SOAP scripts).
     smoke_n = min(4, len(train_ds))
     smoke = collate(train_ds[:smoke_n])
-    with torch.amp.autocast("cuda", enabled=True, dtype=torch.float16):
-        smoke_out = model(**{k: v.to(model.device) for k, v in smoke.items()})
+    smoke_out = model(**{k: v.to(model.device) for k, v in smoke.items()})
     if not smoke_out.loss.requires_grad:
         hard_fail("smoke loss has no grad_fn - LoRA wiring is broken.")
     smoke_out.loss.backward()
@@ -198,7 +200,7 @@ def main() -> int:
     if smoke_loss != smoke_loss or smoke_loss == float("inf") or smoke_loss == float("-inf") or smoke_loss <= 0.0:
         hard_fail(f"smoke forward produced a non-finite/non-positive loss ({smoke_loss}).")
     model.zero_grad(set_to_none=True)
-    print(f"[SMOKE-OK] fp16 AMP forward + backward on {smoke_n} pairs, loss={smoke_loss:.4f}, grads on {len(grad_params)} trainable params")
+    print(f"[SMOKE-OK] fp32 forward + backward on {smoke_n} pairs, loss={smoke_loss:.4f}, grads on {len(grad_params)} trainable params")
 
     targs = Seq2SeqTrainingArguments(
         output_dir=os.path.join("../checkpoints", args.out_name),
@@ -210,7 +212,10 @@ def main() -> int:
         gradient_checkpointing=False,
         num_train_epochs=args.epochs,
         learning_rate=args.learning_rate,
-        fp16=True,
+        # run-9 remediation: PURE fp32 for the T5/mt5 family - the fp16-AMP
+        # variant collapsed to '<extra_id_0>' sentinel output (docstring has
+        # the evidence trail). mt5-small fp32 fits and computes on the T4.
+        fp16=False,
         bf16=False,
         logging_steps=args.steps_per_report,
         eval_strategy="steps",
@@ -228,6 +233,30 @@ def main() -> int:
     )
     trainer.train()
 
+    # Run-9 lesson: an adapter that emits ONLY span-corruption sentinels is
+    # useless yet run-9 exported one silently (its own eval also ran before
+    # training finished, per the packaged timestamps). Probe IMMEDIATELY after
+    # training and record it in the manifest. The adapter is still saved for
+    # diagnostics, but a collapsed result is loudly flagged and serving must
+    # not be pointed at it.
+    model.eval()
+    probe_results = []
+    probe_collapsed = True
+    for rec in val_rows[:3]:
+        ids = tokenizer(TASK_PREFIX + str(rec["urdu"]), return_tensors="pt",
+                        truncation=True, max_length=args.max_source_tokens).input_ids.to(model.device)
+        with torch.no_grad():
+            out = model.generate(input_ids=ids, max_new_tokens=64, num_beams=1, do_sample=False)
+        pred = tokenizer.batch_decode(out, skip_special_tokens=True)[0].strip()
+        probe_results.append({"expected": str(rec["roman"])[:120], "generated": pred[:120]})
+        if pred and "<extra_id" not in pred:
+            probe_collapsed = False
+    print(f"[QUALITY-PROBE] collapsed={probe_collapsed}: {json.dumps(probe_results)[:1500]}")
+    if probe_collapsed:
+        print("[WARN][QUALITY-PROBE] EVERY probe prediction is empty or a span-corruption sentinel "
+              "('extra_id') output - the adapter learned nothing usable. Saved for diagnostics ONLY; "
+              "serving must NOT point at this adapter and the next run needs the remediated recipe.")
+
     out_dir = os.path.join(args.export_dir, args.out_name)
     os.makedirs(out_dir, exist_ok=True)
     trainer.save_model(out_dir)
@@ -241,6 +270,7 @@ def main() -> int:
         "training_source": "Mavkif/Roman-Urdu-Parl-split (Apache-2.0; parliamentary text, NOT veterinary speech)",
         "lora": {"r": args.lora_r, "target_modules": ["q", "v"], "alpha": args.lora_r * 2},
         "model_scale": args.model_scale,
+        "dtype": "fp32",
         "train_rows": len(inputs_ids),
         "val_rows": len(val_ds),
         "gpu": gpu,
@@ -248,6 +278,7 @@ def main() -> int:
         "trained_at": _utc_stamp(),
         "adapter_path": out_dir,
         "note": "Adapter is NOT a complete model: serving must pair it with the exact base checkpoint id+revision.",
+        "quality_probe": {"collapsed": probe_collapsed, "probe": probe_results},
         "executed": True,
     }
     with open(os.path.join(out_dir, "training_manifest.json"), "w", encoding="utf-8") as handle:

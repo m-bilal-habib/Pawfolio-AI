@@ -19,10 +19,12 @@ def test_health_model_scale_labels_are_explicit(client):
     body = r.json()
     scale = body["model_scale"]
     assert set(scale) == {"asr", "soap", "roman"}
-    # Phase-2 artifacts predate the model_scale tag -> honestly derived.
-    assert scale["asr"].startswith("SMOKE(assumed")
-    assert scale["soap"].startswith("SMOKE(assumed")
-    # Model C is not trained/exported yet.
+    # Run-9 artifacts carry the tag directly in their training manifests.
+    assert scale["asr"] == "FULL"
+    assert scale["soap"] == "FULL"
+    # Model C: the run-9 adapter FAILED its eval, so the serving default stays
+    # unset -> honest UNKNOWN label (see test_scale_labels.py for the
+    # pre-tag/derivation rules themselves).
     assert scale["roman"].startswith("UNKNOWN")
 
 
@@ -32,3 +34,12 @@ def test_health_policy_block(client):
     assert body["policy"]["silent_gemini_fallback"] == "never - ML failure returns a controlled 5xx"
     assert "lazy" in body["policy"]["model_loading"]
     assert "unload" in body["policy"]["unload_helper"]
+
+
+def test_health_reports_run9_adapter_files(client):
+    r = client.get("/health")
+    comps = r.json()["providers"]["ml"]["components"]
+    assert comps["asr"]["adapter_files_present"] is True
+    assert comps["soap"]["adapter_files_present"] is True
+    assert comps["asr"]["model_scale_source"] == "training_manifest.model_scale"
+    assert comps["roman"]["configured"] is False

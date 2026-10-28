@@ -18,9 +18,20 @@ from typing import Optional
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
-# Development default: the verified Phase-2 smoke export, freshly unpacked.
+# Development default: the verified Phase-2 smoke export (run 8, pre-tag
+# manifests) - kept for reference; the ACTIVE defaults below point at run 9.
 _DEFAULT_ARTIFACTS = (
     REPO_ROOT / "ml-training" / "artifacts" / "unpacked_voxsoap_ml_exports_20261027-181112"
+)
+
+# Run-9 verified artifacts (RUN_ID 20261028-142956, full-scale tags recorded in
+# each training manifest). ASR + SOAP defaults point here. The run-9 ROMAN
+# adapter exists on disk but FAILED its evaluation (every prediction was the
+# mT5 span-corruption sentinel '<extra_id_0>'; see the run-9 verification
+# report), so the roman default stays None - enable it via
+# VOXSOAP_ROMAN_ADAPTER_DIR for diagnostics ONLY.
+_RUN9_ARTIFACTS = (
+    REPO_ROOT / "ml-training" / "artifacts" / "unpacked_voxsoap_ml_exports_20261028-142956"
 )
 
 VALID_PROVIDERS = ("ml", "gemini")
@@ -42,11 +53,11 @@ class ServingConfig:
     # match the adapter's training_manifest.json exactly (validated at load).
     asr_base_model: str = "openai/whisper-small"
     asr_base_revision: str = "main"
-    asr_adapter_dir: Optional[Path] = _DEFAULT_ARTIFACTS / "asr" / "whisper-lora-ur-20261027-181112"
+    asr_adapter_dir: Optional[Path] = _RUN9_ARTIFACTS / "asr" / "whisper-lora-ur-20261028-142956"
     # SOAP component.
     soap_base_model: str = "Qwen/Qwen2.5-3B-Instruct"
     soap_base_revision: str = "main"
-    soap_adapter_dir: Optional[Path] = _DEFAULT_ARTIFACTS / "soap" / "soap-lora-20261027-181112"
+    soap_adapter_dir: Optional[Path] = _RUN9_ARTIFACTS / "soap" / "soap-lora-20261028-142956"
     soap_system_prompt: str = DEFAULT_SOAP_SYSTEM_PROMPT
     # Roman Urdu (Model C): NOT trained/exported yet -> /roman stays an honest
     # 501 until a Model C adapter + training_manifest.json exist.
@@ -97,12 +108,12 @@ def load_config() -> ServingConfig:
         asr_base_model=_env_str("VOXSOAP_ASR_BASE_MODEL", "openai/whisper-small"),
         asr_base_revision=_env_str("VOXSOAP_ASR_BASE_REVISION", "main"),
         asr_adapter_dir=_env_path("VOXSOAP_ASR_ADAPTER_DIR") or (
-            _DEFAULT_ARTIFACTS / "asr" / "whisper-lora-ur-20261027-181112"
+            _RUN9_ARTIFACTS / "asr" / "whisper-lora-ur-20261028-142956"
         ),
         soap_base_model=_env_str("VOXSOAP_SOAP_BASE_MODEL", "Qwen/Qwen2.5-3B-Instruct"),
         soap_base_revision=_env_str("VOXSOAP_SOAP_BASE_REVISION", "main"),
         soap_adapter_dir=_env_path("VOXSOAP_SOAP_ADAPTER_DIR") or (
-            _DEFAULT_ARTIFACTS / "soap" / "soap-lora-20261027-181112"
+            _RUN9_ARTIFACTS / "soap" / "soap-lora-20261028-142956"
         ),
         soap_system_prompt=_env_str("VOXSOAP_SOAP_SYSTEM_PROMPT", DEFAULT_SOAP_SYSTEM_PROMPT),
         roman_base_model=_env_str("VOXSOAP_ROMAN_BASE_MODEL", "google/mt5-small"),

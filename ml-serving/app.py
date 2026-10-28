@@ -164,7 +164,8 @@ def create_app(cfg: Optional[ServingConfig] = None) -> FastAPI:
             },
             "notes": [
                 "Phase 4 SCAFFOLD: development/smoke use ONLY; no production-readiness claim is made.",
-                "Default dirs point at the unpacked PHASE-2 SMOKE adapters (model_scale derives as SMOKE(assumed)).",
+                "Default dirs point at the verified run-9 artifacts (run 20261028-142956, model_scale=FULL).",
+                "Roman (Model C) is NOT configured by default: its run-9 eval FAILED (mT5 sentinel collapse).",
                 "Real inference requires a 64-bit Python with torch; the current 32-bit 3.15 cannot import torch "
                 "(the mocked contract suite still runs).",
             ],

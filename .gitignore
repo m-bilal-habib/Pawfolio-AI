@@ -79,6 +79,7 @@ ml-training/cache/
 ml-training/checkpoints/
 ml-service/models/
 ml-serving/models/
+ml-serving/artifacts/
 *.safetensors
 *.pt
 *.onnx

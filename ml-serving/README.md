@@ -30,9 +30,12 @@ py app.py                                              # or: py -m uvicorn app:a
 # GET http://127.0.0.1:8321/health
 ```
 
-Note: the default directories point at
-`ml-training/artifacts/unpacked_voxsoap_ml_exports_20261027-181112/` (the
-verified Phase-2 SMOKE export). Retarget with `VOXSOAP_*_ADAPTER_DIR`.
+Note: the default directories point at the verified **run-9** export
+(`ml-training/artifacts/unpacked_voxsoap_ml_exports_20261028-142956/`,
+`model_scale=FULL` in every training manifest). Retarget with
+`VOXSOAP_*_ADAPTER_DIR`. The run-9 Roman-adapter dir exists on disk but its
+evaluation FAILED (mT5 sentinel collapse) - `VOXSOAP_ROMAN_ADAPTER_DIR`
+therefore stays unset by default; set it manually for diagnostics only.
 
 ## Routes
 
