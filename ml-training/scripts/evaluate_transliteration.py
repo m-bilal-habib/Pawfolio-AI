@@ -67,7 +67,7 @@ def main() -> int:
     parser.add_argument("--report", default="../reports/roman_eval.json")
     args = parser.parse_args()
 
-import jiwer
+    import jiwer
     import torch
     from peft import PeftModel
     from transformers import AutoModelForSeq2SeqLM, AutoTokenizer

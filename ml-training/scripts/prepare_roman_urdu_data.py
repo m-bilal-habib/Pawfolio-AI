@@ -14,7 +14,7 @@ contribution stays separable and reportable.
 Usage:
     python prepare_roman_urdu_data.py \
         --out-dir ../data/roman_urdu \
-        --max-per-split 300 --max-test-rows 80 --seed 20260124 \
+        --max-per-split 2000 --max-val-rows 300 --max-test-rows 300 --seed 20260124 \
         [--include-alpaca]
 Writes: roman_urdu_train.jsonl / _validation.jsonl / _test.jsonl,
 optionally alpaca_optional.jsonl, plus roman_urdu_prep_report.json.
@@ -29,6 +29,7 @@ import os
 import random
 import re
 import sys
+import time
 from difflib import SequenceMatcher
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -123,7 +124,19 @@ def process_split(dataset_id: str, split: str, fields: Tuple[str, str], cap: int
             if pair_digest in seen_hashes:
                 raise ValueError("exact duplicate")
             joined = f"{urdu}|{roman}"
-            if any(SequenceMatcher(None, joined, seen).ratio() >= NEAR_DUP_SIMILARITY for seen in near_cache):
+            near_hit = False
+            for seen in near_cache:
+                # Run-11 speed fix (same rejection semantics, measured honestly
+                # in the report): an O(n*m) difflib ratio per (row x cache)
+                # pair took ~32 min for 2.2k rows. difflib ratio is bounded by
+                # 2*min/(len_a+len_b), so if that provable bound cannot reach
+                # the threshold, a FULL scan is pointless and skipped.
+                if 2 * min(len(joined), len(seen)) / NEAR_DUP_SIMILARITY < len(joined) + len(seen):
+                    continue
+                if SequenceMatcher(None, joined, seen).ratio() >= NEAR_DUP_SIMILARITY:
+                    near_hit = True
+                    break
+            if near_hit:
                 raise ValueError("near duplicate")
             urdu_clean = urdu
             roman_clean = roman
@@ -182,7 +195,10 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     parser.add_argument("--out-dir", default="../data/roman_urdu")
     parser.add_argument("--max-per-split", type=int, default=300)
-    parser.add_argument("--max-test-rows", type=int, default=80)
+    parser.add_argument("--max-val-rows", type=int, default=300,
+                        help="validation cap; run-10/11 fix: was silently clamped to 120 inside the script")
+    parser.add_argument("--max-test-rows", type=int, default=300,
+                        help="test cap; run-11 fix: the notebook used to hardcode 80")
     parser.add_argument("--alpaca-cap", type=int, default=200)
     parser.add_argument("--seed", type=int, default=20260124)
     parser.add_argument("--include-alpaca", action="store_true")
@@ -224,11 +240,14 @@ def main() -> int:
     rng = random.Random(args.seed)
     seen_hashes: set = set()
     near_cache: List[str] = []
-    caps = {"train": args.max_per_split, "validation": min(args.max_per_split, 120), "test": args.max_test_rows}
+    caps = {"train": args.max_per_split, "validation": args.max_val_rows, "test": args.max_test_rows}
     os.makedirs(args.out_dir, exist_ok=True)
     outputs: Dict[str, Any] = {}
+    split_seconds: Dict[str, float] = {}
     for split in OFFICIAL_SPLITS:
+        t0 = time.perf_counter()
         rows = process_split(DATASET_PARL, split, fields, caps[split], seen_hashes, near_cache, rng, counters)
+        split_seconds[split] = round(time.perf_counter() - t0, 2)
         path = os.path.join(args.out_dir, f"roman_urdu_{split}.jsonl")
         with open(path, "w", encoding="utf-8") as handle:
             for r in rows:
@@ -254,6 +273,8 @@ def main() -> int:
         "caps": caps,
         "seed": args.seed,
         "split_policy": "official splits preserved; streaming subsets only (full CSV never materialized)",
+        "dedup_scan": "exact-dup via global hash; near-dup via difflib ratio gated by a PROVABLY-safe length bound (2*min/thr < len_a+len_b skips the scan) - threshold and rejection semantics unchanged",
+        "split_seconds": split_seconds,
         "generated_at": _utc_stamp(),
         "outputs": outputs,
         "executed": True,
