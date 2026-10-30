@@ -12,6 +12,7 @@ import type {
 import { NewRecordingPanel } from './NewRecordingPanel';
 import { UploadAudioPanel } from './UploadAudioPanel';
 import { RichTextEditor } from './RichTextEditor';
+import { MLAssistPanel } from './MLAssistPanel';
 import { escapePlainToRichHtml } from '@/lib/vox-soap/vox-soap.richtext';
 import { VOX_SOAP_STAFF } from '@/lib/vox-soap/vox-soap.staff';
 import { useAuth } from '@/lib/auth';
@@ -105,6 +106,10 @@ export const VoxSoapWorkspace: React.FC<{ defaultPetId?: string }> = ({
   const [isConfirming, setIsConfirming] = useState<boolean>(false);
   const [recordingPanelOpen, setRecordingPanelOpen] = useState<boolean>(false);
   const [uploadPanelOpen, setUploadPanelOpen] = useState<boolean>(false);
+  // Phase 5: LOCAL ML assistive draft flow (Whisper + QLoRA SOAP on this
+  // machine through /api/voxsoap/*). Completely separate from the Gemini
+  // extract pipeline; its panel owns the honesty envelope/badges.
+  const [mlPanelOpen, setMlPanelOpen] = useState<boolean>(false);
   const [isExporting, setIsExporting] = useState<boolean>(false);
   const [statusBanner, setStatusBanner] = useState<{
     type: 'success' | 'warning' | 'error' | 'info';
@@ -739,6 +744,21 @@ export const VoxSoapWorkspace: React.FC<{ defaultPetId?: string }> = ({
                 <span>📎</span>
                 <span>Upload Audio</span>
               </button>
+
+              {/* Phase 5: LOCAL ML assistive draft (THIS machine's Whisper +
+                  QLoRA SOAP adapter through the localhost FastAPI service).
+                  Kept as its own flow: provider/serving_mode/model_scale
+                  badges render inside the panel, no Gemini substitution. */}
+              <button
+                type="button"
+                onClick={() => setMlPanelOpen(true)}
+                disabled={isRecording || isExtracting}
+                title="ML Assistive Draft — record and draft with the LOCAL VoxSOAP ML model (localhost service; assistive only, vet confirmation mandatory)"
+                className="px-4 py-2.5 rounded-full bg-sidebar hover:bg-[#33281f] text-ink font-bold text-sm flex items-center gap-2 border border-line shadow-md transition disabled:opacity-40"
+              >
+                <span>🧠</span>
+                <span>ML Assistive Draft</span>
+              </button>
             </div>
 
             {/* Metadata Inputs & Sign-off / Export Row */}
@@ -911,6 +931,14 @@ export const VoxSoapWorkspace: React.FC<{ defaultPetId?: string }> = ({
                   className="px-5 py-2.5 rounded-xl bg-sidebar hover:bg-[#33281f] text-ink font-bold text-sm border border-line"
                 >
                   📎 Upload Audio
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setMlPanelOpen(true)}
+                  className="px-5 py-2.5 rounded-xl bg-sidebar hover:bg-[#33281f] text-ink font-bold text-sm border border-line"
+                  title="LOCAL VoxSOAP ML model (Whisper + SOAP adapter on this machine) — assistive only, vet confirmation mandatory"
+                >
+                  🧠 ML Assistive Draft
                 </button>
               </div>
             </section>
@@ -1485,6 +1513,20 @@ export const VoxSoapWorkspace: React.FC<{ defaultPetId?: string }> = ({
           contextLabel="Upload • demo patient Leo"
           onClose={() => setUploadPanelOpen(false)}
           onCompleted={handlePanelRecorded}
+        />
+
+        {/* Phase 5: LOCAL ML assistive draft panel — 16 kHz PCM WAV capture
+            into the localhost VoxSOAP service (proxy /api/voxsoap/*). It
+            renders its OWN provider/serving_mode/model_scale/guard badges and
+            never substitutes Gemini; patients stay on the Gemini flow. */}
+        <MLAssistPanel
+          open={mlPanelOpen}
+          staffRole={staffRole}
+          staffId={staffId}
+          staffName={staffName}
+          accent="amber"
+          contextLabel="ML assist • local service (8321)"
+          onClose={() => setMlPanelOpen(false)}
         />
       </div>
     </div>

@@ -124,3 +124,31 @@ resamples. So the BROWSER delivers exactly 16 kHz mono PCM WAV:
 - Model C/Roman permanently 501 unless owner re-enables with a passing adapter (deprecation record:
   `ml-training/reports/model_c_deprecation_20261029.md`).
 - Long-clip ASR windowing, clinician-preserve-terms, auth — later scaffold hardening, out of P5 core.
+
+## 6. Implementation status (2026-10-30) — CODE LANDED, live E2E pending the service
+
+Committed on `Speech-to-Text-feature/voxsoap-model-integration`:
+
+| Piece | File | Notes |
+|---|---|---|
+| Passthrough proxy | `src/app/api/voxsoap/[route]/route.ts` | nodejs runtime, route allowlist (GET: health; POST: transcribe/draft/roman/unload), byte-for-byte body passthrough, verbatim status+response, 300 s budget (`VOXSOAP_TIMEOUT_MS`), FR-6 receptionist 403 on transcribe/draft (parity with `/api/clinic/vox-soap/extract`), controlled 502/504 envelopes that explicitly say "NOT a model answer; nothing was rerouted to Gemini". Never synthesizes success. |
+| Envelope contract types | `src/lib/vox-soap/voxsoap-ml.types.ts` | Flask envelope mirrored verbatim; `model_scale` typed as string OR map (health carries the map); `VoxSoapMLGuard` mirrors `guards.py` exactly. |
+| ML client | `src/lib/vox-soap/voxsoap-ml.client.ts` | health/transcribe/draft/unload helpers; staff headers forwarded for provenance; non-envelope responses surfaced as honest `unparseable_response`; no throw-and-hide. |
+| 16 kHz capture + WAV encoder | `src/lib/vox-soap/voxsoap-ml.wav.ts` + `public/worklets/pcm-recorder.js` | forced-16 kHz AudioContext + AudioWorklet Float32 capture; OfflineAudioContext CLIENT-side resample fallback for engines ignoring forced rates; canonical 44-byte s16le mono WAV encoder. Server stays resample-free. |
+| UI panel | `src/components/vox-soap/MLAssistPanel.tsx` | health precheck → consent → record (pause/resume, 12-min/23 MB guard under the 25 MB server cap) → encode → transcribe → EDITABLE transcript (14 000-char server cap surfaced) → draft → EDITABLE draft + deterministic guard badges (`complete_schema`, per-section ✓/✗, unsupported/omitted fact chips, unstated markers, `review_hint` verbatim) → envelope badges (provider/serving_mode/model_scale/latency_s) on every output; `/roman` disabled with the DEPRECATED-501 truth; `/unload` button shows `unload_status` + `model_scale_after`; mock-provider warning chip when `providers.ml.is_mock`. |
+| Workspace entry | `src/components/vox-soap/VoxSoapWorkspace.tsx` | "🧠 ML Assistive Draft" buttons added to both capture CTA rows and the panel mounted alongside the existing Gemini panels — the Gemini flow is untouched and clearly separate. |
+| Env | `.env.local` (gitignored) | `VOXSOAP_BASE_URL=http://127.0.0.1:8321` (matches the proxy fallback). |
+
+Verification done so far (tsc clean, eslint clean):
+- **Proxy honest-failure drills against the dev server (ML service intentionally down):** GET
+  `/api/voxsoap/health` → controlled 502 `service_unreachable` envelope; GET on a POST route → 404
+  `unknown_route`; POST `/draft` as receptionist → 403 FR-6 (no upstream call); POST `/draft` as vet →
+  controlled 502 envelope; POST bogus route → 404. No path renders a Gemini-style success.
+- **WAV encoder byte-level checks (mirrored harness, all PASS):** canonical RIFF/WAVE/fmt/data tags,
+  PCM=1, mono, 16000 Hz, byte rate 32000, block align 2, 16 bits, data sizes, boundary conversions
+  (0→0, 0.5→16383, −0.5→−16384, 1.0→32767, −1.0→−32768, clamp ±1), header-only empty blob.
+
+Still open (same acceptance checklist, §4): start the REAL local service (§1 venv) and run the full
+E2E loop — recording needs a live mic in a logged-in clinic session, and the visual pass needs a real
+`/health` + `/transcribe` + `/draft` through `127.0.0.1:8321`. Until then the panel shows the honest
+"service not running" drill state by design.
