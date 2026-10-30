@@ -42,6 +42,35 @@ TASK_PREFIX = "transliterate to roman urdu: "
 COMPONENT_KEYS = ("asr", "soap", "roman")
 
 
+# ---- transformers cross-version helpers ------------------------------------
+# The 2026-10-30 Colab real-inference gate caught an unpinned-resolve drift:
+# `apply_chat_template(..., tokenize=True, return_tensors="pt")` returns a raw
+# torch.Tensor on the VERIFIED 4.48.3 stack, but a BatchEncoding mapping on
+# newer transformers - whose `.shape` access raised KeyError('shape'). The
+# exact runtime is pinned in requirements-serving-ml.txt, and these helpers
+# accept BOTH shapes so call-sites survive any future re-pin honestly.
+
+def _unwrap_chat_prompt(prompt: Any) -> Tuple[Any, Optional[Any]]:
+    """Return (input_ids, attention_mask|None) from either template return shape."""
+    ids = prompt["input_ids"] if hasattr(prompt, "input_ids") else prompt
+    return ids, getattr(prompt, "attention_mask", None)
+
+
+def _prep_dtype_kwargs(torch_dtype: Any) -> Dict[str, Any]:
+    """`from_pretrained` renamed torch_dtype -> dtype in newer transformers.
+    Choose the kwarg from the INSTALLED version instead of relying on warning
+    text - the wrong kwarg either TypeErrors or emits a deprecation warning."""
+    try:
+        import transformers
+
+        parts = str(transformers.__version__).split(".")
+        if (int(parts[0]), int(parts[1])) >= (4, 56):
+            return {"dtype": torch_dtype}
+    except Exception:
+        pass  # version unreadable -> keep the long-standing kwarg name
+    return {"torch_dtype": torch_dtype}
+
+
 class ProviderError(Exception):
     """Controlled, honest provider failure - the API layer maps it to JSON."""
 
@@ -274,7 +303,7 @@ class MLProvider:
         dtype = torch.float16 if device == "cuda" else torch.float32
         processor = WhisperProcessor.from_pretrained(str(comp["adapter_dir"]))
         base = WhisperForConditionalGeneration.from_pretrained(
-            comp["base_model"], revision=comp["base_revision"], torch_dtype=dtype
+            comp["base_model"], revision=comp["base_revision"], **_prep_dtype_kwargs(dtype)
         )
         model = PeftModel.from_pretrained(base, str(comp["adapter_dir"]))
         model.to(device)
@@ -301,7 +330,7 @@ class MLProvider:
             # tokenizer is safe (never a silent cross-model mix).
             tok = AutoTokenizer.from_pretrained(comp["base_model"], revision=comp["base_revision"])
         base = AutoModelForCausalLM.from_pretrained(
-            comp["base_model"], revision=comp["base_revision"], torch_dtype=dtype
+            comp["base_model"], revision=comp["base_revision"], **_prep_dtype_kwargs(dtype)
         )
         model = PeftModel.from_pretrained(base, str(comp["adapter_dir"]))
         model.to(device)
@@ -333,84 +362,134 @@ class MLProvider:
     # ---------- inference ----------
 
     def transcribe(self, samples, sample_rate: int, audio_bytes: Optional[bytes] = None) -> Dict[str, Any]:
-        state = self._loaded["asr"] or self._load_asr()
-        torch = self._real_stack()
-        import numpy as np
+        try:
+            state = self._loaded["asr"] or self._load_asr()
+            torch = self._real_stack()
+            import numpy as np
 
-        model = state["model"]
-        processor = state["processor"]
-        speech = np.asarray(samples, dtype=np.float32)
-        feats = processor.feature_extractor(
-            speech,
-            sampling_rate=sample_rate,
-            return_attention_mask=True,
-            return_tensors="pt",
-        )
-        gen_kwargs: Dict[str, Any] = {
-            "max_new_tokens": self._cfg.asr_max_new_tokens,
-            "language": "urdu",
-            "task": "transcribe",
-        }
-        if getattr(feats, "attention_mask", None) is not None:
-            gen_kwargs["attention_mask"] = feats.attention_mask.to(model.device)
-        with torch.no_grad():
-            ids = model.generate(
-                input_features=feats.input_features.to(device=model.device, dtype=model.dtype),
-                **gen_kwargs,
+            model = state["model"]
+            processor = state["processor"]
+            speech = np.asarray(samples, dtype=np.float32)
+            feats = processor.feature_extractor(
+                speech,
+                sampling_rate=sample_rate,
+                return_attention_mask=True,
+                return_tensors="pt",
             )
-        text = processor.tokenizer.batch_decode(ids, skip_special_tokens=True)[0].strip()
-        return {
-            "text": text,
-            "language": "urdu",
-            "sample_rate": sample_rate,
-            "note": "single-window transcription; long-clip windowing is NOT implemented in this scaffold",
-        }
+            # max_new_tokens is the actively supported generate arg (the exact
+            # recipe evaluate_asr.py used for the verified Stage-10 eval under
+            # the pinned stack); `max_length` is the deprecated Whisper path.
+            gen_kwargs: Dict[str, Any] = {
+                "max_new_tokens": self._cfg.asr_max_new_tokens,
+                "language": "urdu",
+                "task": "transcribe",
+            }
+            if getattr(feats, "attention_mask", None) is not None:
+                gen_kwargs["attention_mask"] = feats.attention_mask.to(model.device)
+            with torch.no_grad():
+                ids = model.generate(
+                    input_features=feats.input_features.to(device=model.device, dtype=model.dtype),
+                    **gen_kwargs,
+                )
+            # clean_up_tokenization_spaces pinned EXPLICITLY to True: that is
+            # the default the verified eval stack (4.48.3) actually measured,
+            # and it keeps serving output consistent with the eval pipeline
+            # even when a future transformers flips the default to False.
+            text = processor.tokenizer.batch_decode(
+                ids, skip_special_tokens=True, clean_up_tokenization_spaces=True
+            )[0].strip()
+            return {
+                "text": text,
+                "language": "urdu",
+                "sample_rate": sample_rate,
+                "note": "single-window transcription; long-clip windowing is NOT implemented in this scaffold",
+            }
+        except ProviderError:
+            raise  # controlled errors keep their exact identity/status
+        except Exception as err:
+            raise InferenceError(
+                f"ASR inference failed in this environment: {type(err).__name__}: {err}. "
+                "Nothing was silently substituted (no Gemini fallback)."
+            ) from err
 
     def draft(self, transcript: str) -> Dict[str, Any]:
-        state = self._loaded["soap"] or self._load_soap()
-        torch = self._real_stack()
-        model = state["model"]
-        tok = state["tokenizer"]
-        prompt_ids = tok.apply_chat_template(
-            [
-                {"role": "system", "content": self._cfg.soap_system_prompt},
-                {"role": "user", "content": transcript},
-            ],
-            tokenize=True,
-            add_generation_prompt=True,
-            return_tensors="pt",
-        )
-        with torch.no_grad():
-            out = model.generate(
-                input_ids=prompt_ids.to(model.device),
-                max_new_tokens=self._cfg.draft_max_new_tokens,
-                do_sample=False,
-                pad_token_id=tok.pad_token_id or tok.eos_token_id,
+        try:
+            state = self._loaded["soap"] or self._load_soap()
+            torch = self._real_stack()
+            model = state["model"]
+            tok = state["tokenizer"]
+            # return_dict=True is EXPLICIT: the unpinned Colab resolve revealed
+            # that implicit template-return shape drifted across transformers
+            # versions (raw Tensor -> BatchEncoding) and crashed the real
+            # /draft gate with KeyError('shape'). Explicit + _unwrap_chat_prompt
+            # accepts both shapes; the runtime itself is pinned in
+            # requirements-serving-ml.txt.
+            prompt = tok.apply_chat_template(
+                [
+                    {"role": "system", "content": self._cfg.soap_system_prompt},
+                    {"role": "user", "content": transcript},
+                ],
+                tokenize=True,
+                add_generation_prompt=True,
+                return_tensors="pt",
+                return_dict=True,
             )
-        continuation = out[:, prompt_ids.shape[-1]:]
-        text = tok.batch_decode(continuation, skip_special_tokens=True)[0].strip()
-        return {
-            "draft": text,
-            "generation": "greedy",
-            "max_new_tokens": self._cfg.draft_max_new_tokens,
-            "note": "assistive DRAFT - deterministic guard annotations attached; vet confirmation is mandatory",
-        }
+            prompt_ids, prompt_mask = _unwrap_chat_prompt(prompt)
+            gen_kwargs: Dict[str, Any] = {
+                "input_ids": prompt_ids.to(model.device),
+                "max_new_tokens": self._cfg.draft_max_new_tokens,
+                "do_sample": False,
+                "pad_token_id": tok.pad_token_id or tok.eos_token_id,
+            }
+            if prompt_mask is not None:
+                gen_kwargs["attention_mask"] = prompt_mask.to(model.device)
+            with torch.no_grad():
+                out = model.generate(**gen_kwargs)
+            continuation = out[:, prompt_ids.shape[-1]:]
+            # clean_up_tokenization_spaces pinned for the same reason as ASR:
+            # frozen to the verified 4.48.3 default the eval pipeline measured.
+            text = tok.batch_decode(
+                continuation, skip_special_tokens=True, clean_up_tokenization_spaces=True
+            )[0].strip()
+            return {
+                "draft": text,
+                "generation": "greedy",
+                "max_new_tokens": self._cfg.draft_max_new_tokens,
+                "note": "assistive DRAFT - deterministic guard annotations attached; vet confirmation is mandatory",
+            }
+        except ProviderError:
+            raise
+        except Exception as err:
+            raise InferenceError(
+                f"SOAP draft inference failed in this environment: {type(err).__name__}: {err}. "
+                "Nothing was silently substituted (no Gemini fallback)."
+            ) from err
 
     def roman(self, text: str) -> Dict[str, Any]:
-        state = self._loaded["roman"] or self._load_roman()
-        torch = self._real_stack()
-        model = state["model"]
-        tok = state["tokenizer"]
-        ids = tok(TASK_PREFIX + text, return_tensors="pt", truncation=True, max_length=128)
-        with torch.no_grad():
-            out = model.generate(
-                input_ids=ids.input_ids.to(model.device),
-                max_new_tokens=self._cfg.roman_max_new_tokens,
-                num_beams=1,
-                do_sample=False,
-            )
-        roman = tok.batch_decode(out, skip_special_tokens=True)[0].strip()
-        return {"roman": roman, "task_prefix": TASK_PREFIX}
+        try:
+            state = self._loaded["roman"] or self._load_roman()
+            torch = self._real_stack()
+            model = state["model"]
+            tok = state["tokenizer"]
+            ids = tok(TASK_PREFIX + text, return_tensors="pt", truncation=True, max_length=128)
+            with torch.no_grad():
+                out = model.generate(
+                    input_ids=ids.input_ids.to(model.device),
+                    max_new_tokens=self._cfg.roman_max_new_tokens,
+                    num_beams=1,
+                    do_sample=False,
+                )
+            roman = tok.batch_decode(
+                out, skip_special_tokens=True, clean_up_tokenization_spaces=True
+            )[0].strip()
+            return {"roman": roman, "task_prefix": TASK_PREFIX}
+        except ProviderError:
+            raise
+        except Exception as err:
+            raise InferenceError(
+                f"Roman inference failed in this environment: {type(err).__name__}: {err}. "
+                "Nothing was silently substituted (no Gemini fallback)."
+            ) from err
 
     # ---------- unload / swap (Windows RAM safeguard) ----------
 

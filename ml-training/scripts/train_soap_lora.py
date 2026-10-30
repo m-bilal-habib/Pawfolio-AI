@@ -103,6 +103,12 @@ def build_example(tokenizer: Any, source_text: str, target_text: str,
 
     Implementation notes:
       * prompt_ids uses apply_chat_template(system,user, add_generation_prompt=True),
+        NOTE (2026-10-30): template-tokenization RETURN SHAPES drifted across
+        transformers versions (an unpinned serving resolve crashed real /draft
+        with KeyError: 'shape'). THIS script is safe: it passes no
+        return_tensors and its stack is pinned by requirements-colab.txt
+        (transformers==4.48.3). Before any unpinned upgrade, re-verify the
+        return shape (serving's fix lives in providers._unwrap_chat_prompt),
       * full_ids appends the assistant turn plus EOS,
       * the script ASSERTS that full_ids starts with prompt_ids; when the
         tokenizer's template does not guarantee that prefix property, the

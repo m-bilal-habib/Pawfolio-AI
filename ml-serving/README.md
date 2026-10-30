@@ -28,6 +28,7 @@ this replaces the existing Gemini path (Phase 5).
 ```powershell
 # from D:\Pawfolio AI\ml-serving
 py -m pip install -r requirements-serving.txt          # API layer (mocked-testable)
+py -m pip install -r requirements-serving-ml.txt       # REAL inference - EXACT verified pins
 py app.py                                              # or: py -m uvicorn app:app --host 127.0.0.1 --port 8321
 # GET http://127.0.0.1:8321/health
 ```
@@ -97,20 +98,34 @@ py -m pytest ml-serving/tests -m real -v
 ```
 
 Mocked tests use fake providers reporting `serving_mode="mocked-test-double"`
-in every response. Real-inference tests are additionally gated by `pytest.mark.real`.
+in every response (24 tests). Real-inference tests are additionally gated by
+`pytest.mark.real` (4 tests: health, real /transcribe, roman-501, real /draft -
+the 4th needs CUDA or `VOXSOAP_REAL_DRAFT_FORCE=1` + ~13 GB free CPU RAM,
+otherwise it skips honestly).
 
 ## Real-inference gate status (read before relying on this)
 
-Blocked on this machine: the only installed interpreters are **32-bit**
+**Evidence recorded 2026-10-30 (Colab Tesla T4):** `pytest -m real` PASSED
+3/3 (42.61 s) with the full-scale `20261030-165202` adapters and the unpinned
+resolve, and the live `POST /draft` probe CAUGHT a real bug:
+`transformers` newer than the verified stack changed
+`apply_chat_template(..., return_tensors="pt")` from a raw tensor to a
+`BatchEncoding`, so the SOAP draft path crashed (`KeyError: 'shape'` → the
+raw exception escaped as an uncontrolled 500). Fixed in `providers.py`:
+explicit `return_dict=True` + `_unwrap_chat_prompt()` (accepts both shapes),
+version-aware `dtype`/`torch_dtype` kwargs, explicitly pinned
+`clean_up_tokenization_spaces=True` (the verified 4.48.3 eval default), and
+every ML inference body now wraps unexpected failures as controlled
+`InferenceError` → 503 (never a silent Gemini swap). The serving runtime is
+pinned in `requirements-serving-ml.txt` (torch 2.11.0, transformers 4.48.3,
+peft 0.18.1, accelerate 1.3.0, soundfile 0.13.1, bitsandbytes 0.49.2) so
+pip never pulls an untested major (e.g. transformers 5.x) again.
+
+Still blocked ON THIS MACHINE: the only installed interpreters are **32-bit**
 Pythons (3.15-32, 2.7-32) and torch publishes no win32 wheels, so
-`torch`/`transformers` cannot run - the route gate therefore reports an
-honest 503 `inference_error` until one of:
-
-1. a **64-bit Python** (3.11-3.13) is installed and `requirements-serving.txt`
-   + a torch/CUDA build are installed into it, or
-2. the serving check is run in **Colab** (torch 2.11+cu130 environment) and
-   results are copied back as the gate evidence.
-
-Until then: `GET /health` works (manifest-level introspection), all route
-contracts are mock-verified, and every error path is proven by the mocked
-suite. Torch-absent ML failures surface as honest 503s - never a Gemini swap.
+`torch`/`transformers` cannot run locally - the mocked suite (24 tests) runs
+there; the real gate runs on Colab (torch 2.11+cu130) or a local **64-bit
+Python** with the two requirements files. Re-run after any re-pin; the 4th
+real test (real /draft with the full-scale SOAP adapter) is the live
+regression guard for the drift that was caught above. ML failures in a
+torch-absent process surface as honest 503s - never a Gemini swap.

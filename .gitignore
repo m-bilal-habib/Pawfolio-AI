@@ -88,4 +88,5 @@ __pycache__/
 *.pyc
 # Colab upload zips must live OUTSIDE ml-training (never committed; never re-zipped recursively)
 ML_TRAINING_UPLOAD.zip
+ML_SERVING_UPLOAD.zip
 ml-training/*.zip

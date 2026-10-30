@@ -7,13 +7,11 @@ python-multipart>=0.0.9
 httpx>=0.27
 pytest>=8.0
 
-# ---- REAL INFERENCE layer (NOT installable under the 32-bit interpreter) ----
-# Requires a 64-bit interpreter with a CUDA torch build (Windows) or Colab.
-#   torch            (CUDA build per platform; never pinned here)
-#   transformers>=4.44
-#   peft>=0.11
-#   accelerate
-#   numpy
-#   soundfile
+# ---- REAL INFERENCE layer (NOT here - this API install stays torch-free) ----
+# NOT installable under the 32-bit interpreter. Exact, verified pins live in
+# requirements-serving-ml.txt - INSTALL THAT FILE INSTEAD of letting pip
+# resolve a latest version: an unpinned `transformers>=4.44` resolve crashed
+# the real /draft gate on 2026-10-30 (BatchEncoding return-shape drift beyond
+# 4.48.3; the serving code now handles both shapes AND the runtime is pinned).
 # protobuf is intentionally NOT pinned here (runtime-owned dependency; see the
 # check_run9 / stage-2 notes in the feature contract reports).
