@@ -3,21 +3,19 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import pytest
-
 _WORKSPACE = Path(__file__).resolve().parents[2]
-_RUN9_MANIFEST = (_WORKSPACE / "ml-training" / "artifacts" /
-                  "unpacked_voxsoap_ml_exports_20261028-142956" / "asr" /
-                  "whisper-lora-ur-20261028-142956" / "training_manifest.json")
+_FULLSCALE_ASR_MANIFEST = (
+    _WORKSPACE / "ml-training" / "artifacts" /
+    "unpacked_voxsoap_ml_exports_20261030-165202" / "asr" /
+    "whisper-lora-ur-20261030-165202" / "training_manifest.json"
+)
 
 
-def _require_restored_run9_artifacts():
-    if not _RUN9_MANIFEST.is_file():
-        pytest.skip(
-            "run-9 export not restored locally (ml-training/artifacts missing or "
-            "unpacked dir removed) - serving defaults point there honestly as "
-            "UNKNOWN until the owner restores the artifact folder"
-        )
+def _require_fullscale_artifacts():
+    assert _FULLSCALE_ASR_MANIFEST.is_file(), (
+        "full-scale Phase-3 export missing/unpacked incorrectly - expected "
+        f"{_FULLSCALE_ASR_MANIFEST} (see ml-training/reports/phase3_gate_report.md)"
+    )
 
 
 def test_health_ok(client):
@@ -33,17 +31,17 @@ def test_health_ok(client):
 
 
 def test_health_model_scale_labels_are_explicit(client):
-    _require_restored_run9_artifacts()
+    _require_fullscale_artifacts()
     r = client.get("/health")
     body = r.json()
     scale = body["model_scale"]
     assert set(scale) == {"asr", "soap", "roman"}
-    # Run-9 artifacts carry the tag directly in their training manifests.
+    # Full-scale artifacts carry the tag directly in their training manifests.
     assert scale["asr"] == "FULL"
     assert scale["soap"] == "FULL"
-    # Model C: the run-9 adapter FAILED its eval, so the serving default stays
-    # unset -> honest UNKNOWN label (see test_scale_labels.py for the
-    # pre-tag/derivation rules themselves).
+    # Model C (roman) is DEPRECATED: adapter_dir defaults to None -> an honest
+    # UNKNOWN label; /roman answers 501 (see test_scale_labels.py for the
+    # derivation rules themselves).
     assert scale["roman"].startswith("UNKNOWN")
 
 
@@ -55,8 +53,8 @@ def test_health_policy_block(client):
     assert "unload" in body["policy"]["unload_helper"]
 
 
-def test_health_reports_run9_adapter_files(client):
-    _require_restored_run9_artifacts()
+def test_health_reports_fullscale_adapter_files(client):
+    _require_fullscale_artifacts()
     r = client.get("/health")
     comps = r.json()["providers"]["ml"]["components"]
     assert comps["asr"]["adapter_files_present"] is True

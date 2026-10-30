@@ -1,9 +1,9 @@
 """VoxSOAP ML serving configuration (Phase 4 scaffold - contract §9 region).
 
 Every knob is environment-driven with a VOXSOAP_ prefix so the app can be
-retargeted without code edits. Defaults point at the unpacked PHASE-2 SMOKE
-adapters under ml-training/artifacts/ - development/smoke ONLY, never a
-production claim.
+retargeted without code edits. Defaults point at the verified FULL-SCALE
+Phase-3 export (run 20261030-165202) under ml-training/artifacts/ -
+development/gate use ONLY, never a production claim.
 
 Provider rule (contract): the default provider on the ML feature branch must
 be explicit, and there is NO hidden fallback that silently switches to Gemini
@@ -18,14 +18,14 @@ from typing import Optional
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
-# Development default: the verified Phase-2 smoke export (run 8, pre-tag
-# manifests) - kept for reference; the ACTIVE defaults below point at run 9.
-_DEFAULT_ARTIFACTS = (
-    REPO_ROOT / "ml-training" / "artifacts" / "unpacked_voxsoap_ml_exports_20261027-181112"
-)
-
-# Run-9 verified artifacts (RUN_ID 20261028-142956, full-scale tags recorded in
-# each training manifest). ASR + SOAP defaults point here.
+# ACTIVE default: the verified FULL-SCALE Phase-3 gate export (RUN_ID
+# 20261030-165202, unpacked + verified 2026-10-30). Both training manifests
+# carry model_scale="full", executed=true, Tesla T4 (torch 2.11.0+cu130).
+# ASR + SOAP defaults point here. Earlier default exports (run-8 smoke
+# 20261027-181112 and run-9 20261028-142956) no longer exist on disk - the
+# 20261030 combined archive REPLACED them as the serving source. SHA-256 of
+# the export + both adapter weights are recorded in
+# ml-training/reports/phase3_gate_report.md.
 # Model C (Roman Urdu transliteration) is DEPRECATED (2026-10-29, runs 9/10/11):
 # every training recipe failed its evaluation - run-9 emitted ONLY the mT5
 # span-corruption sentinel '<extra_id_0>' (CER 0.9142), run-10 plateaued at
@@ -33,8 +33,8 @@ _DEFAULT_ARTIFACTS = (
 # (CER 6.8905, exact_match 0.0). The roman default therefore stays None and
 # /roman answers an honest 501; VOXSOAP_ROMAN_ADAPTER_DIR remains a
 # diagnostics-only override for a supervised owner-approved re-enable.
-_RUN9_ARTIFACTS = (
-    REPO_ROOT / "ml-training" / "artifacts" / "unpacked_voxsoap_ml_exports_20261028-142956"
+_FULLSCALE_ARTIFACTS = (
+    REPO_ROOT / "ml-training" / "artifacts" / "unpacked_voxsoap_ml_exports_20261030-165202"
 )
 
 VALID_PROVIDERS = ("ml", "gemini")
@@ -56,11 +56,11 @@ class ServingConfig:
     # match the adapter's training_manifest.json exactly (validated at load).
     asr_base_model: str = "openai/whisper-small"
     asr_base_revision: str = "main"
-    asr_adapter_dir: Optional[Path] = _RUN9_ARTIFACTS / "asr" / "whisper-lora-ur-20261028-142956"
+    asr_adapter_dir: Optional[Path] = _FULLSCALE_ARTIFACTS / "asr" / "whisper-lora-ur-20261030-165202"
     # SOAP component.
     soap_base_model: str = "Qwen/Qwen2.5-3B-Instruct"
     soap_base_revision: str = "main"
-    soap_adapter_dir: Optional[Path] = _RUN9_ARTIFACTS / "soap" / "soap-lora-20261028-142956"
+    soap_adapter_dir: Optional[Path] = _FULLSCALE_ARTIFACTS / "soap" / "soap-lora-20261030-165202"
     soap_system_prompt: str = DEFAULT_SOAP_SYSTEM_PROMPT
     # Roman Urdu (Model C): DEPRECATED (2026-10-29, runs 9/10/11 eval failed)
     # -> /roman stays an honest 501; only a supervised owner-approved adapter
@@ -112,12 +112,12 @@ def load_config() -> ServingConfig:
         asr_base_model=_env_str("VOXSOAP_ASR_BASE_MODEL", "openai/whisper-small"),
         asr_base_revision=_env_str("VOXSOAP_ASR_BASE_REVISION", "main"),
         asr_adapter_dir=_env_path("VOXSOAP_ASR_ADAPTER_DIR") or (
-            _RUN9_ARTIFACTS / "asr" / "whisper-lora-ur-20261028-142956"
+            _FULLSCALE_ARTIFACTS / "asr" / "whisper-lora-ur-20261030-165202"
         ),
         soap_base_model=_env_str("VOXSOAP_SOAP_BASE_MODEL", "Qwen/Qwen2.5-3B-Instruct"),
         soap_base_revision=_env_str("VOXSOAP_SOAP_BASE_REVISION", "main"),
         soap_adapter_dir=_env_path("VOXSOAP_SOAP_ADAPTER_DIR") or (
-            _RUN9_ARTIFACTS / "soap" / "soap-lora-20261028-142956"
+            _FULLSCALE_ARTIFACTS / "soap" / "soap-lora-20261030-165202"
         ),
         soap_system_prompt=_env_str("VOXSOAP_SOAP_SYSTEM_PROMPT", DEFAULT_SOAP_SYSTEM_PROMPT),
         roman_base_model=_env_str("VOXSOAP_ROMAN_BASE_MODEL", "google/mt5-small"),

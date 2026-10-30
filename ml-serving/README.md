@@ -6,17 +6,18 @@ DEPRECATED - see below) on the user's Windows
 machine; the Next.js app calls it over `http://127.0.0.1:<port>` (contract
 serving section).
 
-**Status: SCAFFOLD, development only.** Phase-2 SMOKE adapters are used for
-development/shake-out. Nothing here is a production-readiness claim: real
-inference, complete workflow tests and veterinarian-reviewed cases are still
-required before this replaces the existing Gemini path (Phase 5).
+**Status: SCAFFOLD, development only.** The verified FULL-SCALE Phase-3
+adapters (run 20261030-165202) are the default development artifacts. Nothing
+here is a production-readiness claim: the real-inference gate, the complete
+clinical workflow and veterinarian-reviewed cases are still required before
+this replaces the existing Gemini path (Phase 5).
 
 ## Layout
 
 | File | Purpose |
 | --- | --- |
 | `app.py` | FastAPI routes + response envelope (lazy loading, no-fallback policy) |
-| `config.py` | `VOXSOAP_*` env-driven config; defaults point at the unpacked Phase-2 smoke export |
+| `config.py` | `VOXSOAP_*` env-driven config; defaults point at the verified full-scale Phase-3 export (run 20261030-165202) |
 | `providers.py` | `MLProvider` (lazy load / unload / swap) and `GeminiProxyProvider` (explicit-only passthrough) |
 | `audio_utils.py` | audio decode (soundfile, stdlib-WAV fallback) |
 | `guards.py` | deterministic clinical-guard annotations (ported from `evaluate_soap.py`) |
@@ -31,9 +32,10 @@ py app.py                                              # or: py -m uvicorn app:a
 # GET http://127.0.0.1:8321/health
 ```
 
-Note: the default directories point at the verified **run-9** export
-(`ml-training/artifacts/unpacked_voxsoap_ml_exports_20261028-142956/`,
-`model_scale=FULL` in every training manifest). Retarget with
+Note: the default directories point at the verified FULL-SCALE **Phase-3**
+export (`ml-training/artifacts/unpacked_voxsoap_ml_exports_20261030-165202/`,
+`model_scale=full` in both training manifests; verification details and
+SHA-256s: `ml-training/reports/phase3_gate_report.md`). Retarget with
 `VOXSOAP_*_ADAPTER_DIR`. The Roman (Model C) component is **DEPRECATED**
 (2026-10-29): three training recipes (runs 9/10/11) all failed their
 evaluations - mT5 sentinel collapse (CER 0.9142), loss plateau (CER 6.1456),

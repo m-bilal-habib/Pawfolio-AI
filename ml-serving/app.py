@@ -166,7 +166,7 @@ def create_app(cfg: Optional[ServingConfig] = None) -> FastAPI:
             },
             "notes": [
                 "Phase 4 SCAFFOLD: development/smoke use ONLY; no production-readiness claim is made.",
-                "Default dirs point at the verified run-9 artifacts (run 20261028-142956, model_scale=FULL).",
+                "Default dirs point at the verified full-scale Phase-3 artifacts (run 20261030-165202, model_scale=FULL in both training manifests).",
                 "Roman (Model C) is DEPRECATED (2026-10-29): its run-9 eval FAILED (mT5 sentinel collapse) and runs 10/11 also failed "
                 "(loss plateau, then repetition loops; CER 6.8905) - /roman stays an honest 501 unless a supervised owner-approved "
                 "adapter with a passing eval is configured.",
