@@ -105,27 +105,36 @@ otherwise it skips honestly).
 
 ## Real-inference gate status (read before relying on this)
 
-**Evidence recorded 2026-10-30 (Colab Tesla T4):** `pytest -m real` PASSED
-3/3 (42.61 s) with the full-scale `20261030-165202` adapters and the unpinned
-resolve, and the live `POST /draft` probe CAUGHT a real bug:
-`transformers` newer than the verified stack changed
-`apply_chat_template(..., return_tensors="pt")` from a raw tensor to a
-`BatchEncoding`, so the SOAP draft path crashed (`KeyError: 'shape'` → the
-raw exception escaped as an uncontrolled 500). Fixed in `providers.py`:
-explicit `return_dict=True` + `_unwrap_chat_prompt()` (accepts both shapes),
-version-aware `dtype`/`torch_dtype` kwargs, explicitly pinned
-`clean_up_tokenization_spaces=True` (the verified 4.48.3 eval default), and
-every ML inference body now wraps unexpected failures as controlled
-`InferenceError` → 503 (never a silent Gemini swap). The serving runtime is
-pinned in `requirements-serving-ml.txt` (torch 2.11.0, transformers 4.48.3,
-peft 0.18.1, accelerate 1.3.0, soundfile 0.13.1, bitsandbytes 0.49.2) so
-pip never pulls an untested major (e.g. transformers 5.x) again.
+**Phase 4 REAL-INFERENCE GATE: PASSED (2026-10-30, owner's Colab Tesla T4,
+full-scale `20261030-165202` adapters, model_scale FULL on asr + soap).**
+`pytest -m real` **4/4 PASSED** and all four live endpoint probes returned
+200 OK (`/health`, `/transcribe` real Whisper Urdu inference, `/draft` real
+QLoRA SOAP note with guard annotations, `/unload`). Full evidence, chronology,
+integrity chain and honest limitations: `reports/phase4_gate_report.md`.
+Phase 5 (Next.js integration) is planned in `reports/phase5_integration_plan.md`.
 
-Still blocked ON THIS MACHINE: the only installed interpreters are **32-bit**
-Pythons (3.15-32, 2.7-32) and torch publishes no win32 wheels, so
+Chronology kept honestly: the FIRST same-day attempt (unpinned resolve,
+`transformers` newer than the verified 4.48.3) passed 3/3 and its live
+`POST /draft` probe CAUGHT a real bug — newer transformers return a
+`BatchEncoding` from `apply_chat_template(..., return_tensors="pt")` where
+4.48.3 returned a raw tensor, so the SOAP draft path crashed
+(`KeyError: 'shape'`, the raw exception escaping as an uncontrolled 500).
+Fixed in `providers.py` at commit `6a07ed8`: explicit `return_dict=True` +
+`_unwrap_chat_prompt()` (accepts both shapes), version-aware
+`dtype`/`torch_dtype` kwargs, `clean_up_tokenization_spaces=True` pinned
+explicitly (the verified 4.48.3 eval default), every ML inference body
+wrapping unexpected failures as controlled `InferenceError` → 503, and the
+pinned runtime in `requirements-serving-ml.txt` (torch 2.11.0,
+transformers 4.48.3, peft 0.18.1, accelerate 1.3.0, soundfile 0.13.1,
+bitsandbytes 0.49.2) so pip never pulls an untested major (e.g.
+transformers 5.x). The pinned re-run then passed 4/4.
+
+Still no real inference ON THIS MACHINE: the only installed interpreters are
+**32-bit** Pythons (3.15-32, 2.7-32) and torch publishes no win32 wheels, so
 `torch`/`transformers` cannot run locally - the mocked suite (24 tests) runs
-there; the real gate runs on Colab (torch 2.11+cu130) or a local **64-bit
-Python** with the two requirements files. Re-run after any re-pin; the 4th
-real test (real /draft with the full-scale SOAP adapter) is the live
-regression guard for the drift that was caught above. ML failures in a
-torch-absent process surface as honest 503s - never a Gemini swap.
+there; the real gate ran on Colab, and the Phase-5 plan
+(`reports/phase5_integration_plan.md`) sets up a 64-bit Python 3.12 venv to
+close that gap. Re-run the gate after any re-pin; the 4th real test (real
+/draft with the full-scale SOAP adapter) is the live regression guard for the
+drift caught above. `/roman` stays 501 (Model C **DEPRECATED**). ML failures
+in a torch-absent process surface as honest 503s - never a Gemini swap.
