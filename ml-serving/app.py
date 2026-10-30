@@ -11,7 +11,9 @@ Honesty contract enforced in this file:
    with an explicit source, or an explicit UNAVAILABLE/NOT_APPLICABLE label.
  * provider is explicit per request (ml | gemini). An ML failure returns a
    controlled 5xx; there is NEVER a silent Gemini fallback.
- * /roman answers honest 501 until a Model C adapter is configured.
+ * /roman answers an honest 501 - Model C is DEPRECATED (2026-10-29; runs
+ * 9/10/11 failed quality), so 501 stands unless the owner re-enables with a
+ * passing adapter.
 """
 from __future__ import annotations
 
@@ -165,7 +167,9 @@ def create_app(cfg: Optional[ServingConfig] = None) -> FastAPI:
             "notes": [
                 "Phase 4 SCAFFOLD: development/smoke use ONLY; no production-readiness claim is made.",
                 "Default dirs point at the verified run-9 artifacts (run 20261028-142956, model_scale=FULL).",
-                "Roman (Model C) is NOT configured by default: its run-9 eval FAILED (mT5 sentinel collapse).",
+                "Roman (Model C) is DEPRECATED (2026-10-29): its run-9 eval FAILED (mT5 sentinel collapse) and runs 10/11 also failed "
+                "(loss plateau, then repetition loops; CER 6.8905) - /roman stays an honest 501 unless a supervised owner-approved "
+                "adapter with a passing eval is configured.",
                 "Real inference requires a 64-bit Python with torch; the current 32-bit 3.15 cannot import torch "
                 "(the mocked contract suite still runs).",
             ],

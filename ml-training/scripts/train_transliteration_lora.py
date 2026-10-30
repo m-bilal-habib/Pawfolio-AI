@@ -1,6 +1,14 @@
 #!/usr/bin/env python3
 """VoxSOAP ML - Model C: Roman Urdu transliteration LoRA training (§5 Model C, §4.5).
 
+DEPRECATED (2026-10-29, runs 9/10/11): EXPERIMENTAL/UNSOLVED. Three training
+recipes failed evaluation - run-9 sentinel collapse (CER 0.9142, every sample
+emitted only '<extra_id_0>'), run-10 loss plateau at ln(vocab) (CER 6.1456),
+run-11 repetition loops (CER 6.8905, exact_match 0.0). Kept for the research
+record and a supervised owner-approved re-enable attempt only; the notebook
+toggle (RUN_MODEL_C) defaults OFF and this component never blocks Phase 3/4
+(Whisper ASR + SOAP QLoRA).
+
 SEPARATE text-to-text task (contract: "Roman Urdu normalization remains a
 separate optional experiment", §12.1). Never bundled into Whisper, never
 claimed as an ASR capability.

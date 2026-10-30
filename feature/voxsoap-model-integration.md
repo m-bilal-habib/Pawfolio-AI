@@ -235,6 +235,21 @@ The audio must be decoded to the model's expected sample rate/channel format by 
 - Initially, expose Roman Urdu normalization as an optional post-processing stage, with a confidence/uncertainty path and the ability for the clinician to edit it.
 - Evaluate name/medicine handling and code-switching separately; transliteration can alter spelling and meaning.
 
+> **Deprecation addendum (2026-10-29 — owner decision after Model C run 11):**
+> Model C leaves the blocking path and is marked **EXPERIMENTAL / UNSOLVED**.
+> Three measured recipes all failed evaluation: run-9 (fp16-AMP, lr 5e-4)
+> collapsed to the literal sentinel `<extra_id_0>` (CER 0.9142); run-10 (pure
+> fp32, lr 1e-4, 3 epochs) plateaued at loss ≈ ln(vocab) (CER 6.1456); run-11
+> (fp32, LoRA r16 on q/k/v/o, 8 epochs, `<extra_id_0>` target-prefix alignment)
+> degenerated into repetition loops (CER 6.8905, exact_match 0.0). Training
+> stages 14–14c default OFF (`RUN_MODEL_C = False`), and `/roman` stays an
+> honest 501 in serving. If Roman-Urdu normalization is ever required again,
+> the assumed pivots are rule-based normalization or a byte-level
+> character-mapping model (e.g. byt5-small) — explicitly NOT mT5
+> span-corruption fine-tuning. ASR (Whisper) and SOAP (Qwen 2.5-3B QLoRA) are
+> unaffected and remain the Phase-3 core path (details:
+> `ml-training/reports/model_c_deprecation_20261029.md`).
+
 ### Deterministic Clinical Guard
 
 Reuse existing Zod schemas, medication catalog, validation, and workflow rules. An ML model is not the safety validator. The model may propose draft text, but deterministic code should enforce schema shape, required fields, workflow permissions, warnings, and sign-off rules.

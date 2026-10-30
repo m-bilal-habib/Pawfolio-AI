@@ -193,10 +193,11 @@ class MLProvider:
         if adapter_dir is None:
             if key == "roman":
                 raise NotConfigured(
-                    "/roman is intentionally NOT enabled: no Model C (Roman Urdu transliteration) adapter is "
-                    "trained/exported yet. Point VOXSOAP_ROMAN_ADAPTER_DIR at an adapter directory containing "
-                    "training_manifest.json + adapter_model.safetensors to enable it. Nothing was silently "
-                    "substituted (no Gemini fallback)."
+                    "/roman is intentionally a 501 by design: Model C (mT5 Roman Urdu transliteration) was DEPRECATED on "
+                    "2026-10-29 after three training recipes failed their evaluations (runs 9/10/11: sentinel collapse, "
+                    "then loss plateau, then repetition loops; CER 6.8905, exact_match 0.0). VOXSOAP_ROMAN_ADAPTER_DIR "
+                    "remains a diagnostics-only override requiring a training_manifest.json + adapter_model.safetensors "
+                    "from a supervised owner-approved re-enable attempt. Nothing was silently substituted (no Gemini fallback).",
                 )
             raise NotConfigured(
                 f"{key.upper()} adapter directory is not configured; set the VOXSOAP_{key.upper()}_ADAPTER_DIR env var."

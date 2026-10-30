@@ -1,7 +1,8 @@
 # VoxSOAP ML Serving (Phase 4 scaffold)
 
 FastAPI service that will host the VoxSOAP ML components (Whisper ASR LoRA,
-Qwen SOAP QLoRA draft, mT5 Roman-Urdu transliteration) on the user's Windows
+Qwen SOAP QLoRA draft; the mT5 Roman-Urdu transliteration component is
+DEPRECATED - see below) on the user's Windows
 machine; the Next.js app calls it over `http://127.0.0.1:<port>` (contract
 serving section).
 
@@ -33,9 +34,11 @@ py app.py                                              # or: py -m uvicorn app:a
 Note: the default directories point at the verified **run-9** export
 (`ml-training/artifacts/unpacked_voxsoap_ml_exports_20261028-142956/`,
 `model_scale=FULL` in every training manifest). Retarget with
-`VOXSOAP_*_ADAPTER_DIR`. The run-9 Roman-adapter dir exists on disk but its
-evaluation FAILED (mT5 sentinel collapse) - `VOXSOAP_ROMAN_ADAPTER_DIR`
-therefore stays unset by default; set it manually for diagnostics only.
+`VOXSOAP_*_ADAPTER_DIR`. The Roman (Model C) component is **DEPRECATED**
+(2026-10-29): three training recipes (runs 9/10/11) all failed their
+evaluations - mT5 sentinel collapse (CER 0.9142), loss plateau (CER 6.1456),
+then repetition loops (CER 6.8905, exact_match 0.0). `VOXSOAP_ROMAN_ADAPTER_DIR`
+stays a diagnostics-only override; `/roman` answers an honest 501 by design.
 
 ## Routes
 
@@ -44,7 +47,7 @@ therefore stays unset by default; set it manually for diagnostics only.
 | `GET /health` | - | component/status/scale report; loads nothing |
 | `POST /transcribe` | multipart `audio` (16 kHz PCM WAV), form `provider` optional | ASR LoRA transcription; other sample rates => honest 400 |
 | `POST /draft` | JSON `{transcript, provider?}` | SOAP draft + deterministic guard annotations |
-| `POST /roman` | JSON `{text, provider?}` | **501** until `VOXSOAP_ROMAN_ADAPTER_DIR` is set (Model C not trained yet) |
+| `POST /roman` | JSON `{text, provider?}` | **501** - Model C DEPRECATED (runs 9/10/11 failed); diagnostics-only via `VOXSOAP_ROMAN_ADAPTER_DIR` |
 | `POST /unload` | JSON `{component: asr|soap|roman|all}` | frees weights + gc + CUDA cache; swap = change env, restart |
 
 Every response (success **and** controlled error) carries:

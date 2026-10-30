@@ -25,11 +25,14 @@ _DEFAULT_ARTIFACTS = (
 )
 
 # Run-9 verified artifacts (RUN_ID 20261028-142956, full-scale tags recorded in
-# each training manifest). ASR + SOAP defaults point here. The run-9 ROMAN
-# adapter exists on disk but FAILED its evaluation (every prediction was the
-# mT5 span-corruption sentinel '<extra_id_0>'; see the run-9 verification
-# report), so the roman default stays None - enable it via
-# VOXSOAP_ROMAN_ADAPTER_DIR for diagnostics ONLY.
+# each training manifest). ASR + SOAP defaults point here.
+# Model C (Roman Urdu transliteration) is DEPRECATED (2026-10-29, runs 9/10/11):
+# every training recipe failed its evaluation - run-9 emitted ONLY the mT5
+# span-corruption sentinel '<extra_id_0>' (CER 0.9142), run-10 plateaued at
+# loss ~= ln(vocab) (CER 6.1456), run-11 degenerated into repetition loops
+# (CER 6.8905, exact_match 0.0). The roman default therefore stays None and
+# /roman answers an honest 501; VOXSOAP_ROMAN_ADAPTER_DIR remains a
+# diagnostics-only override for a supervised owner-approved re-enable.
 _RUN9_ARTIFACTS = (
     REPO_ROOT / "ml-training" / "artifacts" / "unpacked_voxsoap_ml_exports_20261028-142956"
 )
@@ -59,8 +62,9 @@ class ServingConfig:
     soap_base_revision: str = "main"
     soap_adapter_dir: Optional[Path] = _RUN9_ARTIFACTS / "soap" / "soap-lora-20261028-142956"
     soap_system_prompt: str = DEFAULT_SOAP_SYSTEM_PROMPT
-    # Roman Urdu (Model C): NOT trained/exported yet -> /roman stays an honest
-    # 501 until a Model C adapter + training_manifest.json exist.
+    # Roman Urdu (Model C): DEPRECATED (2026-10-29, runs 9/10/11 eval failed)
+    # -> /roman stays an honest 501; only a supervised owner-approved adapter
+    # with a PASSING eval changes this. VOXSOAP_ROMAN_ADAPTER_DIR = diagnostics.
     roman_base_model: str = "google/mt5-small"
     roman_base_revision: str = "main"
     roman_adapter_dir: Optional[Path] = None

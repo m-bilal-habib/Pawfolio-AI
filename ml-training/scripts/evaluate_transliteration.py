@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """VoxSOAP ML - Model C evaluation: Roman Urdu transliteration (§4.5/§11.x).
 
+DEPRECATED (2026-10-29, runs 9/10/11): EXPERIMENTAL/UNSOLVED - kept for the
+research record and a supervised owner-approved re-enable attempt only.
+Every recorded recipe failed: CER 0.9142 / 6.1456 / 6.8905, exact_match 0.0.
+
 Scores the Model C adapter on the PRESERVED official test pairs:
   * exact_match (normalized + unnormalized)
   * CER via jiwer on the normalized pairs (rule explicitly recorded)
