@@ -152,3 +152,33 @@ Still open (same acceptance checklist, §4): start the REAL local service (§1 v
 E2E loop — recording needs a live mic in a logged-in clinic session, and the visual pass needs a real
 `/health` + `/transcribe` + `/draft` through `127.0.0.1:8321`. Until then the panel shows the honest
 "service not running" drill state by design.
+
+## 7. Local venv + live service gate (2026-10-30) — SUBSET PASSED, E2E with the owner still open
+
+64-bit Python **3.12.10** venv installed at `.venv-ml64/` (gitignored), stack EXACTLY as pinned in
+`requirements-serving-ml.txt`: torch **2.11.0+cpu**, transformers **4.48.3**, peft 0.18.1,
+accelerate 1.3.0, soundfile 0.13.1, bitsandbytes 0.49.2 (installed; unused by the serving compute
+path — the 4-bit loader stays Linux/Colab-only), numpy 2.5.4.
+
+- **Mocked contract suite in the venv:** 24 passed / 4 deselected (7.27 s).
+- **Real-marker suite in the venv (first LOCAL real-inference run of the gate tests):**
+  `test_real_health_reports_unloaded_real_components` PASSED ·
+  `test_real_transcribe_with_phase2_adapter` PASSED (real Whisper-small + the FULL Urdu LoRA, fp32
+  CPU on this machine) · `test_real_roman_stays_501_until_model_c_lands` PASSED ·
+  `test_real_draft_with_fullscale_adapter` SKIPPED with its honest reason (fp32 3B ≈ 12–13 GB RAM on
+  a 15.9 GB machine — the skip-guard is the Windows safeguard working). 3 passed / 1 skipped /
+  24 deselected in 959.70 s.
+- **Live service:** uvicorn (app:app, 127.0.0.1:8321) on the venv; `GET /health` → 200 with
+  `asr: FULL` + `soap: FULL` (`training_manifest.model_scale`), `roman: UNKNOWN(no
+  training_manifest.json)`, `providers.ml.is_mock: false`, gemini `proxy_url_set: false`.
+- **Live `/transcribe` probe:** 200 — `serving_mode: "real-provider"`, `model_scale: "FULL"`,
+  honest envelope fields + audio echo block (16 kHz / 48 000 samples decoded). Probe audio was a
+  SYNTHETIC 3 s tone WAV: the transcription text is meaningless by design and repeated a single
+  Urdu token (Whisper loop behaviour on non-speech input) — that probe gated the ENVELOPE and the
+  real fp32 CPU inference path, not transcription quality. Real-consultation quality evidence
+  remains the Phase-3 gates + vet review sheet, as before.
+- `/draft` deliberately NOT probed from the agent shell: the 3B fp32 load (~12–13 GB against a
+  15.9 GB machine) is best done exactly once from the owner's E2E session, with other apps closed
+  (and the first load performs the one-time Qwen2.5-3B hub download ~6 GB, cached in
+  `%USERPROFILE%\.cache\huggingface`). Loading, answering and unloading from the browser drill
+  remains the acceptance step (§4).

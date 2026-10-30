@@ -63,6 +63,11 @@ desktop.ini
 *.sln
 *.sw?
 
+# Local ML serving venv (64-bit real inference — never committed)
+.venv-ml64/
+venv/
+.venv/
+
 # Temporary and Office lock files
 ~$*
 *.tmp
