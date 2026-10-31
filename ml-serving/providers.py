@@ -305,6 +305,16 @@ class MLProvider:
         base = WhisperForConditionalGeneration.from_pretrained(
             comp["base_model"], revision=comp["base_revision"], **_prep_dtype_kwargs(dtype)
         )
+        # The Whisper checkpoint ships a STALE generation_config default
+        # (forced_decoder_ids = [[1, None], [2, 50359]]). transformers 4.48
+        # IGNORES it whenever task/language kwargs are passed (the live server
+        # log proved exactly that conflict warning) - our generate recipe
+        # (evaluate_asr.py: max_new_tokens + language + task) is kwarg-driven.
+        # Clearing the stale default here is therefore a NO-OP for behaviour;
+        # it only removes the false-conflict warning noise at generate time.
+        stale_forced_ids = getattr(base, "generation_config", None)
+        if stale_forced_ids is not None and getattr(stale_forced_ids, "forced_decoder_ids", None):
+            stale_forced_ids.forced_decoder_ids = None
         model = PeftModel.from_pretrained(base, str(comp["adapter_dir"]))
         model.to(device)
         model.eval()
