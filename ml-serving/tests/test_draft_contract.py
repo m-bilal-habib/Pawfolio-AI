@@ -40,3 +40,29 @@ def test_draft_rejects_oversize_transcript(app, client):
     assert r.status_code == 400
     body = r.json()
     assert "14000" in body["message"]
+
+
+def test_draft_max_new_tokens_override_is_forwarded_and_echoed(app, client):
+    fake = FakeMLProvider()
+    app.state.container.ml = fake
+    r = client.post(
+        "/draft",
+        json={"transcript": "SUBJECTIVE: 5 mg daily noted. PLAN: continue.", "max_new_tokens": 64},
+    )
+    assert r.status_code == 200, r.text
+    assert fake.calls[0][0] == "draft" and fake.calls[0][2] == 64
+    assert r.json()["max_new_tokens"] == 64
+
+
+def test_draft_max_new_tokens_out_of_range_is_honest_400(app, client):
+    app.state.container.ml = FakeMLProvider()
+    for bad in (0, 999999):
+        r = client.post(
+            "/draft",
+            json={"transcript": "SUBJECTIVE: 5 mg daily noted. PLAN: continue.", "max_new_tokens": bad},
+        )
+        assert r.status_code == 400, r.text
+        body = r.json()
+        assert body["error"] == "bad_request"
+        assert "512" in body["message"]  # states the configured cap explicitly
+        assert body["provider"] == "ml"

@@ -64,8 +64,8 @@ class FakeMLProvider:
             raise InferenceError("fake ML inference failure (test double)")
         return {"text": "instrumented mock transcription 25 mg two times daily", "note": "MOCKED"}
 
-    def draft(self, transcript: str):
-        self.calls.append(("draft", len(transcript)))
+    def draft(self, transcript: str, max_new_tokens=None):
+        self.calls.append(("draft", len(transcript), max_new_tokens))
         if self.fail:
             raise InferenceError("fake ML inference failure (test double)")
         return {
@@ -73,6 +73,7 @@ class FakeMLProvider:
                 "SUBJECTIVE: cough for 3 days. OBJECTIVE: temperature 38.5. "
                 "ASSESSMENT: start 25 mg syrup daily. PLAN: weight-based dose not stated."
             ),
+            "max_new_tokens": max_new_tokens if max_new_tokens is not None else 256,
             "note": "MOCKED",
         }
 
@@ -105,7 +106,7 @@ class FakeGeminiProvider:
     def transcribe(self, samples, sample_rate: int, audio_bytes=None, language: str = "ur"):
         return {"text": "fake-gemini-transcription", "upstream": "mocked"}
 
-    def draft(self, transcript: str):
+    def draft(self, transcript: str, max_new_tokens=None):
         return {"draft": "fake-gemini draft", "upstream": "mocked"}
 
     def roman(self, text: str):

@@ -329,7 +329,22 @@ class MLProvider:
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
         device = self._resolve_device()
-        dtype = torch.float16 if device == "cuda" else torch.float32
+        # 2026-10-31 local-speed fix: the fp32 3B CPU load is ~12.4 GB against
+        # a 15.9 GB machine (disk-swap city). PyTorch CPU supports bfloat16
+        # natively on x86_64 (oneDNN): bf16 weights are ~6.2 GB AND matmuls
+        # run FASTER than fp32 on this stack. fp16 remains the CUDA choice;
+        # VOXSOAP_SOAP_DTYPE=bfloat16|float16|float32 is the honest override.
+        # (mt5/roman keeps its fp32 master - its direct-fp16 NaN guard note
+        # above does not apply here: Qwen is a causal LM, not a T5 family.)
+        dtype_env = str(getattr(self._cfg, "soap_dtype", "auto") or "auto").strip().lower()
+        if dtype_env in ("bfloat16", "bf16"):
+            dtype = torch.bfloat16
+        elif dtype_env == "float16":
+            dtype = torch.float16
+        elif dtype_env == "float32":
+            dtype = torch.float32
+        else:  # auto
+            dtype = torch.float16 if device == "cuda" else torch.bfloat16
         tokenizer_src = str(comp["adapter_dir"])
         try:
             tok = AutoTokenizer.from_pretrained(tokenizer_src)
@@ -339,8 +354,13 @@ class MLProvider:
             # _require_adapter(), so falling back to that validated base's
             # tokenizer is safe (never a silent cross-model mix).
             tok = AutoTokenizer.from_pretrained(comp["base_model"], revision=comp["base_revision"])
+        load_kwargs = _prep_dtype_kwargs(dtype)
+        if device == "cpu":
+            # accelerate-backed lazy load: builds the fp/bf16 skeleton then
+            # streams weights in, avoiding a transient fp32 copy of the base.
+            load_kwargs["low_cpu_mem_usage"] = True
         base = AutoModelForCausalLM.from_pretrained(
-            comp["base_model"], revision=comp["base_revision"], **_prep_dtype_kwargs(dtype)
+            comp["base_model"], revision=comp["base_revision"], **load_kwargs
         )
         model = PeftModel.from_pretrained(base, str(comp["adapter_dir"]))
         model.to(device)
@@ -462,7 +482,7 @@ class MLProvider:
                 "Nothing was silently substituted (no Gemini fallback)."
             ) from err
 
-    def draft(self, transcript: str) -> Dict[str, Any]:
+    def draft(self, transcript: str, max_new_tokens: Optional[int] = None) -> Dict[str, Any]:
         try:
             state = self._loaded["soap"] or self._load_soap()
             torch = self._real_stack()
@@ -485,9 +505,21 @@ class MLProvider:
                 return_dict=True,
             )
             prompt_ids, prompt_mask = _unwrap_chat_prompt(prompt)
+            # 2026-10-31 local-speed: an explicit request-level cap wins
+            # (validated 1..cfg cap at the API layer and echoed in the
+            # envelope). None -> a fast CPU default: 256 new tokens is plenty
+            # for a reviewable S/O/A/P sketch and keeps a full local draft
+            # far inside practical review latency; CUDA keeps the configured
+            # 512 (the phase-3 anti-truncation value). Honest, explicit, and
+            # visible in the response — never a silent edit of the note.
+            tokens_cap = self._cfg.draft_max_new_tokens
+            if max_new_tokens is not None:
+                tokens_cap = int(max_new_tokens)
+            elif self._resolve_device() == "cpu":
+                tokens_cap = min(256, tokens_cap)
             gen_kwargs: Dict[str, Any] = {
                 "input_ids": prompt_ids.to(model.device),
-                "max_new_tokens": self._cfg.draft_max_new_tokens,
+                "max_new_tokens": tokens_cap,
                 "do_sample": False,
                 "pad_token_id": tok.pad_token_id or tok.eos_token_id,
             }
@@ -504,7 +536,7 @@ class MLProvider:
             return {
                 "draft": text,
                 "generation": "greedy",
-                "max_new_tokens": self._cfg.draft_max_new_tokens,
+                "max_new_tokens": tokens_cap,
                 "note": "assistive DRAFT - deterministic guard annotations attached; vet confirmation is mandatory",
             }
         except ProviderError:
@@ -618,8 +650,11 @@ class GeminiProxyProvider:
         }
         return self._post_task("transcribe", payload)
 
-    def draft(self, transcript: str) -> Dict[str, Any]:
-        return self._post_task("draft", {"transcript": transcript})
+    def draft(self, transcript: str, max_new_tokens: Optional[int] = None) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {"transcript": transcript}
+        if max_new_tokens is not None:
+            payload["max_new_tokens"] = max_new_tokens
+        return self._post_task("draft", payload)
 
     def roman(self, text: str) -> Dict[str, Any]:
         return self._post_task("roman", {"text": text})

@@ -82,6 +82,11 @@ class ServingConfig:
     transcript_max_chars: int = 14000  # prepare_soap_data.py MAX_CHARS cap
     asr_max_new_tokens: int = 256      # evaluate_asr.py generate recipe
     draft_max_new_tokens: int = 512    # phase-3 fix for the 256-token truncations
+    # SOAP base dtype: "auto" = fp16 on CUDA, bfloat16 on CPU (2026-10-31
+    # local-speed fix: bf16 halves the 3B CPU RAM footprint ~12.4 -> ~6.2 GB
+    # and is FASTER on x86_64/oneDNN). Override honestly:
+    # VOXSOAP_SOAP_DTYPE=bfloat16|float16|float32.
+    soap_dtype: str = "auto"
     roman_max_new_tokens: int = 256    # evaluate_transliteration.py recipe
 
 
@@ -132,5 +137,6 @@ def load_config() -> ServingConfig:
         transcript_max_chars=int(_env_str("VOXSOAP_TRANSCRIPT_MAX_CHARS", "14000")),
         asr_max_new_tokens=int(_env_str("VOXSOAP_ASR_MAX_NEW_TOKENS", "256")),
         draft_max_new_tokens=int(_env_str("VOXSOAP_DRAFT_MAX_NEW_TOKENS", "512")),
+        soap_dtype=_env_str("VOXSOAP_SOAP_DTYPE", "auto").strip().lower(),
         roman_max_new_tokens=int(_env_str("VOXSOAP_ROMAN_MAX_NEW_TOKENS", "256")),
     )

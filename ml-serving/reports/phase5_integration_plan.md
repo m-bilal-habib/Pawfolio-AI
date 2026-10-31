@@ -182,3 +182,34 @@ path — the 4-bit loader stays Linux/Colab-only), numpy 2.5.4.
   (and the first load performs the one-time Qwen2.5-3B hub download ~6 GB, cached in
   `%USERPROFILE%\.cache\huggingface`). Loading, answering and unloading from the browser drill
   remains the acceptance step (§4).
+
+## 8. Local speed + RAM fixes (2026-10-31, owner-requested) — lgtm pending owner CPU run
+
+Owner pain: first `/draft` from the UI burned the 300 s proxy ceiling on the under-way hub download
+and a ~12.4 GB fp32 3B load against ~3.7–6 GB free RAM; both are capacity, not correctness,
+problems and were fixed as capacity problems — never by hiding the failure.
+
+- **Weights pre-cached:** full `Qwen/Qwen2.5-3B-Instruct` snapshot resolved through
+  `huggingface_hub.snapshot_download` in `.venv-ml64` BEFORE any UI click (resumed from the
+  2.48 GB partial cache). `hf_xet` deliberately NOT installed — the venv stays byte-exact to the
+  pinned requirements.
+- **SOAP dtype:** `_load_soap` now picks bfloat16 on CPU (fp16 stays the CUDA auto), halving the
+  3B CPU footprint ~12.4 GB → ~6.2 GB, faster oneDNN matmuls, `low_cpu_mem_usage=True` streams the
+  weights in. Honest escape hatch: `VOXSOAP_SOAP_DTYPE=bfloat16|float16|float32` overrides the
+  auto; roman/mt5 keeps its fp32 master (direct-fp16 NaN guard note unaffected — Qwen is a causal
+  LM, not T5-family). ASR stays fp32 → the verified eval recipe is untouched; its fp32 footprint
+  is small. HONESTY CAVEAT: bf16 CPU is a numerical change vs the fp32 measured eval — the vet
+  review sheet remains the clinical verdict source (unchanged rule).
+- **Draft token budget:** `/draft` accepts an optional `max_new_tokens` (1..512, out-of-range =
+  honest 400 before any model work) and the provider defaults to **256 on CPU** (512 stays for
+  CUDA). The envelope echoes the effective cap. Mocked suite 31 → **33** (override-forwarded +
+  out-of-range cases); the fakes record the override in `calls[2]`.
+- **Proxy budget:** `/api/voxsoap/*` timeout 300 s → **900 s** (`VOXSOAP_TIMEOUT_MS` still wins if
+  set); the page client sits at 912 s so the proxy's controlled 504 still wins the race.
+- **Ops aids:** `start-voxsoap-local.bat` (two-window launcher), `ml-serving/probe_local_service.mjs`
+  (health → 35 s EN 2-window transcribe → klingon-400 → `/unload all`), README counts refreshed.
+- Live re-gate after the restart (agent-visible tail): probe chain passed — health → real 35 s EN
+  `/transcribe` (200, real-provider FULL, ASR loaded by the run itself) → `klingon` honest-400 →
+  `/unload all` with `asr: true` dropped (soap/roman were never loaded) and RAM visibly returned.
+  (Owner's first live bf16 CPU
+  `/draft` still lands as their acceptance evidence.)

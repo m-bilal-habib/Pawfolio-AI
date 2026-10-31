@@ -20,8 +20,8 @@ export interface VoxSoapMLStaffHeaders {
 }
 
 /** Slightly above the proxy timeout so the proxy's controlled 504 wins the
- * race instead of an opaque client-side abort. */
-const CLIENT_TIMEOUT_MS = 310_000;
+ * race instead of an opaque client-side abort (proxy budget: 900 s). */
+const CLIENT_TIMEOUT_MS = 912_000;
 
 function staffHeadersToInit(staff: VoxSoapMLStaffHeaders): Record<string, string> {
   return {

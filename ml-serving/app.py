@@ -61,6 +61,9 @@ class ServiceContainer:
 class TranscriptRequest(BaseModel):
     transcript: str
     provider: Optional[str] = None
+    # Optional per-request generation cap (2026-10-31 local-speed). None =
+    # provider default (256 fast CPU default / 512 configured cap on CUDA).
+    max_new_tokens: Optional[int] = None
 
 
 class RomanRequest(BaseModel):
@@ -230,7 +233,14 @@ def create_app(cfg: Optional[ServingConfig] = None) -> FastAPI:
                 f"transcript has {len(text)} chars, over the {cfg.transcript_max_chars} cap "
                 "(prepare_soap_data.py MAX_CHARS); shorten it or raise VOXSOAP_TRANSCRIPT_MAX_CHARS."
             )
-        result = provider_obj.draft(text)
+        # Honest 400 BEFORE any model work: an out-of-range cap is a request
+        # error, never a silent clamp (mirrors the /transcribe language gate).
+        if body.max_new_tokens is not None and not (1 <= body.max_new_tokens <= cfg.draft_max_new_tokens):
+            raise BadRequest(
+                f"max_new_tokens must be between 1 and {cfg.draft_max_new_tokens} "
+                f"(VOXSOAP_DRAFT_MAX_NEW_TOKENS); got {body.max_new_tokens}."
+            )
+        result = provider_obj.draft(text, max_new_tokens=body.max_new_tokens)
         result["guard"] = clinical_guard(result.get("draft", ""), text)
         return _respond(request, provider_obj, result, started)
 
