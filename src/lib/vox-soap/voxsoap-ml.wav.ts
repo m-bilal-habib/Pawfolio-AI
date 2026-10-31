@@ -21,6 +21,61 @@ const TARGET_SAMPLE_RATE = 16_000;
 
 export const VOXSOAP_TARGET_SAMPLE_RATE = TARGET_SAMPLE_RATE;
 
+/** Accepted upload containers for the ML upload path (normalized base MIME).
+ * Mirrors the browser-decodable set: whatever Chrome can decodeAudioData is
+ * fair game, because the pipeline below canonically re-encodes to 16 kHz
+ * mono PCM WAV before upload. */
+const ACCEPTED_UPLOAD_MIMES = new Set([
+  'audio/wav',
+  'audio/x-wav',
+  'audio/mp3',
+  'audio/mpeg',
+  'audio/mp4',
+  'audio/x-m4a',
+  'audio/webm',
+  'audio/ogg',
+  'audio/opus',
+  'audio/aac',
+  'audio/flac',
+]);
+
+/** Extension fallback for files whose File.type is empty or the generic
+ * application/octet-stream bucket (Windows registry gaps on .m4a/.aac). */
+const UPLOAD_EXT_TO_MIME: Record<string, string> = {
+  wav: 'audio/wav',
+  wave: 'audio/wav',
+  mp3: 'audio/mp3',
+  webm: 'audio/webm',
+  ogg: 'audio/ogg',
+  oga: 'audio/ogg',
+  opus: 'audio/ogg',
+  mp4: 'audio/mp4',
+  m4a: 'audio/mp4',
+  aac: 'audio/aac',
+  flac: 'audio/flac',
+};
+
+/** Strips codec/registry parameters ("audio/webm;codecs=opus" → "audio/webm")
+ * and canonicalizes vendor wave aliases — mirrors normalizeAudioMime in the
+ * /extract route and normalizeMime in UploadAudioPanel. */
+export function normalizeAudioMime(rawMime: string): string {
+  const base = rawMime.split(';')[0].trim().toLowerCase();
+  return base === 'audio/wave' || base === 'audio/vnd.wave' ? 'audio/wav' : base;
+}
+
+/** Resolves an uploaded File's audio type: reported MIME first (parameter-
+ * stripped), extension ONLY when the type carried no information. Returns
+ * null when NEITHER answers the accepted set — the caller rejects honestly. */
+export function resolveUploadAudioMime(file: File): string | null {
+  const reported = normalizeAudioMime(file.type);
+  if (ACCEPTED_UPLOAD_MIMES.has(reported)) return reported;
+  const fileExt = (file.name.split('.').pop() ?? '').toLowerCase();
+  if ((reported === '' || reported === 'application/octet-stream') && fileExt in UPLOAD_EXT_TO_MIME) {
+    return UPLOAD_EXT_TO_MIME[fileExt];
+  }
+  return null;
+}
+
 /** Rough deliverable size in bytes for a given duration at 16 kHz s16le mono
  * (32,000 B/s — the same math the panel uses for its size guard). */
 export function pcm16kBytesForSeconds(seconds: number): number {
@@ -88,6 +143,66 @@ export interface Pcm16CaptureHandle {
   /** Drops everything and releases the AudioContext (mic tracks live in the
    * caller's MediaStream, same as the Gemini-flow panels). */
   cancel: () => void;
+}
+
+/** Decodes ANY browser-decodable audio container (WAV / MP3 / M4A / WebM /
+ * OGG / FLAC …), mixes every channel down to mono, resamples to 16 kHz via
+ * an OfflineAudioContext, and encodes the canonical 16-bit PCM mono WAV the
+ * ML contract requires (client-side resample only — the server never
+ * resamples). Throws honestly when the browser cannot decode the container —
+ * no silence is fabricated. */
+export async function decodeAndResampleToWav16k(file: File): Promise<Blob> {
+  if (typeof window === 'undefined') {
+    throw new Error('Audio upload decoding is a browser-only API.');
+  }
+  const Ctor =
+    window.AudioContext ??
+    (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+  if (!Ctor) {
+    throw new Error('The Web Audio API is unavailable in this browser — the uploaded file was NOT processed.');
+  }
+  const decodeContext = new Ctor();
+  try {
+    const arrayBuffer = await file.arrayBuffer();
+    let decoded: AudioBuffer;
+    try {
+      decoded = await decodeContext.decodeAudioData(arrayBuffer);
+    } catch {
+      const reported = normalizeAudioMime(file.type) || 'unknown type';
+      throw new Error(
+        `The browser could not decode this file (${reported}). Export the consultation as WAV, MP3, M4A, WebM or OGG and retry — nothing was invented.`
+      );
+    }
+    const frames = decoded.length;
+    if (frames === 0) {
+      throw new Error('The uploaded file decoded to zero samples — nothing was uploaded, nothing invented.');
+    }
+    // Mono mixdown: average every channel into one stream.
+    const channelCount = Math.max(1, decoded.numberOfChannels);
+    const mono = new Float32Array(frames);
+    for (let ch = 0; ch < channelCount; ch += 1) {
+      const data = decoded.getChannelData(ch);
+      for (let i = 0; i < frames; i += 1) mono[i] += data[i] / channelCount;
+    }
+    const decodedRate = decoded.sampleRate;
+    if (decodedRate === TARGET_SAMPLE_RATE) {
+      return encodeWavMono16([mono], TARGET_SAMPLE_RATE);
+    }
+    // Resample client-side via an OfflineAudioContext (exact same recipe the
+    // live-capture stop() path uses) so the 16 kHz contract holds.
+    const frameCount = Math.max(1, Math.ceil((frames / decodedRate) * TARGET_SAMPLE_RATE));
+    const offline = new OfflineAudioContext(1, frameCount, TARGET_SAMPLE_RATE);
+    const scratch = offline.createBuffer(1, frames, decodedRate);
+    scratch.getChannelData(0).set(mono);
+    const source = offline.createBufferSource();
+    source.buffer = scratch;
+    source.connect(offline.destination);
+    source.start();
+    const rendered = await offline.startRendering();
+    return encodeWavMono16([rendered.getChannelData(0)], TARGET_SAMPLE_RATE);
+  } finally {
+    void decodeContext.close().catch(() => undefined);
+  }
 }
 
 /** Starts capturing `stream` as Float32 chunks via the pcm-recorder worklet.

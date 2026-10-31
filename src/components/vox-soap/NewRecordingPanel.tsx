@@ -398,8 +398,12 @@ export const NewRecordingPanel: React.FC<{
    * same blob from the kept mic chunks and re-sends it against the SAME
    * shell visit — no re-recording (Scribenote "Retry" pattern). */
   const postRecordingJob = async () => {
+    // Strip MediaRecorder codec parameters ("audio/webm;codecs=opus" →
+    // "audio/webm") BEFORE the blob carries them to the server allowlist —
+    // 2026-10-31 E2E fix: the raw tag was rejected 415 at stop-recording.
+    const rawRecordingType = recorderRef.current?.mimeType ?? 'audio/webm';
     const micBlob = new Blob(chunksRef.current, {
-      type: recorderRef.current?.mimeType ?? 'audio/webm',
+      type: rawRecordingType.split(';')[0].trim().toLowerCase(),
     });
     if (micBlob.size === 0) {
       setStage('error');

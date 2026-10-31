@@ -105,14 +105,22 @@ export function mlUnload(
   );
 }
 
+/** `/transcribe` language contract — mirrors the ml-serving API layer
+ * ("ur" | "en" | "auto"; anything else is an honest 400 upstream). */
+export type VoxSoapMLLanguage = 'ur' | 'en' | 'auto';
+
 /** Sends a 16 kHz mono PCM WAV. The service returns an honest 400 for any
- * other rate — the client-side capture path guarantees 16 kHz. */
+ * other rate — the client-side capture path guarantees 16 kHz. The optional
+ * language field tags the Whisper decoder (`ur`/`en`) or asks the model to
+ * auto-detect (`auto`); the service defaults to `ur` when omitted. */
 export function mlTranscribe(
   wav: Blob,
-  staff: VoxSoapMLStaffHeaders
+  staff: VoxSoapMLStaffHeaders,
+  language?: VoxSoapMLLanguage
 ): Promise<VoxSoapMLCall> {
   const formData = new FormData();
   formData.append('audio', wav, 'consultation-16k.wav');
+  if (language) formData.append('language', language);
   return call('transcribe', { method: 'POST', body: formData }, staff);
 }
 

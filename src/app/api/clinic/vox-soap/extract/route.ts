@@ -24,6 +24,49 @@ const ALLOWED_AUDIO_MIMES = new Set([
   'audio/x-aiff',
 ]);
 
+/**
+ * Browsers and OS registries rarely report a bare MIME: MediaRecorder emits
+ * "audio/webm;codecs=opus", Windows WAVE files surface as "audio/wave" or
+ * "audio/vnd.wave". The allowlist comparison always sees the NORMALIZED base
+ * type, never the raw string (2026-10-31 E2E fix: the raw
+ * "audio/webm;codecs=opus" tag was rejected 415 at stop-recording).
+ */
+function normalizeAudioMime(rawMime: string): string {
+  const base = rawMime.split(';')[0].trim().toLowerCase();
+  return base === 'audio/wave' || base === 'audio/vnd.wave' ? 'audio/wav' : base;
+}
+
+/** Extension fallback for files whose reported type carries no information
+ * (empty File.type or generic application/octet-stream — common on Windows
+ * for .m4a/.aac/.flac recordings whose registry mapping is missing). Every
+ * value is a member of ALLOWED_AUDIO_MIMES. */
+const EXTENSION_TO_MIME: Record<string, string> = {
+  wav: 'audio/wav',
+  mp3: 'audio/mp3',
+  webm: 'audio/webm',
+  ogg: 'audio/ogg',
+  oga: 'audio/ogg',
+  opus: 'audio/ogg',
+  mp4: 'audio/mp4',
+  m4a: 'audio/mp4',
+  aac: 'audio/aac',
+  flac: 'audio/flac',
+};
+
+/** Resolves what an uploaded audio File actually is: strip parameters from
+ * the reported type first; only when the type says nothing (empty or the
+ * generic octet-stream bucket) trust the file extension. */
+function resolveUploadAudioMime(file: File): { mime: string | null; reported: string } {
+  const reported = normalizeAudioMime(file.type);
+  if (ALLOWED_AUDIO_MIMES.has(reported)) return { mime: reported, reported };
+  const fileExt = (file.name.split('.').pop() ?? '').toLowerCase();
+  if ((reported === '' || reported === 'application/octet-stream') && fileExt in EXTENSION_TO_MIME) {
+    const byExt = EXTENSION_TO_MIME[fileExt];
+    return { mime: byExt, reported };
+  }
+  return { mime: null, reported };
+}
+
 function extractStaffSession(req: NextRequest): StaffSessionContext {
   const roleHeader = (req.headers.get('x-staff-role') ?? 'veterinarian') as ClinicStaffRole;
   return {
@@ -91,14 +134,17 @@ export async function POST(req: NextRequest) {
             { status: 413 }
           );
         }
-        if (!ALLOWED_AUDIO_MIMES.has(audioFile.type)) {
+        const resolved = resolveUploadAudioMime(audioFile);
+        if (!resolved.mime) {
           return NextResponse.json(
-            { error: `Unsupported audio MIME type: ${audioFile.type}` },
+            {
+              error: `Unsupported audio MIME type: ${resolved.reported || '(empty)'} — accepted audio: WebM, WAV, MP3, M4A, AAC, OGG, FLAC, AIFF.`,
+            },
             { status: 415 }
           );
         }
         audioBuffer = Buffer.from(await audioFile.arrayBuffer());
-        audioMimeType = audioFile.type;
+        audioMimeType = resolved.mime;
       }
     } else {
       const body = await req.json();

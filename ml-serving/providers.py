@@ -371,7 +371,8 @@ class MLProvider:
 
     # ---------- inference ----------
 
-    def transcribe(self, samples, sample_rate: int, audio_bytes: Optional[bytes] = None) -> Dict[str, Any]:
+    def transcribe(self, samples, sample_rate: int, audio_bytes: Optional[bytes] = None,
+                   language: str = "ur") -> Dict[str, Any]:
         try:
             state = self._loaded["asr"] or self._load_asr()
             torch = self._real_stack()
@@ -380,39 +381,78 @@ class MLProvider:
             model = state["model"]
             processor = state["processor"]
             speech = np.asarray(samples, dtype=np.float32)
-            feats = processor.feature_extractor(
-                speech,
-                sampling_rate=sample_rate,
-                return_attention_mask=True,
-                return_tensors="pt",
-            )
-            # max_new_tokens is the actively supported generate arg (the exact
-            # recipe evaluate_asr.py used for the verified Stage-10 eval under
-            # the pinned stack); `max_length` is the deprecated Whisper path.
-            gen_kwargs: Dict[str, Any] = {
-                "max_new_tokens": self._cfg.asr_max_new_tokens,
-                "language": "urdu",
-                "task": "transcribe",
-            }
-            if getattr(feats, "attention_mask", None) is not None:
-                gen_kwargs["attention_mask"] = feats.attention_mask.to(model.device)
-            with torch.no_grad():
-                ids = model.generate(
-                    input_features=feats.input_features.to(device=model.device, dtype=model.dtype),
-                    **gen_kwargs,
+
+            # Language contract for /transcribe: explicit "ur"/"en" tag the
+            # decoder with the SAME recipe the verified eval pipeline used
+            # (language + task kwargs); "auto" omits the language kwarg so
+            # Whisper detects language from the audio. Values are validated in
+            # the API layer; the default stays "ur" (the original scaffold
+            # behaviour - no silent contract change for existing callers).
+            lang_key = (language or "ur").strip().lower()
+            lang_whisper = {"ur": "urdu", "en": "english"}.get(lang_key)
+
+            def _decode_window(window: "np.ndarray") -> str:
+                feats = processor.feature_extractor(
+                    window,
+                    sampling_rate=sample_rate,
+                    return_attention_mask=True,
+                    return_tensors="pt",
                 )
-            # clean_up_tokenization_spaces pinned EXPLICITLY to True: that is
-            # the default the verified eval stack (4.48.3) actually measured,
-            # and it keeps serving output consistent with the eval pipeline
-            # even when a future transformers flips the default to False.
-            text = processor.tokenizer.batch_decode(
-                ids, skip_special_tokens=True, clean_up_tokenization_spaces=True
-            )[0].strip()
+                # max_new_tokens is the actively supported generate arg (the
+                # exact recipe evaluate_asr.py used for the verified Stage-10
+                # eval under the pinned stack); `max_length` is the deprecated
+                # Whisper path.
+                gen_kwargs: Dict[str, Any] = {
+                    "max_new_tokens": self._cfg.asr_max_new_tokens,
+                    "task": "transcribe",
+                }
+                if lang_whisper is not None:
+                    gen_kwargs["language"] = lang_whisper
+                if getattr(feats, "attention_mask", None) is not None:
+                    gen_kwargs["attention_mask"] = feats.attention_mask.to(model.device)
+                with torch.no_grad():
+                    ids = model.generate(
+                        input_features=feats.input_features.to(device=model.device, dtype=model.dtype),
+                        **gen_kwargs,
+                    )
+                # clean_up_tokenization_spaces pinned EXPLICITLY to True: that
+                # is the default the verified eval stack (4.48.3) measured,
+                # and it keeps serving output consistent with the eval
+                # pipeline even when a future transformers flips the default.
+                return processor.tokenizer.batch_decode(
+                    ids, skip_special_tokens=True, clean_up_tokenization_spaces=True
+                )[0].strip()
+
+            window_len = 30 * int(sample_rate)
+            # Whisper is a fixed 30 s window model. Audio longer than one
+            # window is split into sequential clean 30 s windows (no overlap -
+            # clean joins faster than overlap handoffs on CPU and honest about
+            # it: a word straddling a boundary may clip; surfaced in `note`).
+            bounds = [
+                (start, min(start + window_len, speech.shape[0]))
+                for start in range(0, speech.shape[0], window_len)
+            ]
+            window_count = len(bounds)
+            if window_count == 1:
+                text = _decode_window(speech)
+                note = "single-window transcription (input <= 30 s)"
+            else:
+                parts = []
+                for start, end in bounds:
+                    part_text = _decode_window(speech[start:end])
+                    if part_text:
+                        parts.append(part_text)
+                text = " ".join(parts)
+                note = (
+                    f"multi-window transcription: {window_count} x 30 s windows joined (no overlap); "
+                    "a word straddling a window boundary may clip"
+                )
             return {
                 "text": text,
-                "language": "urdu",
+                "language": lang_key,
                 "sample_rate": sample_rate,
-                "note": "single-window transcription; long-clip windowing is NOT implemented in this scaffold",
+                "windows": window_count,
+                "note": note,
             }
         except ProviderError:
             raise  # controlled errors keep their exact identity/status
@@ -568,10 +608,12 @@ class GeminiProxyProvider:
             "is_mock": self.is_mock,
         }
 
-    def transcribe(self, samples, sample_rate: int, audio_bytes: Optional[bytes] = None) -> Dict[str, Any]:
+    def transcribe(self, samples, sample_rate: int, audio_bytes: Optional[bytes] = None,
+                   language: str = "ur") -> Dict[str, Any]:
         payload = {
             "audio_b64": base64.b64encode(audio_bytes or b"").decode("ascii"),
             "sample_rate": sample_rate,
+            "language": (language or "ur"),
             "note": "passthrough to the existing Gemini-backed speech service",
         }
         return self._post_task("transcribe", payload)

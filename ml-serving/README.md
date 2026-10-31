@@ -98,7 +98,8 @@ py -m pytest ml-serving/tests -m real -v
 ```
 
 Mocked tests use fake providers reporting `serving_mode="mocked-test-double"`
-in every response (24 tests). Real-inference tests are additionally gated by
+in every response (31 tests, including the /transcribe language contract).
+Real-inference tests are additionally gated by
 `pytest.mark.real` (4 tests: health, real /transcribe, roman-501, real /draft -
 the 4th needs CUDA or `VOXSOAP_REAL_DRAFT_FORCE=1` + ~13 GB free CPU RAM,
 otherwise it skips honestly).
@@ -129,9 +130,10 @@ transformers 4.48.3, peft 0.18.1, accelerate 1.3.0, soundfile 0.13.1,
 bitsandbytes 0.49.2) so pip never pulls an untested major (e.g.
 transformers 5.x). The pinned re-run then passed 4/4.
 
-Still no real inference ON THIS MACHINE: the only installed interpreters are
-**32-bit** Pythons (3.15-32, 2.7-32) and torch publishes no win32 wheels, so
-`torch`/`transformers` cannot run locally - the mocked suite (24 tests) runs
+Still no real inference ON THIS MACHINE outside the venv: the interpreters
+installed outside `.venv-ml64` are **32-bit** Pythons (3.15-32, 2.7-32) and
+torch publishes no win32 wheels, so `torch`/`transformers` cannot run in them -
+the mocked suite (31 tests) runs
 there; the real gate ran on Colab, and the Phase-5 plan
 (`reports/phase5_integration_plan.md`) sets up a 64-bit Python 3.12 venv to
 close that gap. Re-run the gate after any re-pin; the 4th real test (real

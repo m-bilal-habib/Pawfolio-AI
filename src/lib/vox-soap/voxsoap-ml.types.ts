@@ -107,6 +107,8 @@ export interface VoxSoapMLEnvelope extends VoxSoapMLErrorFields {
   text?: string;
   language?: string;
   sample_rate?: number;
+  /** Number of 30 s Whisper windows processed (multi-window transcription). */
+  windows?: number;
 
   // /draft success payload
   draft?: string;

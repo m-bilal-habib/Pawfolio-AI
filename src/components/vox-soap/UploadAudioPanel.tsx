@@ -59,6 +59,21 @@ const ALLOWED_MIMES = new Set([
   'audio/x-aiff',
 ]);
 
+/** MIME strings from browsers/OS registries often carry parameters
+ * ("audio/webm;codecs=opus") or vendor aliases ("audio/wave") — normalized
+ * base type before every allowlist comparison (mirrors
+ * normalizeAudioMime in src/app/api/clinic/vox-soap/extract/route.ts). */
+function normalizeMime(rawMime: string): string {
+  const base = rawMime.split(';')[0].trim().toLowerCase();
+  return base === 'audio/wave' || base === 'audio/vnd.wave' || base === 'audio/x-wav'
+    ? 'audio/wav'
+    : base === 'audio/x-flac'
+    ? 'audio/flac'
+    : base === 'audio/x-aiff'
+    ? 'audio/aiff'
+    : base;
+}
+
 /**
  * Fallback for browsers that report an empty File.type (common for .m4a
  * voice memos, .opus, .oga). Checked by extension.
@@ -78,9 +93,10 @@ const EXTENSION_FALLBACK: Record<string, string> = {
   aif: 'audio/aiff',
 };
 
-/** Resolves a candidate file's real MIME type (File.type first, then extension). */
+/** Resolves a candidate file's real MIME type (File.type first, then extension,
+ *  with parameter stripping — 2026-10-31 E2E fix). */
 function resolveAudioMime(file: File): string | null {
-  const byType = file.type.toLowerCase();
+  const byType = normalizeMime(file.type);
   if (byType && ALLOWED_MIMES.has(byType)) return byType;
   const ext = file.name.split('.').pop()?.toLowerCase() ?? '';
   const byExt = EXTENSION_FALLBACK[ext];

@@ -8,9 +8,17 @@ import {
   mlTranscribe,
   mlUnload,
   latencyLabel,
+  type VoxSoapMLLanguage,
   type VoxSoapMLStaffHeaders,
 } from '@/lib/vox-soap/voxsoap-ml.client';
-import { pcm16kBytesForSeconds, startPcm16Capture, type Pcm16CaptureHandle } from '@/lib/vox-soap/voxsoap-ml.wav';
+import {
+  decodeAndResampleToWav16k,
+  pcm16kBytesForSeconds,
+  pcm16kSecondsForBytes,
+  resolveUploadAudioMime,
+  startPcm16Capture,
+  type Pcm16CaptureHandle,
+} from '@/lib/vox-soap/voxsoap-ml.wav';
 import type { VoxSoapMLCall, VoxSoapMLEnvelope } from '@/lib/vox-soap/voxsoap-ml.types';
 import { PANEL_THEME, type PanelAccent } from './NewRecordingPanel';
 
@@ -239,12 +247,17 @@ export const MLAssistPanel: React.FC<{
   const [draft, setDraft] = useState('');
   const [elapsedLabel, setElapsedLabel] = useState('0:00');
   const [working, setWorking] = useState(false);
+  /** /transcribe language contract (default "ur" = the original scaffold
+   * behaviour): "ur"/"en" tag the Whisper decoder, "auto" lets the model
+   * detect the language from the audio itself. */
+  const [language, setLanguage] = useState<VoxSoapMLLanguage>('ur');
 
   const staff: VoxSoapMLStaffHeaders = { role: staffRole, id: staffId, name: staffName };
   const t = PANEL_THEME[accent];
 
   const streamRef = useRef<MediaStream | null>(null);
   const captureRef = useRef<Pcm16CaptureHandle | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const elapsedRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const encodingRef = useRef(false);
@@ -465,10 +478,69 @@ export const MLAssistPanel: React.FC<{
     }
   };
 
+  /** Upload flow (2026-10-31 E2E fix): a vet-owner file (WAV/MP3/M4A/WebM/…)
+   * is decoded in-browser, mixed to mono, resampled to 16 kHz, re-encoded to
+   * the canonical PCM WAV and then routed through the SAME postTranscribe
+   * path as the mic flow. Honest guards only — no length trimming, no
+   * silence padding, nothing invented. */
+  const handleUploadFile = async (file: File | null) => {
+    if (!file || stage !== 'ready') return;
+    if (fileInputRef.current) fileInputRef.current.value = ''; // allow re-picking the SAME file later
+    setNotice(null);
+    const resolvedMime = resolveUploadAudioMime(file);
+    if (!resolvedMime) {
+      setNotice({
+        tone: 'error',
+        text: `Unsupported audio type ("${file.type || file.name.split('.').pop() || 'unknown'}"). Accepted: WAV, MP3, M4A, MP4, WebM, OGG, AAC, FLAC — nothing was processed.`,
+      });
+      return;
+    }
+    setStage('encoding');
+    try {
+      const wav = await decodeAndResampleToWav16k(file);
+      if (wav.size === 0) {
+        throw new Error('The uploaded file decoded to zero samples — nothing was uploaded, nothing invented.');
+      }
+      const wavSeconds = pcm16kSecondsForBytes(wav.size);
+      if (wav.size > 25 * 1024 * 1024) {
+        throw new Error(
+          `${(wav.size / (1024 * 1024)).toFixed(1)} MB of decoded 16 kHz audio exceeds the local service's 25 MB cap — nothing was uploaded. Trim or split the file.`
+        );
+      }
+      if (wavSeconds > MAX_RECORDING_SECONDS) {
+        throw new Error(
+          `${Math.floor(wavSeconds / 60)} min ${Math.floor(wavSeconds % 60)} s of decoded audio is beyond this panel's ${MAX_RECORDING_SECONDS / 60} min guard — nothing was uploaded. Trim or split the file.`
+        );
+      }
+      setSizeBytes(wav.size);
+      setNotice({
+        tone: 'info',
+        text: `Decoded "${file.name}" client-side to ${(wav.size / (1024 * 1024)).toFixed(1)} MB of 16 kHz mono PCM WAV — now transcribing (${
+          language === 'auto' ? 'auto-detect' : language === 'en' ? 'English' : 'Urdu'
+        }).`,
+      });
+      await postTranscribe(wav);
+    } catch (err) {
+      setStage('ready');
+      setNotice({
+        tone: 'error',
+        text:
+          err instanceof Error
+            ? err.message
+            : 'The uploaded file could not be decoded — nothing was uploaded, nothing invented.',
+      });
+    }
+  };
+
+  const pickUploadFile = () => {
+    if (stage !== 'ready' || !consentChecked) return;
+    fileInputRef.current?.click();
+  };
+
   const postTranscribe = async (wav: Blob) => {
     setStage('transcribing');
     startElapsedTicker();
-    const result = await mlTranscribe(wav, staff);
+    const result = await mlTranscribe(wav, staff, language);
     clearTimers();
     setTranscribeCall(result);
     const env = result.envelope;
@@ -587,6 +659,14 @@ export const MLAssistPanel: React.FC<{
       aria-modal="true"
     >
       <div className={`w-full max-w-3xl max-h-[92vh] overflow-y-auto mx-4 rounded-2xl border shadow-2xl ${t.panel}`}>
+        {/* Hidden picker for the upload flow — mounted at every stage so refs stay stable. */}
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept=".wav,.mp3,.m4a,.mp4,.webm,.ogg,.oga,.opus,.aac,.flac,audio/*"
+          className="hidden"
+          onChange={(e) => void handleUploadFile(e.target.files?.[0] ?? null)}
+        />
         <div className={`flex items-center justify-between px-5 py-3 border-b ${t.headerBorder} sticky top-0 z-10 ${t.panel}`}>
           <div className="flex items-center gap-2 flex-wrap">
             <span className={`w-8 h-8 rounded-full flex items-center justify-center text-sm ${t.brand}`}>🧠</span>
@@ -727,6 +807,17 @@ export const MLAssistPanel: React.FC<{
                     🎙️ Start Recording
                   </button>
                 )}
+                {stage === 'ready' && (
+                  <button
+                    type="button"
+                    onClick={pickUploadFile}
+                    disabled={!consentChecked}
+                    className={`px-5 py-2 rounded-xl text-sm font-bold disabled:opacity-40 ${t.secondaryBtn}`}
+                    title="Decode an existing WAV/MP3/M4A/WebM/OGG file in-browser to 16 kHz mono PCM (client-side resample — the server never resamples), then transcribe with the local Whisper"
+                  >
+                    📁 Upload Audio File
+                  </button>
+                )}
                 {stage === 'recording' && (
                   <button type="button" onClick={pauseRecording} className={`px-4 py-2 rounded-xl text-sm font-semibold ${t.secondaryBtn}`}>
                     ⏸ Pause
@@ -766,6 +857,25 @@ export const MLAssistPanel: React.FC<{
                 )}
               </div>
 
+              {stage === 'ready' && (
+                <div className="flex flex-wrap items-center justify-center gap-2 text-[11px] text-muted">
+                  <label htmlFor="voxsoap-ml-language" className="font-semibold text-ink">
+                    Consultation language
+                  </label>
+                  <select
+                    id="voxsoap-ml-language"
+                    value={language}
+                    onChange={(e) => setLanguage(e.target.value as VoxSoapMLLanguage)}
+                    className="rounded-lg bg-canvas border border-line px-2 py-1 font-mono text-[11px] text-ink focus:outline-none"
+                  >
+                    <option value="ur">Urdu (ur) — default</option>
+                    <option value="en">English (en)</option>
+                    <option value="auto">Auto-detect</option>
+                  </select>
+                  <span className="text-[10px]">forwarded to POST /transcribe — anything else is an honest 400</span>
+                </div>
+              )}
+
               <label
                 className={`flex items-start gap-3 p-3 rounded-xl border text-xs ${
                   consentChecked ? 'border-emerald-500/40 bg-emerald-950/40' : t.consentIdle
@@ -779,9 +889,10 @@ export const MLAssistPanel: React.FC<{
                   className="mt-0.5 h-4 w-4"
                 />
                 <span className={consentChecked ? 'text-emerald-100' : t.consentIdleText}>
-                  <strong>Consent confirmed</strong> for recording, and I understand this flow runs the
-                  LOCAL VoxSOAP models on this machine (Whisper transcription, then an assistive SOAP
-                  draft). Nothing goes to any cloud model; the draft requires veterinary confirmation.
+                  <strong>Consent confirmed</strong> for recording and/or uploading consultation audio, and I
+                  understand this flow runs the LOCAL VoxSOAP models on this machine (Whisper transcription,
+                  then an assistive SOAP draft). Nothing goes to any cloud model; the draft requires
+                  veterinary confirmation.
                 </span>
               </label>
             </div>

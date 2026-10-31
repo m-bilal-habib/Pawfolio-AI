@@ -56,8 +56,10 @@ class FakeMLProvider:
     def scale_for(self, key: str):
         return "SMOKE(mock test-double; NOT real inference)", "test_double"
 
-    def transcribe(self, samples, sample_rate: int, audio_bytes=None):
-        self.calls.append(("transcribe", round(len(samples) / sample_rate, 3), sample_rate))
+    def transcribe(self, samples, sample_rate: int, audio_bytes=None, language: str = "ur"):
+        self.calls.append(
+            ("transcribe", round(len(samples) / sample_rate, 3), sample_rate, language)
+        )
         if self.fail:
             raise InferenceError("fake ML inference failure (test double)")
         return {"text": "instrumented mock transcription 25 mg two times daily", "note": "MOCKED"}
@@ -100,7 +102,7 @@ class FakeGeminiProvider:
     def scale_for(self, key: str):
         return "NOT_APPLICABLE(mock gemini test-double)", "test_double"
 
-    def transcribe(self, samples, sample_rate: int, audio_bytes=None):
+    def transcribe(self, samples, sample_rate: int, audio_bytes=None, language: str = "ur"):
         return {"text": "fake-gemini-transcription", "upstream": "mocked"}
 
     def draft(self, transcript: str):

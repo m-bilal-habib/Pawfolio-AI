@@ -180,11 +180,20 @@ def create_app(cfg: Optional[ServingConfig] = None) -> FastAPI:
         request: Request,
         audio: UploadFile = File(...),
         provider: Optional[str] = Form(None),
+        language: Optional[str] = Form(None),
     ):
         started = time.perf_counter()
         request.state.component = "asr"
         provider_obj = container.resolve(provider)
         request.state.provider_obj = provider_obj
+        # Language contract: explicit "ur" / "en" / "auto" (default "ur", the
+        # original scaffold behaviour). Anything else is an honest 400 - never
+        # a silently wrong decoder tag.
+        lang_key = (language or "ur").strip().lower()
+        if lang_key not in ("ur", "en", "auto"):
+            raise BadRequest(
+                f"unsupported language {language!r}; allowed: ur | en | auto"
+            )
         data = await audio.read()
         if len(data) > int(cfg.max_audio_mb * 1024 * 1024):
             raise BadRequest(f"audio upload of {len(data)} bytes exceeds VOXSOAP_MAX_AUDIO_MB={cfg.max_audio_mb}")
@@ -198,7 +207,7 @@ def create_app(cfg: Optional[ServingConfig] = None) -> FastAPI:
                 f"{cfg.target_sample_rate} Hz audio (16 kHz); the server never silently resamples because a "
                 "misread rate would corrupt ASR output."
             )
-        result = provider_obj.transcribe(samples, sample_rate=sample_rate, audio_bytes=data)
+        result = provider_obj.transcribe(samples, sample_rate=sample_rate, audio_bytes=data, language=lang_key)
         result["audio"] = {
             "sample_rate": sample_rate,
             "filename": getattr(audio, "filename", None),
