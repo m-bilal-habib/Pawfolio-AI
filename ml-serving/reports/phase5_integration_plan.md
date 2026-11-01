@@ -213,3 +213,62 @@ problems and were fixed as capacity problems — never by hiding the failure.
   `/unload all` with `asr: true` dropped (soap/roman were never loaded) and RAM visibly returned.
   (Owner's first live bf16 CPU
   `/draft` still lands as their acceptance evidence.)
+
+## 9. Local-first frontend audio routing (2026-10-31, critical routing bug) — drill 13/13
+
+Owner symptom: BOTH legacy capture panels (UploadAudioPanel with a 5-min WebM file and
+NewRecordingPanel with 24 s/29 s live recordings) surfaced
+`AI TRANSCRIPTION FAILED — NOTHING WAS INVENTED` plus
+`GEMINI_API_KEY is not configured; switching to deterministic fallback parser...` during local ML
+development. Audit located the cause: ALL Gemini coupling lives in `vox-soap.engine.ts` (the
+panels are provider-agnostic) and the engine's single multimodal Gemini call did the
+transcription AND structuring — with no key it degraded into the deterministic parser while
+complaining about the missing key.
+
+The fix is ENGINE-LEVEL, never a panel bolt-on, and reverses the fallback direction:
+
+- **`resolveTranscribeProvider()`** (engine): explicit input override → env
+  `VOXSOAP_TRANSCRIBE_PROVIDER` → default **`ml`**. Gemini transcription is now an EXPLICIT
+  opt-in transport; `ml` mode NEVER touches or mentions Gemini. Bad values throw honest errors
+  (route answers 400 before any model work).
+- **`mlTranscribe()`** (engine): POSTs the audio STRAIGHT to the local ml-serving FastAPI
+  (`VOXSOAP_BASE_URL`, default `http://127.0.0.1:8321/transcribe`) with the same multipart
+  contract the committed probe exercises (field `audio`, `language`); 900 s budget
+  (`VOXSOAP_ML_TRANSCRIBE_TIMEOUT_MS`). Failures are THROWN honestly into the existing catch
+  (`aiError` audited, `Manual_Fallback_Draft` template) — never rerouted to Gemini in EITHER
+  direction.
+- **New honest label `ML_Local_Draft`** (types union + audit action
+  `ML_LOCAL_TRANSCRIPTION_DRAFT` + metadata `transcriptionProvider` / `asrLanguage` /
+  `transcriptionWindows`). The transcript is REAL and preserved verbatim; SOAP structuring is
+  deliberately left to the deterministic template + vet review (grounding-claim filter stays
+  `AI_Dictation_Draft`-only because the template's claims are traceable by construction).
+  Audit-trail discipline: exactly ONE extraction event per run (no duplicate-emit).
+- **Panels deliver the ml audio contract CLIENT-side** (the server never resamples):
+  - `NewRecordingPanel`: MediaRecorder is GONE — the shared
+    `startPcm16Capture` AudioWorklet captures 16 kHz mono PCM directly; pause/resume drop
+    frames worklet-level; stop() encodes the canonical WAV; the size pill reads the REAL
+    deliverable (`pcm16kBytesForSeconds` × 32,000 B/s). Posts `consultation-16k.wav` +
+    `language` + `transcribeProvider` (gemini pacing pinned via
+    `NEXT_PUBLIC_VOXSOAP_TRANSCRIBE_PROVIDER`).
+  - `UploadAudioPanel`: unless the public env pins `gemini`, the file is decoded +
+    resampled CLIENT-side via `decodeAndResampleToWav16k` per attempt (idempotent — retries
+    re-read the original File), with honest pre-upload guards: encoded WAV > 25 MB and > 13 min
+    (`pcm16kSecondsForBytes`) are rejected BEFORE anything is sent.
+  - Both panels gained the `language` select (default `ur`, mirroring MLAssistPanel), passed
+    as form field `language`; `WritingAssistant` (Gemini rewriter) deliberately untouched —
+    its key error is a different feature, not audio processing.
+- **`/extract` route pre-flights** (all BEFORE any model work): honest 400 for unknown
+  `language` (allowed `ur | en | auto`) and unknown `transcribeProvider` (allowed `ml |
+  gemini`); honest **415** when the resolved provider is ml and the audio base MIME ≠
+  `audio/wav` (message states the client-side WAV contract + server-never-resamples rule).
+  Text-only JSON requests are deliberately UNCHANGED (outside the audio mandate; honest
+  fallback preserved).
+- **Drill evidence** (next dev + uvicorn 8321, synthetic 35 s 16 kHz WAV / language=en):
+  `probe_local_extract.mjs` → **13/13** — 201 with `sourceType=ML_Local_Draft`,
+  `rawTranscript` non-empty, `NO gemini/i mention` in the response AND the visit audit trail,
+  audit event `ML_LOCAL_TRANSCRIPTION_DRAFT` with `transcriptionProvider=ml`,
+  `asrLanguage=en`, `aiModel=voxsoap-local-ml:whisper(language=en)`, fake-WebM → 415,
+  `klingon` → 400, `openai` → 400, text-only path still answers (honest fallback). tsc 0,
+  eslint 0 on all five touched files.
+- Honest caveat: synthetic tone is not real speech — the gated property is ROUTING honesty;
+  the owner's 5-min English upload + 24-29 s Urdu mic recordings are the content acceptance.

@@ -141,7 +141,11 @@ export interface VoxSoapVisitRecord {
   clinicId: string;
   recordState: RecordProvenanceState;
   workflowStatus: WorkflowStatus;
-  sourceType: 'AI_Dictation_Draft' | 'Manual_Fallback_Draft' | 'Veterinarian_Verified';
+  sourceType:
+    | 'AI_Dictation_Draft'
+    | 'ML_Local_Draft'
+    | 'Manual_Fallback_Draft'
+    | 'Veterinarian_Verified';
   authorId: string;
   authorRole: ClinicStaffRole;
   signedOffByVetId: string | null;
@@ -197,6 +201,7 @@ export interface VoxSoapAuditEvent {
   action:
     | 'DICTATION_DRAFT_CREATED'
     | 'AI_FALLBACK_TRIGGERED'
+    | 'ML_LOCAL_TRANSCRIPTION_DRAFT'
     | 'ORDER_VALIDATION_FLAGGED'
     | 'VISIT_SIGNED_OFF_AND_VERIFIED'
     | 'PRIOR_VERSION_SUPERSEDED'

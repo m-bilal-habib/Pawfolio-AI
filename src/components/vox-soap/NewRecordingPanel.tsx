@@ -3,6 +3,12 @@
 
 import React, { useState, useEffect, useRef } from 'react';
 import { aiErrorSummaryFromAudit } from '@/lib/vox-soap/vox-soap.aierrors';
+import {
+  pcm16kBytesForSeconds,
+  startPcm16Capture,
+  type Pcm16CaptureHandle,
+} from '@/lib/vox-soap/voxsoap-ml.wav';
+import type { VoxSoapMLLanguage } from '@/lib/vox-soap/voxsoap-ml.client';
 import type { VoxSoapVisitRecord } from '@/lib/vox-soap/vox-soap.types';
 
 /**
@@ -51,6 +57,13 @@ export type PanelAccent = 'indigo' | 'amber';
 
 const MAX_RECORDING_SECONDS = 2 * 60 * 60; // 2 hour cap (Scribenote mobile parity)
 const SIZE_WARNING_BYTES = 20 * 1024 * 1024; // 20 MB soft cap (server: 25 MB)
+
+/** Local-first routing flag (2026-10-31): the recording is ALWAYS delivered as
+ * the 16 kHz mono PCM WAV contract, encoded CLIENT-side by the capture
+ * worklet (the ml-serving server never resamples). It routes to the local ML
+ * service unless the public env pins the explicit 'gemini' provider. */
+const PUBLIC_TRANSCRIBE_PROVIDER =
+  process.env.NEXT_PUBLIC_VOXSOAP_TRANSCRIBE_PROVIDER === 'gemini' ? 'gemini' : 'ml';
 
 /** Theme tokens per accent — logic never branches on theme. */
 export const PANEL_THEME: Record<
@@ -150,16 +163,17 @@ export const NewRecordingPanel: React.FC<{
   const [seconds, setSeconds] = useState(0);
   const [consentChecked, setConsentChecked] = useState(false);
   const [consentAt, setConsentAt] = useState<string | null>(null);
+  const [language, setLanguage] = useState<VoxSoapMLLanguage>('ur');
   const [sizeBytes, setSizeBytes] = useState(0);
   const [notice, setNotice] = useState<{ tone: 'warn' | 'error'; text: string } | null>(null);
   const [errorHint, setErrorHint] = useState<string | null>(null);
   const [lastAiError, setLastAiError] = useState<string | null>(null);
   const [elapsedLabel, setElapsedLabel] = useState('0:00');
 
-  const recorderRef = useRef<MediaRecorder | null>(null);
+  const captureRef = useRef<Pcm16CaptureHandle | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
-  const chunksRef = useRef<Blob[]>([]);
-  const sizeRef = useRef(0);
+  const stoppingRef = useRef(false);
+  const lastWavRef = useRef<Blob | null>(null);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const recordingIdRef = useRef<string | null>(null);
   const micFailReasonRef = useRef<string | undefined>(undefined);
@@ -196,6 +210,7 @@ export const NewRecordingPanel: React.FC<{
     return () => {
       clearTimer();
       stopPolling();
+      captureRef.current?.cancel();
       streamRef.current?.getTracks().forEach((track) => track.stop());
     };
   }, []);
@@ -264,46 +279,28 @@ export const NewRecordingPanel: React.FC<{
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       streamRef.current = stream;
-      const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
-        ? 'audio/webm;codecs=opus'
-        : MediaRecorder.isTypeSupported('audio/webm')
-        ? 'audio/webm'
-        : MediaRecorder.isTypeSupported('audio/mp4')
-        ? 'audio/mp4'
-        : undefined;
-      const recorder = mimeType
-        ? new MediaRecorder(stream, { mimeType })
-        : new MediaRecorder(stream);
-      recorderRef.current = recorder;
-      chunksRef.current = [];
-      sizeRef.current = 0;
+      // 2026-10-31 local-first routing: an AudioWorklet captures 16 kHz mono
+      // PCM CLIENT-side (the ml-serving server never resamples) — there is no
+      // MediaRecorder container guessing anymore, and the deliverable size is
+      // the REAL WAV size, not a compressed-container estimate.
+      const capture = await startPcm16Capture(stream);
+      captureRef.current = capture;
+      stoppingRef.current = false;
+      lastWavRef.current = null;
       setSizeBytes(0);
-
-      recorder.ondataavailable = (e) => {
-        if (e.data.size <= 0) return;
-        chunksRef.current.push(e.data);
-        sizeRef.current += e.data.size;
-        setSizeBytes(sizeRef.current);
-        if (sizeRef.current >= SIZE_WARNING_BYTES) {
-          setNotice({
-            tone: 'warn',
-            text: `Audio reached ${(sizeRef.current / (1024 * 1024)).toFixed(1)} MB — stop and save the note now; the server accepts at most 25 MB (NFR-3).`,
-          });
-        }
-      };
-
-      recorder.onstop = () => {
-        releaseMic();
-        clearTimer();
-        void postRecordingJob();
-      };
-
-      recorder.start();
       setSeconds(0);
       setStage('recording');
       timerRef.current = setInterval(() => {
         setSeconds((prev) => {
           const next = prev + 1;
+          const deliverable = pcm16kBytesForSeconds(next);
+          setSizeBytes(deliverable);
+          if (deliverable >= SIZE_WARNING_BYTES && pcm16kBytesForSeconds(prev) < SIZE_WARNING_BYTES) {
+            setNotice({
+              tone: 'warn',
+              text: `Audio reached ${(deliverable / (1024 * 1024)).toFixed(1)} MB — stop and save the note now; the server accepts at most 25 MB (NFR-3).`,
+            });
+          }
           if (next === MAX_RECORDING_SECONDS - 60) {
             setNotice({
               tone: 'warn',
@@ -341,20 +338,21 @@ export const NewRecordingPanel: React.FC<{
   };
 
   const pauseRecording = () => {
-    if (recorderRef.current?.state === 'recording') {
-      recorderRef.current.pause();
+    if (stage === 'recording') {
+      captureRef.current?.setPaused(true); // worklet-level pause: frames dropped
       clearTimer();
       setStage('paused');
     }
   };
 
   const resumeRecording = () => {
-    if (recorderRef.current?.state === 'paused') {
-      recorderRef.current.resume();
+    if (stage === 'paused') {
+      captureRef.current?.setPaused(false);
       setStage('recording');
       timerRef.current = setInterval(() => {
         setSeconds((prev) => {
           const next = prev + 1;
+          setSizeBytes(pcm16kBytesForSeconds(next));
           if (next >= MAX_RECORDING_SECONDS) {
             stopRecording();
             return MAX_RECORDING_SECONDS;
@@ -366,25 +364,35 @@ export const NewRecordingPanel: React.FC<{
   };
 
   const stopRecording = () => {
-    if (
-      recorderRef.current &&
-      (recorderRef.current.state === 'recording' || recorderRef.current.state === 'paused')
-    ) {
-      recorderRef.current.stop();
-      setStage('uploading');
-    }
+    if (stoppingRef.current) return;
+    if (stage !== 'recording' && stage !== 'paused') return;
+    const capture = captureRef.current;
+    if (!capture) return;
+    stoppingRef.current = true;
+    setStage('uploading'); // Scribenote: encoding + sending the deliverable
+    clearTimer();
+    void capture
+      .stop() // resamples (device rate → 16 kHz) + encodes the mono PCM WAV
+      .then((wav) => postRecordingJob(wav))
+      .catch((err) => {
+        setStage('error');
+        setNotice({
+          tone: 'error',
+          text:
+            err instanceof Error
+              ? err.message
+              : 'The capture could not be encoded — the draft was NOT generated.',
+        });
+        setErrorHint('Open Transcript Fallback (FR-30)');
+      });
   };
 
   const cancelRecording = () => {
     clearTimer();
     stopPolling();
-    if (
-      recorderRef.current &&
-      (recorderRef.current.state === 'recording' || recorderRef.current.state === 'paused')
-    ) {
-      recorderRef.current.onstop = null;
-      recorderRef.current.stop();
-    }
+    stoppingRef.current = true;
+    captureRef.current?.cancel();
+    captureRef.current = null;
     releaseMic();
     onRecordingStateChange(false, 0);
     setSeconds(0);
@@ -394,18 +402,12 @@ export const NewRecordingPanel: React.FC<{
     onClose();
   };
 
-  /** Shared by the post-stop submit AND every ↻ retry: rebuilds the exact
-   * same blob from the kept mic chunks and re-sends it against the SAME
-   * shell visit — no re-recording (Scribenote "Retry" pattern). */
-  const postRecordingJob = async () => {
-    // Strip MediaRecorder codec parameters ("audio/webm;codecs=opus" →
-    // "audio/webm") BEFORE the blob carries them to the server allowlist —
-    // 2026-10-31 E2E fix: the raw tag was rejected 415 at stop-recording.
-    const rawRecordingType = recorderRef.current?.mimeType ?? 'audio/webm';
-    const micBlob = new Blob(chunksRef.current, {
-      type: rawRecordingType.split(';')[0].trim().toLowerCase(),
-    });
-    if (micBlob.size === 0) {
+  /** Shared by the post-stop submit AND every ↻ retry: re-sends the SAME
+   * 16 kHz mono PCM WAV against the SAME shell visit — no re-recording
+   * (Scribenote "Retry" pattern; the blob is kept from the original attempt). */
+  const postRecordingJob = async (wav: Blob) => {
+    lastWavRef.current = wav;
+    if (wav.size === 0) {
       setStage('error');
       setNotice({ tone: 'error', text: 'No audio bytes captured — the draft was NOT generated.' });
       setErrorHint('Open Transcript Fallback (FR-30)');
@@ -422,7 +424,14 @@ export const NewRecordingPanel: React.FC<{
       if (consentAt) {
         formData.append('consentAt', consentAt);
       }
-      formData.append('audio', micBlob, 'consultation.webm');
+      // 2026-10-31 local-first routing: the payload audio is the canonical
+      // 16 kHz mono PCM WAV encoded CLIENT-side by the capture worklet (the
+      // ml-serving server never resamples); `language` + `transcribeProvider`
+      // explicitly follow the /transcribe contract instead of ambient
+      // guessing.
+      formData.append('audio', wav, 'consultation-16k.wav');
+      formData.append('language', language);
+      formData.append('transcribeProvider', PUBLIC_TRANSCRIBE_PROVIDER);
 
       const res = await fetch('/api/clinic/vox-soap/extract', {
         method: 'POST',
@@ -541,8 +550,9 @@ export const NewRecordingPanel: React.FC<{
    * against the SAME shell visit: no re-recording, not even a re-consent. */
   const retryTranscription = () => {
     if (stage === 'uploading' || stage === 'transcribing') return;
+    if (!lastWavRef.current) return;
     setStage('uploading');
-    void postRecordingJob();
+    void postRecordingJob(lastWavRef.current);
   };
 
   const mmss = (total: number) => {
@@ -703,6 +713,31 @@ export const NewRecordingPanel: React.FC<{
                 Discard
               </button>
             )}
+          </div>
+
+          {/* Consultation language — an explicit Whisper decoder tag (default
+              ur, the ml-serving scaffold behaviour; anything else is an
+              honest 400 upstream, never a silently wrong output). */}
+          <div
+            className={`flex items-center justify-between gap-3 p-3 rounded-xl border text-xs ${t.consentIdle}`}
+          >
+            <label
+              htmlFor="voxsoap-recording-language"
+              className={`font-semibold whitespace-nowrap ${t.consentIdleText}`}
+            >
+              Consultation language
+            </label>
+            <select
+              id="voxsoap-recording-language"
+              value={language}
+              onChange={(e) => setLanguage(e.target.value as VoxSoapMLLanguage)}
+              disabled={stage !== 'idle'}
+              className="rounded-lg border border-line bg-white px-2 py-1.5 text-xs font-semibold text-ink focus:outline-none"
+            >
+              <option value="ur">Urdu</option>
+              <option value="en">English</option>
+              <option value="auto">Auto-detect</option>
+            </select>
           </div>
 
           {/* Consent strip (mandatory) */}

@@ -4,6 +4,11 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { PANEL_THEME, type PanelAccent } from './NewRecordingPanel';
 import { aiErrorSummaryFromAudit } from '@/lib/vox-soap/vox-soap.aierrors';
+import {
+  decodeAndResampleToWav16k,
+  pcm16kSecondsForBytes,
+} from '@/lib/vox-soap/voxsoap-ml.wav';
+import type { VoxSoapMLLanguage } from '@/lib/vox-soap/voxsoap-ml.client';
 import type { VoxSoapVisitRecord } from '@/lib/vox-soap/vox-soap.types';
 
 /**
@@ -106,6 +111,17 @@ function resolveAudioMime(file: File): string | null {
 
 const MAX_BYTES = 25 * 1024 * 1024; // VOX_SOAP_MAX_AUDIO_MB default (server 413 guard)
 
+/** Local-first routing flag (2026-10-31): unless the public env pins the
+ * explicit 'gemini' provider, every upload is decoded + resampled CLIENT-side
+ * to the 16 kHz mono PCM WAV contract BEFORE posting (the ml-serving server
+ * never resamples). Unset env keeps the local-first default ('ml'). */
+const PUBLIC_TRANSCRIBE_PROVIDER =
+  process.env.NEXT_PUBLIC_VOXSOAP_TRANSCRIBE_PROVIDER === 'gemini' ? 'gemini' : 'ml';
+
+/** Honest 13-minute guard: 26 Whisper 30 s windows; the local fp32 CPU decode
+ * runs window-serial and the engine/proxy budgets are sized for 13 min. */
+const MAX_WAV_SECONDS = 13 * 60;
+
 export const UploadAudioPanel: React.FC<{
   open: boolean;
   defaultPetId: string;
@@ -131,6 +147,7 @@ export const UploadAudioPanel: React.FC<{
   const [file, setFile] = useState<File | null>(null);
   const [durationSeconds, setDurationSeconds] = useState<number | null>(null);
   const [consentChecked, setConsentChecked] = useState(false);
+  const [language, setLanguage] = useState<VoxSoapMLLanguage>('ur');
   const [dragActive, setDragActive] = useState(false);
   const [notice, setNotice] = useState<{ tone: 'warn' | 'error'; text: string } | null>(null);
   const [lastAiError, setLastAiError] = useState<string | null>(null);
@@ -300,9 +317,41 @@ export const UploadAudioPanel: React.FC<{
       // for .m4a/.opus files, which would fail the server-side 415 whitelist
       // even though the audio itself is perfectly decodable.
       const resolved = resolveAudioMime(file) ?? 'audio/webm';
-      const normalizedName = file.name || `consultation-upload.${resolved.split('/')[1]}`;
+
+      // 2026-10-31 local-first routing: unless the public env pins 'gemini',
+      // the file is decoded + resampled CLIENT-side to the 16 kHz mono PCM
+      // WAV contract BEFORE posting (the ml-serving server never resamples).
+      // The encode re-reads the ORIGINAL File every attempt — an idempotent,
+      // so "↻ Retry transcription" stays honest and identical.
+      let uploadBlob: Blob = file;
+      let normalizedName = file.name || `consultation-upload.${resolved.split('/')[1]}`;
+      if (PUBLIC_TRANSCRIBE_PROVIDER !== 'gemini') {
+        uploadBlob = await decodeAndResampleToWav16k(file);
+        normalizedName = 'consultation-16k.wav';
+        if (uploadBlob.size > MAX_BYTES) {
+          setStage('error');
+          setNotice({
+            tone: 'error',
+            text: `The 16 kHz WAV encoding of this file is ${(uploadBlob.size / (1024 * 1024)).toFixed(1)} MB — the server accepts at most 25 MB (NFR-3, HTTP 413). Trim or compress the recording first; nothing was uploaded.`,
+          });
+          return;
+        }
+        const wavSeconds = pcm16kSecondsForBytes(uploadBlob.size);
+        if (wavSeconds > MAX_WAV_SECONDS) {
+          setStage('error');
+          setNotice({
+            tone: 'error',
+            text: `This file is about ${Math.floor(wavSeconds / 60)} min ${Math.round(wavSeconds % 60)} s — the local Whisper budget tops out at 13 minutes per submission; split longer consultations into parts. Nothing was uploaded.`,
+          });
+          return;
+        }
+      }
       const typedFile =
-        file.type === resolved ? file : new File([file], normalizedName, { type: resolved });
+        PUBLIC_TRANSCRIBE_PROVIDER !== 'gemini'
+          ? new File([uploadBlob], normalizedName, { type: 'audio/wav' })
+          : file.type === resolved
+          ? file
+          : new File([file], normalizedName, { type: resolved });
 
       // 1) Scribenote shell — created ONCE per audio file (NOT per attempt) so
       // retries keep the same visitId and version history stays clean.
@@ -330,12 +379,15 @@ export const UploadAudioPanel: React.FC<{
       }
 
       // 2) Queue the transcription — the route answers immediately (HTTP 202)
-      // with the visitId; Gemini work continues in the background.
+      // with the visitId; the transcription provider's work continues in the
+      // background (local ml-serving Whisper — never a silent fallback).
       const formData = new FormData();
       formData.append('petId', defaultPetId);
       if (recordingIdRef.current) formData.append('recordingId', recordingIdRef.current);
       if (consentAtRef.current) formData.append('consentAt', consentAtRef.current);
       formData.append('audio', typedFile, normalizedName);
+      formData.append('language', language);
+      formData.append('transcribeProvider', PUBLIC_TRANSCRIBE_PROVIDER);
 
       const res = await fetch('/api/clinic/vox-soap/extract', {
         method: 'POST',
@@ -568,6 +620,31 @@ export const UploadAudioPanel: React.FC<{
                 ↺ Try Again
               </button>
             )}
+          </div>
+
+          {/* Consultation language — an explicit Whisper decoder tag (default
+              ur, the ml-serving scaffold behaviour; anything else is an
+              honest 400 upstream, never a silently wrong output). */}
+          <div
+            className={`flex items-center justify-between gap-3 p-3 rounded-xl border text-xs ${t.consentIdle}`}
+          >
+            <label
+              htmlFor="voxsoap-upload-language"
+              className={`font-semibold whitespace-nowrap ${t.consentIdleText}`}
+            >
+              Consultation language
+            </label>
+            <select
+              id="voxsoap-upload-language"
+              value={language}
+              onChange={(e) => setLanguage(e.target.value as VoxSoapMLLanguage)}
+              disabled={stage !== 'idle'}
+              className="rounded-lg border border-line bg-white px-2 py-1.5 text-xs font-semibold text-ink focus:outline-none"
+            >
+              <option value="ur">Urdu</option>
+              <option value="en">English</option>
+              <option value="auto">Auto-detect</option>
+            </select>
           </div>
 
           {/* Consent strip (mandatory — same as live recording) */}

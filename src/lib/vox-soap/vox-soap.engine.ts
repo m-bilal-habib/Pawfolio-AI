@@ -35,6 +35,56 @@ export interface VoxSoapExtractionInput {
   recordingId?: string;
   /** ISO client timestamp proving recording consent (NFR-5 / consent kit). */
   consentAt?: string;
+  /**
+   * Explicit transcription-provider override. The default resolves through
+   * `resolveTranscribeProvider()`: **local-first** (`VOXSOAP_TRANSCRIBE_PROVIDER`,
+   * default "ml") — the 2026-10-31 owner mandate makes keyless local
+   * development NEVER touch or mention Gemini during audio transcription.
+   */
+  transcribeProvider?: 'ml' | 'gemini';
+  /** /transcribe language contract (validated upstream, "ur" default). */
+  asrLanguage?: 'ur' | 'en' | 'auto';
+}
+
+/** Local-first transcription routing (2026-10-31). Gemini is now an
+ * EXPLICIT opt-in transport (`VOXSOAP_TRANSCRIBE_PROVIDER=gemini`), never a
+ * fallback — the reverse of the old behaviour, which complained about a
+ * missing GEMINI_API_KEY and degraded to the deterministic parser whenever
+ * the key was absent. */
+export type TranscribeProvider = 'ml' | 'gemini';
+
+export function resolveTranscribeProvider(override?: string | null): TranscribeProvider {
+  const value = (override ?? process.env.VOXSOAP_TRANSCRIBE_PROVIDER ?? 'ml')
+    .trim()
+    .toLowerCase();
+  if (value === 'ml' || value === 'gemini') return value;
+  throw new Error(
+    `unsupported transcribe provider ${value}; allowed: ml | gemini (got via override ${String(
+      override ?? 'unset'
+    )})`
+  );
+}
+
+const ML_BASE_URL = process.env.VOXSOAP_BASE_URL ?? 'http://127.0.0.1:8321';
+/** A 13-minute recording = 26 Whisper windows; fp32 CPU decode is
+ * window-serial. The budget mirrors the proxy's 900 s honest ceiling. */
+const ML_TRANSCRIBE_TIMEOUT_MS = Number(process.env.VOXSOAP_ML_TRANSCRIBE_TIMEOUT_MS ?? 900_000);
+
+/** Strips MediaRecorder/OS parameters and vendor wave aliases — the ML audio
+ * contract compares BASE MIME only (same normalization as the proxy panels). */
+function normalizeBaseMime(rawMime: string): string {
+  const base = rawMime.split(';')[0].trim().toLowerCase();
+  return base === 'audio/wave' || base === 'audio/vnd.wave' ? 'audio/wav' : base;
+}
+
+/** Shape of the ml-serving /transcribe envelope (honest: ok=false is surfaced
+ * as a thrown error; text/windows are validated before any use). */
+interface MlTranscribeEnvelope {
+  ok?: unknown;
+  text?: unknown;
+  windows?: unknown;
+  message?: string;
+  error?: string;
 }
 
 /**
@@ -546,12 +596,73 @@ MANDATORY CLINICAL SAFETY & GROUNDING RULES:
     let usedModelForAudit: string | null = null;
     let aiErrorMessage: string | null = null;
 
-    try {
-      if (!this.aiClients.length) {
-        throw new Error('GEMINI_API_KEY is not configured; switching to deterministic fallback parser.');
-      }
+    // Local-first routing diagnostics (2026-10-31): declared OUTSIDE the try so
+    // the audit metadata stays populated even when the ml path fails midway.
+    let effectiveProvider: TranscribeProvider | null = null;
+    const asrLanguage: 'ur' | 'en' | 'auto' = input.asrLanguage ?? 'ur';
+    let mlTranscriptionWindows: number | null = null;
 
-      const contents: Array<Record<string, unknown> | string> = [];
+    try {
+      effectiveProvider = resolveTranscribeProvider(input.transcribeProvider);
+
+      if (effectiveProvider === 'ml' && input.audioBuffer && input.audioMimeType) {
+        // ---- LOCAL-ML TRANSCRIPTION BRANCH (2026-10-31 owner mandate) ----
+        // The engine calls the local ml-serving Whisper DIRECTLY and NEVER
+        // touches Gemini in this mode: local-first means local-only. The
+        // transcript is preserved verbatim and the deterministic template
+        // keeps the visit honest until a vet structures/reviews it.
+        //
+        // Audio-mime contract BEFORE any state change or model work: the
+        // service decodes 16 kHz mono PCM WAV only and never resamples, so a
+        // non-WAV payload always means the client bypassed the delivery
+        // contract (the route 415s earlier; this is defense-in-depth).
+        if (normalizeBaseMime(input.audioMimeType) !== 'audio/wav') {
+          throw new Error(
+            `local-ML transcription requires the 16 kHz mono PCM WAV contract — got '${input.audioMimeType}'. Deliver audio client-side (decodeAndResampleToWav16k / startPcm16Capture); the ml-serving server never resamples.`
+          );
+        }
+
+        // Scribenote-style status persistence: the shell flips to
+        // 'Transcribing' the moment local transcription begins.
+        if (shellVisit) {
+          voxSoapStore.saveVisit({
+            ...shellVisit,
+            workflowStatus: 'Transcribing',
+            workflowRecording: {
+              ...shellVisit.workflowRecording,
+              audioMimeType: input.audioMimeType ?? shellVisit.workflowRecording.audioMimeType,
+              audioSizeBytes:
+                input.audioBuffer?.length ?? shellVisit.workflowRecording.audioSizeBytes,
+              consentAt: input.consentAt ?? shellVisit.workflowRecording.consentAt,
+            },
+            updatedAt: new Date().toISOString(),
+          });
+        }
+
+        const transcription = await this.mlTranscribe(input.audioBuffer, asrLanguage);
+        mlTranscriptionWindows = transcription.windows;
+        const localTranscript = transcription.text.trim();
+        if (!localTranscript) {
+          throw new Error(
+            'The local ML service finished but returned an empty transcript — nothing invented; check the recording and retry.'
+          );
+        }
+        usedModelForAudit = `voxsoap-local-ml:whisper(language=${asrLanguage})`;
+        // Honest structuring: real transcript + all-null SOAP fields. The
+        // vet-owned structuring note is exactly what the template emits.
+        sourceType = 'ML_Local_Draft';
+        extracted = this.buildManualFallbackTemplate(localTranscript);
+      } else {
+        // ---- GEMINI STRUCTURING PATH (unchanged behaviour) ----
+        // Reached for the explicit 'gemini' provider (audio or text) AND for
+        // 'ml' text-only payloads — with no audio there is nothing to
+        // transcribe, so such requests keep their existing structuring
+        // behaviour (deliberately NOT silently rerouted anywhere). The key
+        // check lives HERE so keyless ml-audio mode never mentions Gemini.
+        if (!this.aiClients.length) {
+          throw new Error('GEMINI_API_KEY is not configured; switching to deterministic fallback parser.');
+        }
+        const contents: Array<Record<string, unknown> | string> = [];
       if (input.audioBuffer && input.audioMimeType) {
         contents.push({
           inlineData: {
@@ -638,6 +749,7 @@ MANDATORY CLINICAL SAFETY & GROUNDING RULES:
 
       const cleanJson = rawText.replace(/^```json\s*|\s*```$/g, '').trim();
       extracted = GroundedSoapExtractionSchema.parse(JSON.parse(cleanJson));
+      }
     } catch (aiError) {
       const message = aiError instanceof Error ? aiError.message : String(aiError);
       aiErrorMessage = message.slice(0, 480);
@@ -738,6 +850,8 @@ MANDATORY CLINICAL SAFETY & GROUNDING RULES:
       action:
         sourceType === 'Manual_Fallback_Draft'
           ? 'AI_FALLBACK_TRIGGERED'
+          : sourceType === 'ML_Local_Draft'
+          ? 'ML_LOCAL_TRANSCRIPTION_DRAFT'
           : 'DICTATION_DRAFT_CREATED',
       previousState: shellVisit ? shellVisit.recordState : null,
       newState: 'Draft',
@@ -750,6 +864,10 @@ MANDATORY CLINICAL SAFETY & GROUNDING RULES:
         audioSizeRatioDeleted: audioRetentionStatus === 'Deleted_After_Transcription',
         aiModel: usedModelForAudit,
         aiError: aiErrorMessage,
+        transcriptionProvider: effectiveProvider ?? 'unset',
+        ...(effectiveProvider === 'ml'
+          ? { asrLanguage, transcriptionWindows: mlTranscriptionWindows }
+          : {}),
       },
     });
 
@@ -768,6 +886,61 @@ MANDATORY CLINICAL SAFETY & GROUNDING RULES:
     }
 
     return visitRecord;
+  }
+
+  /**
+   * Local-first transcription (2026-10-31): POST the 16 kHz WAV straight to
+   * the local ml-serving FastAPI process — the SAME multipart contract the
+   * committed probe (`ml-serving/probe_local_service.mjs`) exercises. No
+   * Gemini contact anywhere in this path, no server resampling: the service
+   * decodes 16 kHz mono PCM WAV only. Any failure is THROWN honestly into
+   * this run's catch (audited `aiError`, Manual_Fallback_Draft template,
+   * never a reroute to Gemini).
+   */
+  private async mlTranscribe(
+    audioBuffer: Buffer,
+    language: 'ur' | 'en' | 'auto'
+  ): Promise<{ text: string; windows: number | null }> {
+    const form = new FormData();
+    // Uint8Array.from copies into a fresh ArrayBuffer-backed view — Node's
+    // Buffer<ArrayBufferLike> is not BlobPart-compatible under strict lib
+    // typing (SharedArrayBuffer union) and a copy is trivially honest here.
+    form.append('audio', new Blob([Uint8Array.from(audioBuffer)], { type: 'audio/wav' }), 'consultation-16k.wav');
+    form.append('language', language);
+
+    let response: Response;
+    try {
+      response = await fetch(`${ML_BASE_URL}/transcribe`, {
+        method: 'POST',
+        body: form,
+        signal: AbortSignal.timeout(ML_TRANSCRIBE_TIMEOUT_MS),
+      });
+    } catch (err) {
+      const reason =
+        err instanceof Error && err.name === 'TimeoutError'
+          ? `the local ML service did not answer within the ${Math.round(ML_TRANSCRIBE_TIMEOUT_MS / 1000)} s budget`
+          : `the local ML service at ${ML_BASE_URL} could not be reached`;
+      throw new Error(
+        `Local ML transcription failed — ${reason}. Nothing was invented: restart both windows (start-voxsoap-local.bat) and retry in local-ml mode.`
+      );
+    }
+
+    const raw = await response.text();
+    let envelope: MlTranscribeEnvelope | null = null;
+    try {
+      envelope = JSON.parse(raw) as MlTranscribeEnvelope;
+    } catch {
+      envelope = null;
+    }
+    if (!response.ok || !envelope || envelope.ok !== true) {
+      const detail = (envelope?.message ?? envelope?.error ?? raw).toString().slice(0, 240);
+      throw new Error(
+        `Local ML /transcribe answered HTTP ${response.status} (ok=${String(envelope?.ok)}): ${detail}`
+      );
+    }
+    const text = typeof envelope.text === 'string' ? envelope.text : '';
+    const windows = typeof envelope.windows === 'number' ? envelope.windows : null;
+    return { text, windows };
   }
 
   private buildManualFallbackTemplate(rawText: string): GroundedSoapExtractionOutput {
