@@ -29,6 +29,7 @@ import audio_utils
 from audio_utils import AudioDecodeError
 from config import ServingConfig, load_config
 from guards import clinical_guard
+from providers import VET_NOTE_FORMATS
 from providers import (
     BadRequest,
     GeminiProxyProvider,
@@ -62,8 +63,14 @@ class TranscriptRequest(BaseModel):
     transcript: str
     provider: Optional[str] = None
     # Optional per-request generation cap (2026-10-31 local-speed). None =
-    # provider default (256 fast CPU default / 512 configured cap on CUDA).
+    # provider default (448 vet_scribenote CPU default / 512 configured cap).
     max_new_tokens: Optional[int] = None
+    # Optional output format (owner Fix 2, 2026-11-01): "vet_scribenote"
+    # default (base-weights Qwen + hydrated 23-parameter veterinary objective,
+    # structured `sections` in the envelope) or "medscribe" (legacy soap-lora
+    # adapter behaviour). Unknown values are an honest 400 BEFORE any model
+    # work - never a silent clamp.
+    format: Optional[str] = None
 
 
 class RomanRequest(BaseModel):
@@ -240,7 +247,16 @@ def create_app(cfg: Optional[ServingConfig] = None) -> FastAPI:
                 f"max_new_tokens must be between 1 and {cfg.draft_max_new_tokens} "
                 f"(VOXSOAP_DRAFT_MAX_NEW_TOKENS); got {body.max_new_tokens}."
             )
-        result = provider_obj.draft(text, max_new_tokens=body.max_new_tokens)
+        # Owner Fix 2: unknown format is an honest 400 BEFORE any model work.
+        requested_format = (body.format or "vet_scribenote").strip().lower()
+        if requested_format not in VET_NOTE_FORMATS:
+            raise BadRequest(
+                f"unsupported draft format {requested_format!r}; allowed: "
+                "vet_scribenote | medscribe."
+            )
+        result = provider_obj.draft(
+            text, max_new_tokens=body.max_new_tokens, note_format=requested_format
+        )
         result["guard"] = clinical_guard(result.get("draft", ""), text)
         return _respond(request, provider_obj, result, started)
 

@@ -272,3 +272,141 @@ The fix is ENGINE-LEVEL, never a panel bolt-on, and reverses the fallback direct
   eslint 0 on all five touched files.
 - Honest caveat: synthetic tone is not real speech — the gated property is ROUTING honesty;
   the owner's 5-min English upload + 24-29 s Urdu mic recordings are the content acceptance.
+
+## 10. Owner 4-fix delivery (2026-11-01/03) — all coded, mocked 48/48, live contracts green
+
+Branch `Speech-to-Text-feature/voxsoap-model-integration`. Everything below is MOCKED-test
+verified (33 → **48 passed**, 4 real deselected) AND the live parts were re-gated against the
+real bf16 CPU service on this machine after each hardening pass. Three proto-fix verdicts were
+superseded by the final one — the supersessions are part of the record.
+
+### Fix 1 — ASR English cutoff/speed (`providers.py::transcribe`, `_load_asr`)
+
+- Root cause: the ur-LoRA adapter was trained on FLEURS clips (short single sentences padded to
+  30 s), so dense continuous English dialogue triggered an early EOS. English (`language=en`)
+  now decodes with the UNCORRUPTED base `openai/whisper-small` weights
+  (`model.disable_adapter()` around `generate`); Urdu keeps the adapter; `auto` keeps it too
+  (documented: explicit `en` is the escape hatch).
+- Speed/robustness: 30 s windows → sequential **20 s chunks** (320,000 samples, no overlap,
+  boundary-clip honesty in `note`); silent chunks skipped (max |sample| < 1e-3, skipped count
+  reported); `condition_on_prev_tokens=False` so no cross-chunk conditioning; CPU always
+  `torch.set_num_threads(cpu_count)`; `VOXSOAP_ASR_QUANT=1` enables dynamic qint8 quantization
+  as an explicit OPT-IN (default OFF: PEFT/qint8 interaction + eval-parity risk).
+- Live evidence (before the env restart): 35 s EN probe → `windows: 2`,
+  note "multi-chunk transcription: 2 x 20 s chunks joined (no overlap; 0 silent chunk(s)
+  skipped)", latency 75.9 s, `language=klingon` honest 400, `/unload` hygiene RAM drop.
+
+### Fix 2 — `/draft` default `vet_scribenote` (`providers.py` + `app.py`)
+
+- New constants: `VET_NOTE_FORMAT(S)`, 23-parameter `VET_OBJECTIVE_PARAMS` (exact owner order,
+  never re-sorted), strict `VET_SCRIBENOTE_SYSTEM_PROMPT` (four mandated headings; only
+  transcript-stated parameters; placeholders FORBIDDEN), canonical-key alias lookup
+  (temp/hr/bw/rr/crt/fast/ears/otoscopy/…, case/punctuation-insensitive).
+- `draft(..., note_format)`: `vet_scribenote` = BASE Qwen (`disable_adapter()`), CPU cap 448
+  (medscribe keeps the legacy 256; both ≤ the 512 configured cap; request-level override still
+  wins and is echoed). Post-processing (`_vet_split_sections` → `_vet_parse_objective` →
+  `_vet_normalize_bullets` → `_vet_hydrated_story`) deterministically hydrates ALL 23
+  parameters (missing → `Not mentioned`) and the envelope carries `draft` +
+  `sections{subjective, objective_map, objective_text, assessment, plan}`. `medscribe` keeps
+  the EXACT legacy behaviour. Unknown `format` = honest 400 BEFORE model work; `clinical_guard`
+  still annotates every draft.
+- **Hardening pass 1 (live finding):** the base-3B model filled unstated parameters with
+  "not examined"/"Normal"-style placeholders (stated 13/23). Prompt hardened to forbid them
+  explicitly; deterministic `_vet_value_or_not_mentioned()` collapses bare non-data tokens
+  ("Normal", "WNL", "N/A", "unremarkable", "none", …) into the canonical `Not mentioned` fill —
+  mirrored in `src/lib/vox-soap/vox-soap.vetnote.ts` (`isVetPlaceholderValue`, same token set)
+  so client-side Apply mapping never disagrees.
+- **Hardening pass 2 (live finding):** stated values whose tokens could not trace to the
+  transcript ("pink and moist" vitals) — the trace gate drops any stated value with no
+  verbatim token trace in the consultation transcript into `Not mentioned` + counts it in the
+  envelope note ("drop-never-rewrite", mirroring the frontend FR-27 claim filter). Units are
+  stopwords so real spoken data ("24.5 kg") survives. Gate is inert without a transcript
+  (pure unit path) and tested both ways.
+- `GeminiProxyProvider.draft` accepts the same kwarg (forwards `format` upstream; the 501
+  honesty test still passes with the real provider class).
+
+### Fix 3 — frontend wiring (`vox-soap.engine.ts`, new `vox-soap.vetnote.ts`, panels)
+
+- Engine ml branch now: `mlTranscribe()` → stash `mlLocalTranscript` verbatim →
+  `mlLocalDraft()` → `groundedFromVetSections()` → `sourceType='ML_Local_Draft'` with audit
+  model `voxsoap-local-ml:whisper(language=X)→qwen-draft(vet_scribenote)`. `mlLocalDraft`
+  POSTs `{transcript, format:'vet_scribenote'}` to the local service with the honest 900 s
+  budget (`VOXSOAP_ML_DRAFT_TIMEOUT_MS`) and validates the `sections` boundary (missing
+  sections = thrown error, never a silently empty card). On ANY failure the catch keeps the
+  FULL stashed transcript in the deterministic fallback template.
+- **Truncation removed everywhere:** `buildManualFallbackTemplate` no longer slices
+  (the old 160/120-char cuts produced the owner's mid-word quote); presenting complaint and
+  source quote carry the full verbatim transcript.
+- New deterministic TS mapper `vox-soap.vetnote.ts` (shared canonical rules with the server:
+  23-param order, aliases, placeholder collapse, "Not mentioned"→null, bullet
+  classification into vaccinations/med orders/tests/follow-up/general care, plan-dose parsing
+  to medication-order fields) — TWO honest entry points: `groundedFromVetSections` (engine,
+  envelope sections) and `groundedFromVetNoteText` (panel Apply, formatted text parse with the
+  unknown-objective-lines surfaced, never dropped).
+- "📋 Apply Draft to SOAP Workspace" button in `MLAssistPanel` (visible when the host passes
+  `onApplyDraft`) → `VoxSoapWorkspace.handleApplyMlAssistDraft`: client-side patch of the four
+  cards with the same mapping the server post-processing uses; applied med orders carry honest
+  `UNKNOWN` validation and `canConfirmOrder:false` (the client never fabricates a MATCH
+  badge); the record stays a Draft; `groundingAuditNote` gains an assistive-source marker +
+  any unrecognized objective lines; visit stays Draft; vet confirmation remains mandatory.
+
+### Fix 4 — Leo ear-infection verification
+
+- MOCKED (deterministic, `tests/test_vet_scribenote_contract.py`, gates the REAL post-processing
+  functions fed the live model's output shape): 15 checks — 23-param EXACT order, Leo
+  subjective/objective/assessment/plan content gates, hydration, placeholder collapse, trace
+  drop + inert path, no-heading fallback, continuation lines, format routing contract (default
+  echo, medscribe forwarding, klingon → 400). Total mocked suite **46 → 48 passed**.
+- LIVE (`ml-serving/probe_vet_draft.mjs`, raw-socket POST — undici's fixed 300 s headersTimeout
+  kills minutes-long drafts with UND_ERR_HEADERS_TIMEOUT, so `fetch` cannot carry the probe):
+  **CONTRACT 15/15** — HTTP 200 envelope badges + guard; `format:"vet_scribenote"` echoed;
+  exactly the five sections; objective_map = EXACTLY the 23 canonical params in EXACT owner
+  order; **Weight = "24.5 kg"** (the spoken value) and Ears populated ("Right ear canal red and
+  inflamed, left ear clean and normal"); all 23 hydrated lines rendered in the draft; plus
+  client-side re-verification that EVERY stated value's tokens trace verbatim into the Leo
+  transcript (no fabrication possible in the envelope).
+- Live content WARN inventory (assistive draft; owner-gated acceptance): 5/23 stated vs the
+  checklist's 21 — Weight + Ears are the transcript-backed exam findings; the remaining trace
+  gates survived as short over-attributions: Hydration Status="Good" and Eyes="Clear"
+  (vocabulary-only attributions the trace window cannot disambiguate from an exam statement;
+  vet deletes at review), Integument=COPY of the Ears value (3B filler artefact). Subjective
+  drifts: "12-month-old" vs the spoken 3.5 years; "One month ago" vs 3 days; Apoquel/history
+  phrasing varies; plan omits the ear-cleaner suggestion on some runs. These are the documented
+  WARNs from content 6/11; the deterministic contract carries none of them.
+
+### Live latency + environment honesty
+
+- Cold measured `/draft` (bf16 Qwen load + generation, each probe after a clean
+  uvicorn restart): **989.1 s / 1132.1 s / 1011.2 s**. The 900 s budgets
+  (`ML_DRAFT_TIMEOUT_MS`, `/api/voxsoap/*` proxy ceiling) therefore abort a COLD first draft —
+  the engine answer is the honest fallback template (transcript preserved verbatim), never a
+  fabricated note. Documented mitigations: warm the service once with any `/draft` before the
+  first real session, or raise `VOXSOAP_ML_DRAFT_TIMEOUT_MS`/`VOXSOAP_TIMEOUT_MS`. Warm
+  generate-only latency was not measured (every probe cycle restarted the service per the
+  concurrency rule) — recorded as an unknown rather than a guess.
+- Concurrency hazard PROVEN this session: aborted/killed draft clients leave the server thread
+  generating → zombie uvicorn stack → 1.4 GB free RAM page-thrash; the only safe procedure is:
+  kill parent+worker uvicorn PIDs, relaunch, probe EXACTLY once. All live probes ran as
+  single-shot raw sockets with full 1500-2400 s budgets (never concurrent, never aborted
+  mid-flight).
+- Environment exception: `hf_xet` UNINSTALLED in `.venv-ml64` (its import crashed the pinned
+  `huggingface_hub 0.36.2` — the 12/12-file, ~5,897 MB Qwen snapshot completed cleanly after
+  removal). pip would reinstall it on future hub upgrades; flagged here so the exception is
+  not silently resurrected.
+- E2E routing re-drill (post-Fix-3 engine): `probe_local_extract.mjs` (raw-socket multipart +
+  chunked-response dechunking; the sync `/extract` chain outruns undici's headersTimeout too)
+  → **10/10**: 201 with `sourceType=Manual_Fallback_Draft` (synthetic tone → Whisper returns no
+  speech → the honest fallback keeps the transcript-stash path: nothing invented, nothing
+  rerouted), `AI_FALLBACK_TRIGGERED` audited with `transcriptionProvider=ml`, fake-WebM → 415,
+  `language=klingon` → 400, `transcribeProvider=openai` → 400, text-only path unchanged, and
+  NO `/gemini/i` mention anywhere on audio paths. (§9's drill counted 13 assertions on the
+  pre-Fix-3 version; the current harness totals 10 and all pass.)
+- tsc 0 / eslint 0 across every touched frontend file at final gate; py_compile clean.
+
+### Remaining (owner-visible)
+
+- Vet review of ONE real consultation through the UI (mic panel → Apply Draft → confirm/Mark
+  as Done) remains the human acceptance evidence — the code contract above is complete.
+- The live content WARNs (over-attribution + subjective drifts) iterate only with a bigger
+  scribe model or few-shot prompt tuning; the deterministic contract (order/ordering/no
+  fabrication) is enforced server-side regardless.

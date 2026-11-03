@@ -225,6 +225,11 @@ export const MLAssistPanel: React.FC<{
   accent?: PanelAccent;
   contextLabel?: string;
   onClose: () => void;
+  /** Owner Fix 3.3: apply the REVIEWED draft text to the main workspace's
+   * four SOAP cards (deterministic client-side vet-scribenote mapping via
+   * vox-soap.vetnote.groundedFromVetNoteText). Optional — panels without a
+   * hosting workspace simply don't render the button. */
+  onApplyDraft?: (draftText: string) => void;
 }> = ({
   open,
   staffRole,
@@ -233,6 +238,7 @@ export const MLAssistPanel: React.FC<{
   accent = 'amber',
   contextLabel = 'ML assist • local service',
   onClose,
+  onApplyDraft,
 }) => {
   const [stage, setStage] = useState<PanelStage>('checking');
   const [notice, setNotice] = useState<Notice | null>(null);
@@ -969,6 +975,16 @@ export const MLAssistPanel: React.FC<{
                 <button type="button" onClick={() => void copyToClipboard('draft', draft)} className={`px-4 py-2 rounded-xl text-sm font-semibold ${t.secondaryBtn}`}>
                   Copy draft
                 </button>
+                {onApplyDraft && (
+                  <button
+                    type="button"
+                    onClick={() => onApplyDraft(draft)}
+                    className="px-5 py-2 rounded-xl bg-primary hover:bg-primary-dark text-canvas text-sm font-bold"
+                    title="Apply THIS reviewed draft to the main workspace's four SOAP cards (Subjective / Objective / Assessment / Plan) — deterministic client-side vet-scribenote mapping. The note stays assistive and the visit stays a Draft until veterinary confirmation."
+                  >
+                    📋 Apply Draft to SOAP Workspace
+                  </button>
+                )}
                 <button
                   type="button"
                   onClick={() => {

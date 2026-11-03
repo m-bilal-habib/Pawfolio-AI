@@ -24,6 +24,7 @@ import {
   buildGroundingAuditNote,
   verifyGroundedClaims,
 } from './vox-soap.workflow';
+import { groundedFromVetSections } from './vox-soap.vetnote';
 
 export interface VoxSoapExtractionInput {
   petId: string;
@@ -69,6 +70,9 @@ const ML_BASE_URL = process.env.VOXSOAP_BASE_URL ?? 'http://127.0.0.1:8321';
 /** A 13-minute recording = 26 Whisper windows; fp32 CPU decode is
  * window-serial. The budget mirrors the proxy's 900 s honest ceiling. */
 const ML_TRANSCRIBE_TIMEOUT_MS = Number(process.env.VOXSOAP_ML_TRANSCRIBE_TIMEOUT_MS ?? 900_000);
+/** Owner Fix 2 (2026-11-01): the local /draft budget — bf16 CPU 3B inference
+ * takes minutes; mirrors the same honest 900 s ceiling as transcription. */
+const ML_DRAFT_TIMEOUT_MS = Number(process.env.VOXSOAP_ML_DRAFT_TIMEOUT_MS ?? 900_000);
 
 /** Strips MediaRecorder/OS parameters and vendor wave aliases — the ML audio
  * contract compares BASE MIME only (same normalization as the proxy panels). */
@@ -83,6 +87,23 @@ interface MlTranscribeEnvelope {
   ok?: unknown;
   text?: unknown;
   windows?: unknown;
+  message?: string;
+  error?: string;
+}
+
+/** Shape of the ml-serving /draft vet_scribenote envelope (owner Fix 2): the
+ * hydrated sections object is validated at this boundary before mapping —
+ * anything missing is an honest error, never a silently empty card. */
+interface MlVetDraftEnvelope {
+  ok?: unknown;
+  draft?: unknown;
+  sections?: {
+    subjective?: unknown;
+    objective_map?: unknown;
+    objective_text?: unknown;
+    assessment?: unknown;
+    plan?: unknown;
+  } | null;
   message?: string;
   error?: string;
 }
@@ -601,6 +622,10 @@ MANDATORY CLINICAL SAFETY & GROUNDING RULES:
     let effectiveProvider: TranscribeProvider | null = null;
     const asrLanguage: 'ur' | 'en' | 'auto' = input.asrLanguage ?? 'ur';
     let mlTranscriptionWindows: number | null = null;
+    // Owner Fix 2/3 (2026-11-01): the verbatim transcript is stashed OUTSIDE
+    // the try so a failed local /draft still preserves it verbatim in the
+    // honest fallback template (the transcript was real — never discarded).
+    let mlLocalTranscript: string | null = null;
 
     try {
       effectiveProvider = resolveTranscribeProvider(input.transcribeProvider);
@@ -647,11 +672,18 @@ MANDATORY CLINICAL SAFETY & GROUNDING RULES:
             'The local ML service finished but returned an empty transcript — nothing invented; check the recording and retry.'
           );
         }
+        mlLocalTranscript = localTranscript;
         usedModelForAudit = `voxsoap-local-ml:whisper(language=${asrLanguage})`;
-        // Honest structuring: real transcript + all-null SOAP fields. The
-        // vet-owned structuring note is exactly what the template emits.
+        // Owner Fixes 2+3 (2026-11-01): structure through the LOCAL /draft
+        // (format "vet_scribenote" — base-weights Qwen + deterministically
+        // hydrated 23-parameter veterinary objective). NEVER the medscribe
+        // adapter bias, NEVER Gemini; a failure here is thrown into the
+        // honest catch (aiError audited + deterministic template that now
+        // keeps the full transcript, since mlLocalTranscript is stashed).
+        const localDraft = await this.mlLocalDraft(localTranscript);
+        usedModelForAudit = `voxsoap-local-ml:whisper(language=${asrLanguage})→qwen-draft(vet_scribenote)`;
         sourceType = 'ML_Local_Draft';
-        extracted = this.buildManualFallbackTemplate(localTranscript);
+        extracted = groundedFromVetSections(localDraft, localTranscript);
       } else {
         // ---- GEMINI STRUCTURING PATH (unchanged behaviour) ----
         // Reached for the explicit 'gemini' provider (audio or text) AND for
@@ -763,7 +795,7 @@ MANDATORY CLINICAL SAFETY & GROUNDING RULES:
         : input.transcriptText && input.transcriptText.trim()
         ? 'Text_Only_Input'
         : 'Manual_Fallback';
-      extracted = this.buildManualFallbackTemplate(input.transcriptText ?? '');
+      extracted = this.buildManualFallbackTemplate(input.transcriptText ?? mlLocalTranscript ?? '');
     } finally {
       // Ephemeral audio cleanup: zero out buffer reference immediately after transcription
       if (input.audioBuffer) {
@@ -943,21 +975,94 @@ MANDATORY CLINICAL SAFETY & GROUNDING RULES:
     return { text, windows };
   }
 
+  /**
+   * Owner Fix 2 (2026-11-01): the LOCAL vet-scribenote draft — the engine
+   * POSTs the transcript to the local ml-serving /draft with
+   * `format: "vet_scribenote"` (base-weights Qwen + hydrated 23-parameter
+   * objective) and returns the validated section object. Controlled errors
+   * are THROWN honestly; the caller's catch keeps the transcript verbatim
+   * (stashed mlLocalTranscript) in the deterministic template — never a
+   * silent reroute to Gemini in either direction.
+   */
+  private async mlLocalDraft(transcript: string): Promise<{
+    subjective: string;
+    objective_map: Record<string, unknown> | null;
+    objective_text: string;
+    assessment: string;
+    plan: string;
+  }> {
+    let response: Response;
+    try {
+      response = await fetch(`${ML_BASE_URL}/draft`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ transcript, format: 'vet_scribenote' }),
+        signal: AbortSignal.timeout(ML_DRAFT_TIMEOUT_MS),
+      });
+    } catch (err) {
+      const reason =
+        err instanceof Error && err.name === 'TimeoutError'
+          ? `the local SOAP model did not answer within the ${Math.round(
+              ML_DRAFT_TIMEOUT_MS / 1000
+            )} s budget`
+          : `the local ML service at ${ML_BASE_URL} could not be reached for /draft`;
+      throw new Error(
+        `Local ML draft failed — ${reason}. Nothing was invented: the honest fallback template keeps the transcript verbatim for manual structuring.`
+      );
+    }
+
+    const raw = await response.text();
+    let envelope: MlVetDraftEnvelope | null = null;
+    try {
+      envelope = JSON.parse(raw) as MlVetDraftEnvelope;
+    } catch {
+      envelope = null;
+    }
+    if (!response.ok || !envelope || envelope.ok !== true) {
+      const detail = (envelope?.message ?? envelope?.error ?? raw).toString().slice(0, 240);
+      throw new Error(
+        `Local ML /draft answered HTTP ${response.status} (ok=${String(envelope?.ok)}): ${detail}`
+      );
+    }
+    const sections = envelope.sections && typeof envelope.sections === 'object' ? envelope.sections : null;
+    if (!sections) {
+      throw new Error(
+        'Local ML /draft returned no structured sections — the vet_scribenote contract mismatch (a draft without sections is never mapped onto the cards).'
+      );
+    }
+    const str = (value: unknown): string => (typeof value === 'string' ? value : '');
+    return {
+      subjective: str(sections.subjective),
+      objective_map:
+        sections.objective_map && typeof sections.objective_map === 'object'
+          ? (sections.objective_map as Record<string, unknown>)
+          : null,
+      objective_text: str(sections.objective_text),
+      assessment: str(sections.assessment),
+      plan: str(sections.plan),
+    };
+  }
+
   private buildManualFallbackTemplate(rawText: string): GroundedSoapExtractionOutput {
     return {
       verbatim_transcript: rawText || '[Manual Fallback Mode: Audio/AI unavailable]',
       subjective: {
         pet_name: null,
         age_mentioned: null,
+        // Owner Fix 3 (2026-11-01): NO truncation — the presenting complaint
+        // and the grounded source quote carry the FULL verbatim transcript.
+        // The old slice(0, 160)/slice(0, 120) produced the mid-word cut ("How
+        // is Leo doing today? He looks like he got a lot of energy... Yeah, h")
+        // the owner reported; the whole transcript is now preserved and the
+        // workspace quote strip renders it verbatim.
         presenting_complaint: rawText
-          ? `Manual review required for transcript: ${rawText.slice(0, 160)}...`
+          ? `Manual review required for transcript: ${rawText}`
           : 'AI service unavailable. Please enter presenting complaint manually.',
         symptom_duration: null,
         previous_medical_history: null,
-        // No fake "grounded quote" on the fallback path: without a real
-        // transcript there is no verbatim text to cite, and with one the
-        // slice IS verbatim (then the UI's quote strip stays honest).
-        source_quote: rawText.slice(0, 120),
+        // Same honesty rule: no fake "grounded quote" on the fallback path;
+        // with a real transcript the FULL text is the verbatim quote.
+        source_quote: rawText,
       },
       objective: {
         temperature: null,

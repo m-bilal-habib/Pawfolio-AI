@@ -31,6 +31,7 @@ import base64
 import copy
 import gc
 import json
+import re
 import time
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
@@ -40,6 +41,359 @@ from typing import Any, Dict, Optional, Tuple
 TASK_PREFIX = "transliterate to roman urdu: "
 
 COMPONENT_KEYS = ("asr", "soap", "roman")
+
+# ---- Vet Scribenote contract (owner Fix 2, 2026-11-01) ----------------------
+# The medscribe soap-lora adapter forces SHORT human-medical summaries and
+# building a 23-parameter objective by generating "Not mentioned" 21 times
+# burns ~150 CPU tokens. The default /draft format ("vet_scribenote")
+# therefore runs the BASE Qwen weights (adapter disabled) with a strict
+# veterinary prompt: the model only states parameters the transcript
+# EXPLICITLY contains, and Python post-processing deterministically hydrates
+# all 23 canonical parameters (missing -> "Not mentioned").
+
+VET_NOTE_FORMAT = "vet_scribenote"
+VET_NOTE_FORMATS = ("vet_scribenote", "medscribe")
+
+# Canonical physical-exam parameters, EXACT owner order (never re-sorted).
+VET_OBJECTIVE_PARAMS: Tuple[str, ...] = (
+    "Temperature",
+    "Heart Rate",
+    "Weight",
+    "Respiratory Rate",
+    "Capillary Refill Time",
+    "Mucous Membranes",
+    "Hydration Status",
+    "Body Condition Score",
+    "Pain Score",
+    "Fear Anxiety Stress Score",
+    "Eyes",
+    "Ears",
+    "Nasal",
+    "Oral/Dental",
+    "Cardiovascular",
+    "Respiratory",
+    "Neurological",
+    "Musculoskeletal",
+    "Lymphatic",
+    "Gastrointestinal",
+    "Reproductive/Urinary",
+    "Integument",
+    "Masses",
+)
+
+VET_NOT_MENTIONED = "Not mentioned"
+
+# Model-emitted non-data placeholders (wrong: line should not exist at all)
+# map deterministically onto the canonical "Not mentioned" hydration. A value
+# is kept ONLY when it carries actual spoken data — any of these placeholder
+# tokens as the WHOLE value means "not documented in the transcript".
+_VET_PLACEHOLDER_VALUES = (
+    "not examined",
+    "not noted",
+    "not stated",
+    "not documented",
+    "not mentioned",
+    "not evaluated",
+    "not assessed",
+    "not performed",
+    "not recorded",
+    "not checked",
+    "unremarkable",
+    "unspecified",
+    "no abnormality",
+    "no abnormality detected",
+    "no findings",
+    "no data",
+    "nad",
+    "wnl",
+    "n/a",
+    "na",
+    "none",
+    "normal",
+    "within normal limits",
+)
+
+
+def _vet_value_or_not_mentioned(value: str) -> str:
+    """Deterministic placeholder collapse: a bare non-data token ("Normal",
+    "WNL", "not examined", ...) hydrates to "Not mentioned"; a spoken value
+    with real content survives verbatim."""
+    v = re.sub(r"\s+", " ", value or "").strip()
+    if not v:
+        return VET_NOT_MENTIONED
+    norm = re.sub(r"[^a-z0-9/]", "", v.lower())
+    if norm in {re.sub(r"[^a-z0-9/]", "", p) for p in _VET_PLACEHOLDER_VALUES}:
+        return VET_NOT_MENTIONED
+    return v
+
+
+# ---- objective-value trace gate (owner no-hallucination doctrine) -----------
+# 2026-11-03 live probe: even with the hardened prompt the base-3B model
+# states unstated parameters ("Mucous Membranes: pink and moist"). The same
+# rule the frontend verifyGroundedClaims (FR-27) enforces applies here:
+# UNTRACEABLE claims are DROPPED (never rewritten). A stated objective VALUE
+# survives only when EVERY meaningful token has a verbatim trace in the
+# consultation transcript (`transcript` is always available in the serving
+# path); otherwise it deterministically hydrates to "Not mentioned" and is
+# counted for the honesty note. Units and copulas are stopwords (they carry
+# no finding; "kg"/"bpm" must not gate a value the transcript phrases as
+# "kilograms"). Numbers are kept dotful ("24.5" must match "24.5").
+_VET_TRACE_STOPWORDS = frozenset({
+    "a", "an", "the", "and", "or", "of", "in", "to", "with", "for", "on",
+    "is", "are", "was", "were", "be", "at", "by", "as", "it", "its",
+    "no", "not", "very", "both", "s", "kg", "lbs", "bpm", "f", "c", "mm",
+})
+
+
+def _vet_norm_trace(value: str) -> str:
+    return re.sub(r"[^a-z0-9.]+", " ", (value or "").lower()).strip()
+
+
+def _vet_value_traced(value: str, transcript_norm: str) -> bool:
+    tokens = [
+        token for token in _vet_norm_trace(value).split()
+        if token and token not in _VET_TRACE_STOPWORDS
+    ]
+    if not tokens or not transcript_norm:
+        return False
+    return all(token in transcript_norm for token in tokens)
+
+
+VET_SCRIBENOTE_SYSTEM_PROMPT = (
+    "You are a veterinary medical scribe. From the consultation transcript, "
+    "write a clinical note using EXACTLY these four headings, each on its own "
+    "line, in this order:\n"
+    "SUBJECTIVE:\n"
+    "OBJECTIVE_MENTIONED:\n"
+    "ASSESSMENT:\n"
+    "PLAN:\n"
+    "SUBJECTIVE: one detailed third-person clinical history paragraph "
+    "covering the patient's signalment (species, age), the presenting "
+    "complaint, its duration, the observed clinical signs, recent "
+    "grooming/bathing/exposures, and past medical history with prior "
+    "medications.\n"
+    "OBJECTIVE_MENTIONED: only the physical-exam or vital parameters the "
+    "transcript EXPLICITLY states, one per line as 'Name: value'. Use these "
+    "canonical names exactly when stated: Temperature, Heart Rate, Weight, "
+    "Respiratory Rate, Capillary Refill Time, Mucous Membranes, Hydration "
+    "Status, Body Condition Score, Pain Score, Fear Anxiety Stress Score, "
+    "Eyes, Ears, Nasal, Oral/Dental, Cardiovascular, Respiratory, "
+    "Neurological, Musculoskeletal, Lymphatic, Gastrointestinal, "
+    "Reproductive/Urinary, Integument, Masses. A line may be written ONLY "
+    "when the transcript literally provides that value; copy the spoken "
+    "value verbatim (never paraphrase or estimate numbers). OMIT every "
+    "parameter the transcript does not state, and FORBIDDEN placeholders: "
+    "never write 'Not examined', 'Normal', 'WNL', 'N/A', 'unremarkable', "
+    "'not noted' or 'unspecified' for an omitted parameter — the line must "
+    "not exist at all. NEVER write your own 'Not mentioned'.\n"
+    "ASSESSMENT: a bulleted list ('- ') of diagnoses or findings, suspected "
+    "causes, and preventative/vaccination status.\n"
+    "PLAN: a bulleted list ('- ') of treatments or vaccines administered "
+    "today, prescribed medications with exact dose, route, frequency and "
+    "duration, and any recheck instructions.\n"
+    "Rules: write in the third person; never invent findings or values "
+    "absent from the transcript; keep the four headings exactly as written."
+)
+
+# Case/punctuation-insensitive matching for model-emitted objective keys.
+def _vet_normalize_key(raw: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", raw.strip().lower())
+
+
+_CANONICAL_KEY_LOOKUP: Dict[str, str] = {
+    _vet_normalize_key(name): name for name in VET_OBJECTIVE_PARAMS
+}
+_CANONICAL_KEY_LOOKUP.update({
+    "temp": "Temperature",
+    "tempc": "Temperature",
+    "hr": "Heart Rate",
+    "pulse": "Heart Rate",
+    "bw": "Weight",
+    "bodyweight": "Weight",
+    "rr": "Respiratory Rate",
+    "resprate": "Respiratory Rate",
+    "crt": "Capillary Refill Time",
+    "capillaryrefill": "Capillary Refill Time",
+    "mucous": "Mucous Membranes",
+    "mm": "Mucous Membranes",
+    "hydration": "Hydration Status",
+    "bcs": "Body Condition Score",
+    "bodycondition": "Body Condition Score",
+    "pain": "Pain Score",
+    "fas": "Fear Anxiety Stress Score",
+    "fearanxietystress": "Fear Anxiety Stress Score",
+    "fascore": "Fear Anxiety Stress Score",
+    "eye": "Eyes",
+    "ocular": "Eyes",
+    "ear": "Ears",
+    "earcanal": "Ears",
+    "otoscopy": "Ears",
+    "otoscopic": "Ears",
+    "nose": "Nasal",
+    "nasalcavity": "Nasal",
+    "oral": "Oral/Dental",
+    "dental": "Oral/Dental",
+    "mouth": "Oral/Dental",
+    "heart": "Cardiovascular",
+    "cv": "Cardiovascular",
+    "lung": "Respiratory",
+    "lungs": "Respiratory",
+    "chest": "Respiratory",
+    "auscultation": "Cardiovascular",
+    "neuro": "Neurological",
+    "msk": "Musculoskeletal",
+    "lymphnode": "Lymphatic",
+    "lymphnodes": "Lymphatic",
+    "gi": "Gastrointestinal",
+    "abdomen": "Gastrointestinal",
+    "abdominal": "Gastrointestinal",
+    "reproductive": "Reproductive/Urinary",
+    "urinary": "Reproductive/Urinary",
+    "urogenital": "Reproductive/Urinary",
+    "skin": "Integument",
+    "coat": "Integument",
+    "mass": "Masses",
+    "lesion": "Masses",
+    "lesions": "Masses",
+})
+
+_VET_HEADER_NAMES = {
+    "subjective": "subjective",
+    "objectivementioned": "objective",
+    "objective": "objective",
+    "assessment": "assessment",
+    "plan": "plan",
+}
+
+
+def _vet_split_sections(raw: str) -> Dict[str, str]:
+    """Split model output into {subjective, objective, assessment, plan}.
+
+    Deterministic: matches the four mandated headings case-insensitively,
+    tolerating a missing colon and in-line content on the heading line. If a
+    continuation line without a colon appears inside OBJECTIVE... it is kept
+    for the key/value parser. When NO heading is matched at all, the whole
+    raw text is retained as the subjective fallback (nothing is discarded).
+    """
+    buckets: Dict[str, list] = {"subjective": [], "objective": [], "assessment": [], "plan": []}
+    current: Optional[str] = None
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        head, sep, rest = stripped.partition(":")
+        bucket = _VET_HEADER_NAMES.get(_vet_normalize_key(head))
+        # A header colon (or a bare heading word) switches sections; a value
+        # line such as "Temperature: 102.5" normalizes to "temperature" which
+        # is NOT in the header set, so it cannot be confused with a heading.
+        if bucket and (sep == ":" or not rest):
+            current = bucket
+            if rest.strip():
+                buckets[current].append(rest.strip())
+            continue
+        if current is not None:
+            buckets[current].append(stripped)
+        # Pre-heading preamble is dropped (title noise like "SOAP Note:").
+    found = any(buckets.values())
+    if not found:
+        buckets["subjective"] = [raw.strip()]
+    return {key: "\n".join(lines).strip() for key, lines in buckets.items()}
+
+
+def _vet_parse_objective(lines_text: str) -> Tuple[Dict[str, str], int]:
+    """Parse OBJECTIVE(_MENTIONED) lines into canonical-keyed values.
+
+    Returns (values, unknown_count). `key: value` splits on the first colon
+    (falling back to ' - '), canonical names/aliases are matched
+    case/punctuation-insensitively, and colon-less continuation lines are
+    appended to the PREVIOUS key's value (multi-line exam findings survive).
+    Unknown keys are counted, never silently accepted into the shape.
+    """
+    values: Dict[str, str] = {}
+    unknown = 0
+    current: Optional[str] = None
+    for line in lines_text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        head, sep, value = stripped.partition(":")
+        if sep != ":":
+            head, sep, value = stripped.partition(" - ")
+        canonical = _CANONICAL_KEY_LOOKUP.get(_vet_normalize_key(head)) if sep else None
+        if canonical:
+            val = value.strip()
+            while val.startswith("-"):
+                val = val[1:].lstrip()
+            values[canonical] = val
+            current = canonical
+        elif current:
+            # Continuation of the previous finding (no key on this line).
+            values[current] = f"{values[current]} {stripped}".strip()
+        else:
+            unknown += 1
+    return values, unknown
+
+
+def _vet_normalize_bullets(text: str) -> str:
+    """Every non-empty line becomes a '- ' bullet (deterministic shape)."""
+    bullets = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        bullets.append(stripped if stripped.startswith("-") else f"- {stripped}")
+    return "\n".join(bullets)
+
+
+def _vet_hydrated_story(
+    raw_text: str, transcript: Optional[str] = None
+) -> Tuple[str, Dict[str, str], int, int]:
+    """Build the hydrated (draft_text, sections, unknown, drops) tuple.
+
+    `transcript` (the ORIGINAL consultation transcript, available in the
+    serving draft path) enables the deterministic value-trace gate: a stated
+    value with no verbatim token trace in the transcript is dropped to
+    "Not mentioned" (counted in `drops`). Passing None keeps the gate inert
+    for pure unit calls — the placeholder collapse still applies.
+    """
+    buckets = _vet_split_sections(raw_text)
+    objective_values, unknown = _vet_parse_objective(buckets["objective"])
+    # Deterministic hydration: missing -> "Not mentioned" AND a bare model
+    # placeholder ("Normal", "WNL", "not examined", ...) ALSO collapses to
+    # "Not mentioned" — the canonical fill is the ONLY "not documented"
+    # representation in the note, so the Andre-VetNote renderer and the
+    # frontend null-mapping never see a fake data value. The trace gate then
+    # drops model-invented VALUES (e.g. "pink and moist" vitals) that have no
+    # verbatim trace in the consultation transcript — mirrored from the
+    # frontend FR-27 rule (untraceable claims are dropped, never rewritten).
+    transcript_norm = _vet_norm_trace(transcript) if transcript else ""
+    objective_map: Dict[str, str] = {}
+    drops = 0
+    for name in VET_OBJECTIVE_PARAMS:
+        value = _vet_value_or_not_mentioned(objective_values.get(name) or "")
+        if transcript and value != VET_NOT_MENTIONED and not _vet_value_traced(value, transcript_norm):
+            value = VET_NOT_MENTIONED
+            drops += 1
+        objective_map[name] = value
+    objective_text = "\n".join(f"{name}: {value}" for name, value in objective_map.items())
+    sections: Dict[str, str] = {
+        "subjective": buckets["subjective"],
+        "objective_map": objective_map,
+        "objective_text": objective_text,
+        "assessment": _vet_normalize_bullets(buckets["assessment"]),
+        "plan": _vet_normalize_bullets(buckets["plan"]),
+    }
+    draft_text = (
+        "SUBJECTIVE:\n"
+        f"{sections['subjective']}\n\n"
+        "OBJECTIVE_MENTIONED:\n"
+        f"{objective_text}\n\n"
+        "ASSESSMENT:\n"
+        f"{sections['assessment']}\n\n"
+        "PLAN:\n"
+        f"{sections['plan']}"
+    )
+    return draft_text, sections, unknown, drops
 
 
 # ---- transformers cross-version helpers ------------------------------------
@@ -318,6 +672,23 @@ class MLProvider:
         model = PeftModel.from_pretrained(base, str(comp["adapter_dir"]))
         model.to(device)
         model.eval()
+        if device == "cpu":
+            # Owner Fix 1 (2026-11-01): saturate every physical core - the
+            # default intra-op pool leaves half the machine idle on Whisper
+            # decode. Idempotent per call; applied again defensively in
+            # transcribe() on CPU.
+            threads = _boot_os.cpu_count() or 1
+            torch.set_num_threads(threads)
+            if _boot_os.environ.get("VOXSOAP_ASR_QUANT", "").strip() == "1":
+                # Optional fast path, DEFAULT OFF: dynamic qint8 quantization
+                # rewrites EVERY Linear in place - including the PEFT
+                # lora_A/lora_B projections - which is an unverified
+                # eval-parity + adapter-interaction risk. Explicit opt-in
+                # knob (VOXSOAP_ASR_QUANT=1), never a silent default; torch
+                # set_num_threads already delivers a large CPU win.
+                from torch.ao.quantization import quantize_dynamic
+
+                model = quantize_dynamic(model, {torch.nn.Linear}, dtype=torch.qint8)
         state = {"model": model, "processor": processor, "device": device, "loaded_at": time.time()}
         self._loaded["asr"] = state
         return state
@@ -410,6 +781,14 @@ class MLProvider:
             # behaviour - no silent contract change for existing callers).
             lang_key = (language or "ur").strip().lower()
             lang_whisper = {"ur": "urdu", "en": "english"}.get(lang_key)
+            # Owner Fix 1 (2026-11-01, FLEURS early-cutoff): the ur-LoRA
+            # adapter was trained on FLEURS clips - single 5-8 s sentences
+            # padded to 30 s - so on DENSE continuous English dialogue it
+            # prematurely emits </s> after 1-2 sentences. English therefore
+            # decodes with the UNCORRUPTED base openai/whisper-small weights
+            # (adapter disabled); Urdu keeps the adapter; "auto" also keeps
+            # it (documented: explicit 'en' is the English escape hatch).
+            use_base_weights = lang_key == "en"
 
             def _decode_window(window: "np.ndarray") -> str:
                 feats = processor.feature_extractor(
@@ -421,20 +800,34 @@ class MLProvider:
                 # max_new_tokens is the actively supported generate arg (the
                 # exact recipe evaluate_asr.py used for the verified Stage-10
                 # eval under the pinned stack); `max_length` is the deprecated
-                # Whisper path.
+                # Whisper path. condition_on_prev_tokens=False is Fix 1: no
+                # cross-chunk conditioning, so a pause or greeting can never
+                # gate the rest of the note.
                 gen_kwargs: Dict[str, Any] = {
                     "max_new_tokens": self._cfg.asr_max_new_tokens,
                     "task": "transcribe",
+                    "condition_on_prev_tokens": False,
                 }
                 if lang_whisper is not None:
                     gen_kwargs["language"] = lang_whisper
                 if getattr(feats, "attention_mask", None) is not None:
                     gen_kwargs["attention_mask"] = feats.attention_mask.to(model.device)
                 with torch.no_grad():
-                    ids = model.generate(
-                        input_features=feats.input_features.to(device=model.device, dtype=model.dtype),
-                        **gen_kwargs,
-                    )
+                    if use_base_weights:
+                        with model.disable_adapter():
+                            ids = model.generate(
+                                input_features=feats.input_features.to(
+                                    device=model.device, dtype=model.dtype
+                                ),
+                                **gen_kwargs,
+                            )
+                    else:
+                        ids = model.generate(
+                            input_features=feats.input_features.to(
+                                device=model.device, dtype=model.dtype
+                            ),
+                            **gen_kwargs,
+                        )
                 # clean_up_tokenization_spaces pinned EXPLICITLY to True: that
                 # is the default the verified eval stack (4.48.3) measured,
                 # and it keeps serving output consistent with the eval
@@ -443,35 +836,43 @@ class MLProvider:
                     ids, skip_special_tokens=True, clean_up_tokenization_spaces=True
                 )[0].strip()
 
-            window_len = 30 * int(sample_rate)
-            # Whisper is a fixed 30 s window model. Audio longer than one
-            # window is split into sequential clean 30 s windows (no overlap -
-            # clean joins faster than overlap handoffs on CPU and honest about
-            # it: a word straddling a boundary may clip; surfaced in `note`).
-            bounds = [
-                (start, min(start + window_len, speech.shape[0]))
-                for start in range(0, speech.shape[0], window_len)
+            # Owner Fix 1: 20 s chunks (320,000 samples at 16 kHz) replace the
+            # 30 s split - shorter chunks keep each decode inside the FLEURS
+            # distribution the base model handles cleanly.
+            chunk_len = 20 * int(sample_rate)
+            chunks = [
+                (start, min(start + chunk_len, speech.shape[0]))
+                for start in range(0, speech.shape[0], chunk_len)
             ]
-            window_count = len(bounds)
-            if window_count == 1:
-                text = _decode_window(speech)
-                note = "single-window transcription (input <= 30 s)"
+            chunk_count = len(chunks)
+            decoded = []
+            skipped_silent = 0
+            for start, end in chunks:
+                chunk = speech[start:end]
+                # Silence gate: pure padding/room-tone chunks cost a full
+                # decode for nothing - skip them and say so in the note.
+                if float(np.max(np.abs(chunk))) < 1e-3:
+                    skipped_silent += 1
+                    continue
+                part_text = _decode_window(chunk)
+                if part_text:
+                    decoded.append(part_text)
+            text = " ".join(decoded)
+            if chunk_count == 0:
+                note = "empty input audio"
+            elif chunk_count == 1:
+                note = "single-chunk transcription (input <= 20 s)"
             else:
-                parts = []
-                for start, end in bounds:
-                    part_text = _decode_window(speech[start:end])
-                    if part_text:
-                        parts.append(part_text)
-                text = " ".join(parts)
                 note = (
-                    f"multi-window transcription: {window_count} x 30 s windows joined (no overlap); "
-                    "a word straddling a window boundary may clip"
+                    f"multi-chunk transcription: {chunk_count} x 20 s chunks joined (no "
+                    f"overlap; {skipped_silent} silent chunk(s) skipped); a word straddling "
+                    "a chunk boundary may clip"
                 )
             return {
                 "text": text,
                 "language": lang_key,
                 "sample_rate": sample_rate,
-                "windows": window_count,
+                "windows": chunk_count,
                 "note": note,
             }
         except ProviderError:
@@ -482,8 +883,15 @@ class MLProvider:
                 "Nothing was silently substituted (no Gemini fallback)."
             ) from err
 
-    def draft(self, transcript: str, max_new_tokens: Optional[int] = None) -> Dict[str, Any]:
+    def draft(self, transcript: str, max_new_tokens: Optional[int] = None,
+              note_format: str = VET_NOTE_FORMAT) -> Dict[str, Any]:
         try:
+            if (note_format or "").strip().lower() not in VET_NOTE_FORMATS:
+                raise InferenceError(
+                    f"unsupported draft format {note_format!r}; allowed: "
+                    "vet_scribenote | medscribe."
+                )
+            fmt = (note_format or "").strip().lower()
             state = self._loaded["soap"] or self._load_soap()
             torch = self._real_stack()
             model = state["model"]
@@ -494,9 +902,17 @@ class MLProvider:
             # /draft gate with KeyError('shape'). Explicit + _unwrap_chat_prompt
             # accepts both shapes; the runtime itself is pinned in
             # requirements-serving-ml.txt.
+            # Owner Fix 2 (2026-11-01): "vet_scribenote" DEFAULT runs the BASE
+            # Qwen weights (model.disable_adapter()) - the medscribe soap-lora
+            # adapter forces short human-medical summaries and cannot emit the
+            # 23-parameter veterinary shape. "medscribe" keeps the EXACT
+            # legacy behaviour (adapter enabled + configured system prompt).
+            system_prompt = (
+                self._cfg.soap_system_prompt if fmt == "medscribe" else VET_SCRIBENOTE_SYSTEM_PROMPT
+            )
             prompt = tok.apply_chat_template(
                 [
-                    {"role": "system", "content": self._cfg.soap_system_prompt},
+                    {"role": "system", "content": system_prompt},
                     {"role": "user", "content": transcript},
                 ],
                 tokenize=True,
@@ -507,16 +923,18 @@ class MLProvider:
             prompt_ids, prompt_mask = _unwrap_chat_prompt(prompt)
             # 2026-10-31 local-speed: an explicit request-level cap wins
             # (validated 1..cfg cap at the API layer and echoed in the
-            # envelope). None -> a fast CPU default: 256 new tokens is plenty
-            # for a reviewable S/O/A/P sketch and keeps a full local draft
-            # far inside practical review latency; CUDA keeps the configured
+            # envelope). None -> a fast CPU default; CUDA keeps the configured
             # 512 (the phase-3 anti-truncation value). Honest, explicit, and
             # visible in the response — never a silent edit of the note.
+            # Owner Fix 2: the vet_scribenote shape needs the 23-line hydrated
+            # objective TWICE the sketch budget - the CPU default is raised
+            # 256 -> 448 (still far below the 512 configured cap), echoed here
+            # and in the envelope. The medscribe legacy path keeps 256.
             tokens_cap = self._cfg.draft_max_new_tokens
             if max_new_tokens is not None:
                 tokens_cap = int(max_new_tokens)
             elif self._resolve_device() == "cpu":
-                tokens_cap = min(256, tokens_cap)
+                tokens_cap = min(448 if fmt == "vet_scribenote" else 256, tokens_cap)
             gen_kwargs: Dict[str, Any] = {
                 "input_ids": prompt_ids.to(model.device),
                 "max_new_tokens": tokens_cap,
@@ -526,18 +944,51 @@ class MLProvider:
             if prompt_mask is not None:
                 gen_kwargs["attention_mask"] = prompt_mask.to(model.device)
             with torch.no_grad():
-                out = model.generate(**gen_kwargs)
+                if fmt == "vet_scribenote":
+                    with model.disable_adapter():
+                        out = model.generate(**gen_kwargs)
+                else:
+                    out = model.generate(**gen_kwargs)
             continuation = out[:, prompt_ids.shape[-1]:]
             # clean_up_tokenization_spaces pinned for the same reason as ASR:
             # frozen to the verified 4.48.3 default the eval pipeline measured.
             text = tok.batch_decode(
                 continuation, skip_special_tokens=True, clean_up_tokenization_spaces=True
             )[0].strip()
+            if fmt == "medscribe":
+                return {
+                    "draft": text,
+                    "generation": "greedy",
+                    "max_new_tokens": tokens_cap,
+                    "note": "assistive DRAFT - deterministic guard annotations attached; vet confirmation is mandatory",
+                }
+            # Owner Fix 2 post-processing: deterministically hydrate ALL 23
+            # canonical objective parameters (missing -> "Not mentioned") and
+            # ship both the formatted draft string and the structured sections
+            # object the frontend maps into the main SOAP workspace cards.
+            draft_text, sections, unknown_dropped, trace_dropped = _vet_hydrated_story(text, transcript=transcript)
+            note = (
+                "assistive DRAFT - deterministic guard annotations attached; "
+                "vet confirmation is mandatory"
+            )
+            if unknown_dropped:
+                note += (
+                    f" ({unknown_dropped} unrecognized objective line(s) dropped by "
+                    "canonical-key matching)"
+                )
+            if trace_dropped:
+                note += (
+                    f" ({trace_dropped} objective value(s) dropped: no verbatim trace "
+                    "in the consultation transcript - untraceable claims are never "
+                    "invented into the note)"
+                )
             return {
-                "draft": text,
+                "draft": draft_text,
+                "sections": sections,
+                "format": VET_NOTE_FORMAT,
                 "generation": "greedy",
                 "max_new_tokens": tokens_cap,
-                "note": "assistive DRAFT - deterministic guard annotations attached; vet confirmation is mandatory",
+                "note": note,
             }
         except ProviderError:
             raise
@@ -650,10 +1101,13 @@ class GeminiProxyProvider:
         }
         return self._post_task("transcribe", payload)
 
-    def draft(self, transcript: str, max_new_tokens: Optional[int] = None) -> Dict[str, Any]:
+    def draft(self, transcript: str, max_new_tokens: Optional[int] = None,
+              note_format: str = "vet_scribenote") -> Dict[str, Any]:
         payload: Dict[str, Any] = {"transcript": transcript}
         if max_new_tokens is not None:
             payload["max_new_tokens"] = max_new_tokens
+        if note_format:
+            payload["format"] = note_format
         return self._post_task("draft", payload)
 
     def roman(self, text: str) -> Dict[str, Any]:

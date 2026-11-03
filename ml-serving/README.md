@@ -48,8 +48,8 @@ stays a diagnostics-only override; `/roman` answers an honest 501 by design.
 | Route | Body | Behaviour |
 | --- | --- | --- |
 | `GET /health` | - | component/status/scale report; loads nothing |
-| `POST /transcribe` | multipart `audio` (16 kHz PCM WAV), form `provider` optional | ASR LoRA transcription; other sample rates => honest 400 |
-| `POST /draft` | JSON `{transcript, provider?}` | SOAP draft + deterministic guard annotations |
+| `POST /transcribe` | multipart `audio` (16 kHz PCM WAV), form `provider` optional | ASR transcription; other sample rates => honest 400. English (`language=en`) decodes with the ADAPTER-DISABLED base Whisper weights (owner Fix 1) and audio longer than 20 s is processed as sequential 20 s chunks (silent chunks skipped, reported in `note`) |
+| `POST /draft` | JSON `{transcript, provider?, max_new_tokens?, format?}` | `format:"vet_scribenote"` (DEFAULT): base-weights Qwen + deterministic hydration of ALL 23 canonical objective parameters (missing/bare-placeholder values -> "Not mentioned") + a verbatim-trace gate that DROPS stated values the transcript never contains; envelope carries `draft` + `sections{subjective, objective_map, objective_text, assessment, plan}`. `format:"medscribe"`: legacy soap-lora adapter behaviour. Unknown format => honest 400 |
 | `POST /roman` | JSON `{text, provider?}` | **501** - Model C DEPRECATED (runs 9/10/11 failed); diagnostics-only via `VOXSOAP_ROMAN_ADAPTER_DIR` |
 | `POST /unload` | JSON `{component: asr|soap|roman|all}` | frees weights + gc + CUDA cache; swap = change env, restart |
 
@@ -87,6 +87,39 @@ Every response (success **and** controlled error) carries:
    number / medicine-fact arithmetic from `evaluate_soap.py` to annotate
    drafts; the veterinarian remains the reviewer of record.
 5. **16 kHz audio or honest 400.** The server never silently resamples.
+6. **Objective values are transcribed, never invented (2026-11-03).** In the
+   vet_scribenote draft every stated parameter value must TRACE verbatim to
+   the consultation transcript; untraceable values are DROPPED into
+   "Not mentioned" (counted in the envelope note) — the same
+   drop-never-rewrite doctrine the frontend FR-27 claim filter enforces. Bare
+   model placeholders ("Normal", "WNL", "not examined", ...) collapse the
+   same way; a fabricated medical value can never reach a card.
+
+## Owner fixes 2026-11-01/03 (ASR speed + vet-scribenote draft)
+
+1. **ASR (Fix 1).** The ur-LoRA adapter was trained on FLEURS clips — short
+   single sentences padded to 30 s — so on DENSE continuous English dialogue
+   it prematurely emitted EOS. English now decodes with the UNCORRUPTED base
+   `openai/whisper-small` weights (`model.disable_adapter()` inside
+   `generate`); Urdu keeps the adapter; "auto" also keeps it (explicit `en`
+   is the escape hatch). Audio longer than 20 s is decoded as sequential
+   20 s chunks (320,000 samples, no overlap; a boundary word may clip, stated
+   in `note`), silent chunks are skipped, and prev-chunk conditioning is OFF.
+   CPU speed-up: `torch.set_num_threads(cpu_count)` always on CPU;
+   `VOXSOAP_ASR_QUANT=1` additionally enables dynamic qint8 quantization as
+   an explicit OPT-IN (default OFF: PEFT/qint8 interaction + eval-parity
+   risk — never silently change a verified recipe).
+2. **Draft (Fix 2).** Default `format:"vet_scribenote"` = BASE Qwen weights +
+   the strict veterinary prompt (only transcript-stated parameters, drafted
+   as `Name: value` lines) + deterministic Python post-processing that
+   hydrates ALL 23 canonical parameters (UNSTATED -> `Not mentioned`)
+   exactly in owner order, normalizes every section bullet, and returns the
+   structured `sections` object the frontend maps into the workspace cards.
+   `format:"medscribe"` preserves the legacy adapter behaviour (and its 256
+   CPU token cap; vet_scribenote's hydrated shape gets 448, still under the
+   512 configured maximum). `hf_xet`: UNINSTALLED in `.venv-ml64` (its
+   import crashed huggingface_hub 0.36.2 downloads) — snapshot downloads
+   work cleanly without it.
 
 ## Tests (mocked vs real)
 
@@ -98,9 +131,12 @@ py -m pytest ml-serving/tests -m real -v
 ```
 
 Mocked tests use fake providers reporting `serving_mode="mocked-test-double"`
-in every response (33 tests, including the /transcribe language contract and
-the /draft max_new_tokens override). Real-inference tests are additionally gated by
-`pytest.mark.real` (4 tests: health, real /transcribe, roman-501, real /draft -
+in every response (48 tests: the /transcribe language contract, the /draft
+max_new_tokens override, and the 15-test vet_scribenote contract suite —
+canonical 23-parameter order, Leo-consultation content gates, placeholder
+collapse and the verbatim-trace drop gate). Real-inference tests are
+additionally gated by `pytest.mark.real` (4 tests: health, real /transcribe,
+roman-501, real /draft -
 the 4th needs CUDA or `VOXSOAP_REAL_DRAFT_FORCE=1` + ~13 GB free CPU RAM,
 otherwise it skips honestly).
 
@@ -133,10 +169,12 @@ transformers 5.x). The pinned re-run then passed 4/4.
 Still no real inference ON THIS MACHINE outside the venv: the interpreters
 installed outside `.venv-ml64` are **32-bit** Pythons (3.15-32, 2.7-32) and
 torch publishes no win32 wheels, so `torch`/`transformers` cannot run in them -
-the mocked suite (33 tests) runs
+the mocked suite (48 tests) runs
 there; the real gate ran on Colab, and the Phase-5 plan
 (`reports/phase5_integration_plan.md`) sets up a 64-bit Python 3.12 venv to
-close that gap. Re-run the gate after any re-pin; the 4th real test (real
+close that gap (§10 records the 2026-11-03 local verification in `.venv-ml64`,
+where `hf_xet` had to be UNINSTALLED — an environment exception documented
+there). Re-run the gate after any re-pin; the 4th real test (real
 /draft with the full-scale SOAP adapter) is the live regression guard for the
 drift caught above. `/roman` stays 501 (Model C **DEPRECATED**). ML failures
 in a torch-absent process surface as honest 503s - never a Gemini swap.

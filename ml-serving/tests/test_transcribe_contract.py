@@ -84,7 +84,7 @@ class _ProbeAsrProvider:
             "note": "PROBED (mocked contract test)",
         }
 
-    def draft(self, transcript: str):
+    def draft(self, transcript: str, max_new_tokens=None, note_format: str = "vet_scribenote"):
         raise NotImplementedError("draft is not under test here")
 
     def roman(self, text: str):

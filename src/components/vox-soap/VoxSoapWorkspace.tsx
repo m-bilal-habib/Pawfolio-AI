@@ -14,6 +14,7 @@ import { UploadAudioPanel } from './UploadAudioPanel';
 import { RichTextEditor } from './RichTextEditor';
 import { MLAssistPanel } from './MLAssistPanel';
 import { escapePlainToRichHtml } from '@/lib/vox-soap/vox-soap.richtext';
+import { groundedFromVetNoteText } from '@/lib/vox-soap/vox-soap.vetnote';
 import { VOX_SOAP_STAFF } from '@/lib/vox-soap/vox-soap.staff';
 import { useAuth } from '@/lib/auth';
 import { WORKFLOW_STATUS_LABELS } from '@/lib/vox-soap/vox-soap.workflow';
@@ -506,6 +507,96 @@ export const VoxSoapWorkspace: React.FC<{ defaultPetId?: string }> = ({
         : 'Grounding verified: every claim traces verbatim to your transcript. Review the note, then Mark as Done.',
     });
   }, []);
+
+  /** Owner Fix 3.3 (2026-11-01): the ML Assistive Draft panel applies its
+   * REVIEWED draft text straight onto the four SOAP cards. The mapping is the
+   * SAME deterministic vet-scribenote contract the server hydration uses
+   * (vox-soap.vetnote.groundedFromVetNoteText), so the cards show exactly the
+   * note the veterinarian reviewed in the panel. Unrecognized objective lines
+   * are surfaced in the audit note (never dropped). Provenance honesty: an
+   * assistive-source marker is appended to groundingAuditNote; the record
+   * stays Draft (recordState unchanged) and veterinary confirmation remains
+   * mandatory; applied medication orders intentionally carry honest
+   * UNKNOWN/uncanfirmable validation until the sign-off flow re-validates
+   * them server-side (the client patch never invents a MATCH badge). */
+  const handleApplyMlAssistDraft = useCallback(
+    (draftText: string) => {
+      if (!activeVisit || !draftText.trim()) return;
+      const applied = groundedFromVetNoteText(draftText, activeVisit.rawTranscript);
+      const output = applied.output;
+      const objectiveDisplay: Record<string, string> = {};
+      for (const { key } of OBJECTIVE_LABELS) {
+        const value = output.objective[key as keyof typeof output.objective];
+        objectiveDisplay[key] =
+          value === null || value === undefined || value === ''
+            ? 'Not mentioned'
+            : key === 'weight_kg'
+            ? `${value} kg`
+            : String(value);
+      }
+      const unknownNote = applied.objectiveUnknownLines.length
+        ? ` (${applied.objectiveUnknownLines.length} unrecognized objective line(s) preserved in the panel draft: ${applied.objectiveUnknownLines
+            .map((l) => `"${l}"`)
+            .join('; ')})`
+        : '';
+      const appliedOrders: ValidatedMedicationOrderDraft[] = output.plan.medication_orders.map(
+        (order, idx) => ({
+          orderId: `mlassist-${Date.now()}-${idx}`,
+          ...order,
+          validation: {
+            isComplete: Boolean(order.dose_amount?.trim() && order.frequency?.trim() && order.duration?.trim()),
+            missingRequiredFields: [
+              ...(!order.medicine_name?.trim() ? ['medicine_name'] : []),
+              ...(!order.dose_amount?.trim() ? ['dose_amount'] : []),
+              ...(!order.frequency?.trim() ? ['frequency'] : []),
+              ...(!order.duration?.trim() ? ['duration'] : []),
+            ],
+            drugValidationStatus: 'UNKNOWN',
+            matchedCanonicalDrug: null,
+            similarityScore: null,
+            allergyConflictDetected: false,
+            allergyConflictReason: null,
+            canConfirmOrder: false,
+          },
+        })
+      );
+      const appliedAt = new Date().toISOString();
+      const updated: VoxSoapVisitRecord = {
+        ...activeVisit,
+        rawTranscript: output.verbatim_transcript || activeVisit.rawTranscript,
+        subjective: {
+          pet_name: activeVisit.subjective.pet_name,
+          age_mentioned: output.subjective.age_mentioned,
+          presenting_complaint: output.subjective.presenting_complaint,
+          symptom_duration: output.subjective.symptom_duration,
+          previous_medical_history: output.subjective.previous_medical_history,
+          source_quote: output.subjective.source_quote,
+        },
+        objectiveRaw: output.objective,
+        objectiveDisplay,
+        assessment: output.assessment,
+        plan: { ...output.plan, medication_orders: appliedOrders },
+        groundingAuditNote: [
+          activeVisit.groundingAuditNote,
+          `[${appliedAt}] the reviewed ML Assistive Draft was applied client-side to all four SOAP cards (assistive draft; veterinary confirmation MANDATORY)${unknownNote}]`,
+        ]
+          .filter(Boolean)
+          .join(' '),
+        updatedAt: appliedAt,
+      };
+      setActiveVisit(updated);
+      setEditableOrders(appliedOrders);
+      setOpenAccordion('client');
+      setStatusBanner({
+        type: 'info',
+        title: 'ML assistive draft applied',
+        detail:
+          'The reviewed draft populated all four SOAP cards deterministically (vet-scribenote mapping). It stays an ASSISTIVE draft — review and confirm, then Mark as Done.',
+      });
+      setMlPanelOpen(false);
+    },
+    [activeVisit]
+  );
 
   const handlePanelFallback = useCallback(() => {
     setShowTranscriptDrawer(true);
@@ -1527,6 +1618,7 @@ export const VoxSoapWorkspace: React.FC<{ defaultPetId?: string }> = ({
           accent="amber"
           contextLabel="ML assist • local service (8321)"
           onClose={() => setMlPanelOpen(false)}
+          onApplyDraft={handleApplyMlAssistDraft}
         />
       </div>
     </div>
