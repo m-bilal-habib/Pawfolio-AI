@@ -790,30 +790,70 @@ export const NewRecordingPanel: React.FC<{
           )}
 
           {/* Honest failure breakdown — ↻ Retry re-sends the SAME recording,
-              kept in memory; the FR-30 escape hatch stays available. */}
-          {stage === 'failed' && (
-            <div className="p-3 rounded-xl border bg-amber-950/80 border-amber-500/50 text-amber-100 text-xs leading-relaxed">
-              <strong>Why:</strong>{' '}
-              {lastAiError ??
-                'the AI service could not finish this recording within its retry budget.'}{' '}
-              — every API-key and model candidate was already tried automatically. Press{' '}
-              <span className="font-bold">↻ Retry transcription</span> to re-send this exact
-              recording without recording anything again (brief demand spikes usually clear
-              within minutes), or{' '}
-              <button
-                type="button"
-                onClick={() => {
-                  onFallbackRequested('AI transcription failed — manual transcript fallback requested.');
-                  stopPolling();
-                  closeAfterError();
-                }}
-                className="underline underline-offset-2 font-bold hover:text-white"
-              >
-                Open Transcript Fallback (FR-30)
-              </button>
-              .
-            </div>
-          )}
+              kept in memory; the FR-30 escape hatch stays available. Owner
+              fix (2026-11-04): PROVIDER-AWARE copy — a local-ml failure gives
+              the accurate local-service guidance (start-voxsoap-local.bat ML
+              console check, zero Google mentions); the Gemini candidate/
+              demand-spike copy survives ONLY for an explicitly gemini-pinned
+              deployment. */}
+          {stage === 'failed' && (() => {
+            const isLocalMlFailure =
+              PUBLIC_TRANSCRIBE_PROVIDER !== 'gemini' ||
+              /Local ML|127\.0\.0\.1:8321/i.test(lastAiError ?? '');
+            return (
+              <div className="p-3 rounded-xl border bg-amber-950/80 border-amber-500/50 text-amber-100 text-xs leading-relaxed">
+                <strong>Why:</strong>{' '}
+                {lastAiError ??
+                  'the AI service could not finish this recording within its retry budget.'}
+                {isLocalMlFailure ? (
+                  <>
+                    <br />
+                    Make sure the local ML service is running at{' '}
+                    <span className="font-mono">http://127.0.0.1:8321</span> (run{' '}
+                    <span className="font-bold">start-voxsoap-local.bat</span>). Check the ML
+                    console for crashes or memory errors, then press{' '}
+                    <span className="font-bold">↻ Retry transcription</span> to re-send this
+                    exact recording without recording anything again, or{' '}
+                    <button
+                      type="button"
+                      onClick={() => {
+                        onFallbackRequested(
+                          'AI transcription failed — manual transcript fallback requested.'
+                        );
+                        stopPolling();
+                        closeAfterError();
+                      }}
+                      className="underline underline-offset-2 font-bold hover:text-white"
+                    >
+                      Open Transcript Fallback (FR-30)
+                    </button>
+                    .
+                  </>
+                ) : (
+                  <>
+                    {' '}— every API-key and model candidate was already tried automatically.
+                    Press <span className="font-bold">↻ Retry transcription</span> to re-send
+                    this exact recording without recording anything again (brief demand spikes
+                    usually clear within minutes), or{' '}
+                    <button
+                      type="button"
+                      onClick={() => {
+                        onFallbackRequested(
+                          'AI transcription failed — manual transcript fallback requested.'
+                        );
+                        stopPolling();
+                        closeAfterError();
+                      }}
+                      className="underline underline-offset-2 font-bold hover:text-white"
+                    >
+                      Open Transcript Fallback (FR-30)
+                    </button>
+                    .
+                  </>
+                )}
+              </div>
+            );
+          })()}
 
           {/* Retention note */}
           <p className={`text-[11px] leading-relaxed ${t.retention}`}>

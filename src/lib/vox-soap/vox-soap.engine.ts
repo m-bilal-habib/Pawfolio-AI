@@ -1,6 +1,7 @@
 // File: d:\Pawfolio AI\src\lib\vox-soap\vox-soap.engine.ts
 import { GoogleGenAI } from '@google/genai';
 import { z } from 'zod';
+import http from 'node:http';
 import {
   CLINIC_APPROVED_VACCINES,
   CLINIC_REVIEWED_DRUG_CATALOG,
@@ -921,6 +922,151 @@ MANDATORY CLINICAL SAFETY & GROUNDING RULES:
   }
 
   /**
+   * Owner connectivity fix (2026-11-04): a 2-second /health pre-check BEFORE
+   * any multi-megabyte POST to the local service. A dead/hung/OOM-crashed
+   * service surfaces in ~2 s with an explicit, actionable message instead of
+   * after a long upload/failure cycle. Network failures are logged with the
+   * OS error code (ECONNREFUSED / ECONNRESET / ETIMEDOUT) into the server
+   * console for diagnosis.
+   */
+  private async assertLocalServiceHealthy(component: 'transcribe' | 'draft'): Promise<void> {
+    try {
+      const health = await fetch(`${ML_BASE_URL}/health`, {
+        cache: 'no-store',
+        signal: AbortSignal.timeout(2000),
+      });
+      if (health.ok) return; // service reachable and healthy — proceed
+      const detail = (await health.text().catch(() => '')).slice(0, 160);
+      console.error(
+        `[VoxSOAP Engine] ${ML_BASE_URL}/health answered HTTP ${health.status} before ${component} :: ${detail}`
+      );
+      throw new Error(
+        `Local ML service answered HTTP ${health.status} on its /health at ${ML_BASE_URL} before the ${component} upload — the service is up but UNHEALTHY. Check the ML console for crashes or memory errors, restart start-voxsoap-local.bat, then press ↻ Retry transcription. Nothing was invented; nothing was sent to any other provider.`
+      );
+    } catch (err) {
+      // The unhealthy-service throw is re-raised verbatim (exact identity
+      // preserved); ONLY genuine network failures are classified here.
+      if (err instanceof Error && err.message.startsWith('Local ML service answered HTTP')) throw err;
+      const causeCode =
+        (err as { cause?: { code?: string } })?.cause?.code ??
+        (err instanceof Error && err.name === 'TimeoutError' ? 'ETIMEDOUT (2 s pre-check budget)' : 'unknown');
+      console.error(
+        `[VoxSOAP Engine] /health pre-check to ${ML_BASE_URL} failed before ${component} (code=${causeCode}):`,
+        err
+      );
+      throw new Error(
+        `Local ML service at ${ML_BASE_URL} could not be reached. Restart both windows (start-voxsoap-local.bat) and retry — then press ↻ Retry transcription to re-send this exact ${component === 'transcribe' ? 'file' : 'transcript'}. (engine pre-check code=${causeCode})`
+      );
+    }
+  }
+
+  /**
+   * Owner transport fix (2026-11-04): undici's global fetch enforces a FIXED
+   * 300 s `headersTimeout` — a minutes-long local ml call gets its socket
+   * killed with `UND_ERR_HEADERS_TIMEOUT` (observed live on /draft at
+   * exactly 300 s in the 5-minute drill) and `AbortSignal.timeout` CANNOT
+   * raise that cap. Both long local calls therefore ride `node:http` (no
+   * headersTimeout), with the whole budget enforced via `req.setTimeout`
+   * and a sentinel `TIMEOUT_BUDGET_<N>s` error that the callers classify as
+   * an honest processing-timeout (distinct from a connection refusal,
+   * which arrives as a flat ECONNREFUSED `.code` on the request error).
+   */
+  private requestLocal(
+    urlString: string,
+    contentTypeHeader: string,
+    body: Buffer,
+    budgetMs: number
+  ): Promise<{ status: number; body: string }> {
+    return new Promise((resolve, reject) => {
+      const url = new URL(urlString);
+      const req = http.request(
+        {
+          host: url.hostname,
+          port: Number(url.port || 80),
+          path: `${url.pathname}${url.search}`,
+          method: 'POST',
+          // `connection: close` mirrors the committed probe contract: the
+          // service answers once, nobody reuses the socket.
+          headers: {
+            'content-type': contentTypeHeader,
+            'content-length': String(body.length),
+            connection: 'close',
+          },
+        },
+        (res) => {
+          const chunks: Buffer[] = [];
+          res.on('data', (chunk: Buffer) => chunks.push(chunk));
+          res.on('error', (resErr) => reject(resErr));
+          res.on('end', () => {
+            resolve({ status: res.statusCode ?? 0, body: Buffer.concat(chunks).toString('utf8') });
+          });
+        }
+      );
+      // During a long CPU decode the service is SILENT, so socket
+      // inactivity == the whole processing window: this one timeout IS the
+      // honest budget (nothing beneath it can cut in). Firing destroys the
+      // request with our sentinel error.
+      req.setTimeout(budgetMs, () => {
+        req.destroy(new Error(`TIMEOUT_BUDGET_${Math.round(budgetMs / 1000)}s`));
+      });
+      req.on('error', (reqErr) => reject(reqErr));
+      req.end(body);
+    });
+  }
+
+  /** Multipart twin of the committed probe contract on the node:http
+   * transport — the SAME wire format (audio + language fields) the
+   * local service already ingests. */
+  private postMultipartLocal(
+    pathname: string,
+    fields: Record<string, string>,
+    file: { field: string; filename: string; contentType: string; bytes: Buffer },
+    budgetMs: number
+  ): Promise<{ status: number; body: string }> {
+    const boundary = `----voxsoap-local-${Date.now().toString(36)}-${Math.random().toString(16).slice(2, 10)}`;
+    const parts: Buffer[] = [];
+    for (const [name, value] of Object.entries(fields)) {
+      parts.push(
+        Buffer.from(
+          `--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${value}\r\n`,
+          'utf8'
+        )
+      );
+    }
+    parts.push(
+      Buffer.concat([
+        Buffer.from(
+          `--${boundary}\r\nContent-Disposition: form-data; name="${file.field}"; filename="${file.filename}"\r\nContent-Type: ${file.contentType}\r\n\r\n`,
+          'utf8'
+        ),
+        file.bytes,
+        Buffer.from(`\r\n--${boundary}--\r\n`, 'utf8'),
+      ])
+    );
+    return this.requestLocal(
+      `${ML_BASE_URL}${pathname}`,
+      `multipart/form-data; boundary=${boundary}`,
+      Buffer.concat(parts),
+      budgetMs
+    );
+  }
+
+  /** JSON sibling used by the long-running /draft call — same budget rules,
+   * same node:http behaviour (no undici headersTimeout). */
+  private postJsonLocal(
+    pathname: string,
+    payload: Record<string, unknown>,
+    budgetMs: number
+  ): Promise<{ status: number; body: string }> {
+    return this.requestLocal(
+      `${ML_BASE_URL}${pathname}`,
+      'application/json',
+      Buffer.from(JSON.stringify(payload), 'utf8'),
+      budgetMs
+    );
+  }
+
+  /**
    * Local-first transcription (2026-10-31): POST the 16 kHz WAV straight to
    * the local ml-serving FastAPI process — the SAME multipart contract the
    * committed probe (`ml-serving/probe_local_service.mjs`) exercises. No
@@ -933,39 +1079,53 @@ MANDATORY CLINICAL SAFETY & GROUNDING RULES:
     audioBuffer: Buffer,
     language: 'ur' | 'en' | 'auto'
   ): Promise<{ text: string; windows: number | null }> {
-    const form = new FormData();
-    // Uint8Array.from copies into a fresh ArrayBuffer-backed view — Node's
-    // Buffer<ArrayBufferLike> is not BlobPart-compatible under strict lib
-    // typing (SharedArrayBuffer union) and a copy is trivially honest here.
-    form.append('audio', new Blob([Uint8Array.from(audioBuffer)], { type: 'audio/wav' }), 'consultation-16k.wav');
-    form.append('language', language);
+    // Owner connectivity fix (2026-11-04): fail in ~2 s with an actionable
+    // message when the service is down, BEFORE uploading multi-megabyte
+    // payloads (an ECONNREFUSED never wastes the whole transcription budget).
+    await this.assertLocalServiceHealthy('transcribe');
 
-    let response: Response;
+    // Owner transport fix (2026-11-04): undici's FIXED 300 s headersTimeout
+    // kills any minutes-long fetch (`UND_ERR_HEADERS_TIMEOUT`) and
+    // AbortSignal.timeout cannot raise that cap — the multipart upload rides
+    // node:http with the full budget enforced by req.setTimeout. The wire
+    // body is the SAME contract (audio + language) the committed probe sends.
+    let response: { status: number; body: string };
     try {
-      response = await fetch(`${ML_BASE_URL}/transcribe`, {
-        method: 'POST',
-        body: form,
-        signal: AbortSignal.timeout(ML_TRANSCRIBE_TIMEOUT_MS),
-      });
+      response = await this.postMultipartLocal(
+        '/transcribe',
+        { language },
+        { field: 'audio', filename: 'consultation-16k.wav', contentType: 'audio/wav', bytes: audioBuffer },
+        ML_TRANSCRIBE_TIMEOUT_MS
+      );
     } catch (err) {
-      const reason =
-        err instanceof Error && err.name === 'TimeoutError'
-          ? `the local ML service did not answer within the ${Math.round(ML_TRANSCRIBE_TIMEOUT_MS / 1000)} s budget`
-          : `the local ML service at ${ML_BASE_URL} could not be reached`;
+      const isBudgetTimeout = err instanceof Error && /^TIMEOUT_BUDGET_/.test(err.message);
+      // node:http errors carry a FLAT .code (ECONNREFUSED) — read it first;
+      // nested undici-style causes only exist on the fetch paths.
+      const causeCode = isBudgetTimeout
+        ? `processing-timeout (${err instanceof Error ? err.message : 'TIMEOUT_BUDGET'})`
+        : (err as NodeJS.ErrnoException).code ??
+          (err as { cause?: { code?: string } })?.cause?.code ??
+          'unknown';
+      console.error(`[VoxSOAP Engine] POST ${ML_BASE_URL}/transcribe failed (code=${causeCode}):`, err);
+      // A processing-timeout (the budget elapsing while the CPU decode ran)
+      // and a connection refusal are DISTINCT diagnoses: the first means the
+      // model was busy; the second means the process was never there.
+      const reason = isBudgetTimeout
+        ? `the local Whisper did not answer within the ${Math.round(ML_TRANSCRIBE_TIMEOUT_MS / 1000)} s budget (processing-timeout — this recording's 20 s chunk decode is slower than this budget on CPU)`
+        : `the local ML service at ${ML_BASE_URL} could not be reached (code=${causeCode})`;
       throw new Error(
-        `Local ML transcription failed — ${reason}. Nothing was invented: restart both windows (start-voxsoap-local.bat) and retry in local-ml mode.`
+        `Local ML transcription failed — ${reason}. Nothing was invented: restart both windows (start-voxsoap-local.bat) and retry by pressing ↻ Retry transcription (re-sends this exact file).`
       );
     }
 
-    const raw = await response.text();
     let envelope: MlTranscribeEnvelope | null = null;
     try {
-      envelope = JSON.parse(raw) as MlTranscribeEnvelope;
+      envelope = JSON.parse(response.body) as MlTranscribeEnvelope;
     } catch {
       envelope = null;
     }
-    if (!response.ok || !envelope || envelope.ok !== true) {
-      const detail = (envelope?.message ?? envelope?.error ?? raw).toString().slice(0, 240);
+    if (response.status < 200 || response.status >= 300 || !envelope || envelope.ok !== true) {
+      const detail = (envelope?.message ?? envelope?.error ?? response.body).toString().slice(0, 240);
       throw new Error(
         `Local ML /transcribe answered HTTP ${response.status} (ok=${String(envelope?.ok)}): ${detail}`
       );
@@ -991,35 +1151,44 @@ MANDATORY CLINICAL SAFETY & GROUNDING RULES:
     assessment: string;
     plan: string;
   }> {
-    let response: Response;
+    // Owner connectivity fix (2026-11-04): the same 2-second /health
+    // pre-check before the minutes-long draft POST (a dead service fails
+    // fast with the actionable message instead of burning the budget).
+    await this.assertLocalServiceHealthy('draft');
+
+    // Owner transport fix (2026-11-04): the draft rides node:http too — that
+    // is exactly where the live 5-min drill caught undici killing the call
+    // at 300 s (`UND_ERR_HEADERS_TIMEOUT`). Same budget semantics as the
+    // transcription call above.
+    let response: { status: number; body: string };
     try {
-      response = await fetch(`${ML_BASE_URL}/draft`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ transcript, format: 'vet_scribenote' }),
-        signal: AbortSignal.timeout(ML_DRAFT_TIMEOUT_MS),
-      });
+      response = await this.postJsonLocal('/draft', { transcript, format: 'vet_scribenote' }, ML_DRAFT_TIMEOUT_MS);
     } catch (err) {
-      const reason =
-        err instanceof Error && err.name === 'TimeoutError'
-          ? `the local SOAP model did not answer within the ${Math.round(
-              ML_DRAFT_TIMEOUT_MS / 1000
-            )} s budget`
-          : `the local ML service at ${ML_BASE_URL} could not be reached for /draft`;
+      const isBudgetTimeout = err instanceof Error && /^TIMEOUT_BUDGET_/.test(err.message);
+      const causeCode = isBudgetTimeout
+        ? `processing-timeout (${err instanceof Error ? err.message : 'TIMEOUT_BUDGET'})`
+        : (err as NodeJS.ErrnoException).code ??
+          (err as { cause?: { code?: string } })?.cause?.code ??
+          'unknown';
+      console.error(`[VoxSOAP Engine] POST ${ML_BASE_URL}/draft failed (code=${causeCode}):`, err);
+      const reason = isBudgetTimeout
+        ? `the local SOAP model did not answer within the ${Math.round(
+            ML_DRAFT_TIMEOUT_MS / 1000
+          )} s budget (processing-timeout — not a connection refusal)`
+        : `the local ML service at ${ML_BASE_URL} could not be reached for /draft (code=${causeCode})`;
       throw new Error(
-        `Local ML draft failed — ${reason}. Nothing was invented: the honest fallback template keeps the transcript verbatim for manual structuring.`
+        `Local ML draft failed — ${reason}. Nothing was invented: the honest fallback template keeps the transcript verbatim for manual structuring; restart both windows (start-voxsoap-local.bat) and retry.`
       );
     }
 
-    const raw = await response.text();
     let envelope: MlVetDraftEnvelope | null = null;
     try {
-      envelope = JSON.parse(raw) as MlVetDraftEnvelope;
+      envelope = JSON.parse(response.body) as MlVetDraftEnvelope;
     } catch {
       envelope = null;
     }
-    if (!response.ok || !envelope || envelope.ok !== true) {
-      const detail = (envelope?.message ?? envelope?.error ?? raw).toString().slice(0, 240);
+    if (response.status < 200 || response.status >= 300 || !envelope || envelope.ok !== true) {
+      const detail = (envelope?.message ?? envelope?.error ?? response.body).toString().slice(0, 240);
       throw new Error(
         `Local ML /draft answered HTTP ${response.status} (ok=${String(envelope?.ok)}): ${detail}`
       );

@@ -410,3 +410,62 @@ superseded by the final one — the supersessions are part of the record.
 - The live content WARNs (over-attribution + subjective drifts) iterate only with a bigger
   scribe model or few-shot prompt tuning; the deterministic contract (order/ordering/no
   fabrication) is enforced server-side regardless.
+
+## 11. Owner connectivity/UX batch (2026-11-04) — provider-aware failure UI, 2 s health
+pre-check, node:http transport, per-chunk CPU hygiene
+
+Triggered by the owner's real-usage report: a 5-minute Leo consultation under `PUBLIC_TRANSCRIBE_PROVIDER=ml`
+surfaced the GEMINI retry copy ("every key and model candidate… brief demand spikes on Google's
+side") on a local-ML failure — dishonest copy on an honest fallback.
+
+- **Provider-aware failure banners** (`UploadAudioPanel.tsx`, `NewRecordingPanel.tsx`): the
+  `stage === 'failed'` block now branches — local-ML deployments (default, or any error text
+  matching `/Local ML|127\.0\.0\.1:8321/i`) get the exact `lastAiError` verbatim plus the true
+  remediation ("Make sure the local ML service is running at http://127.0.0.1:8321 (run
+  `start-voxsoap-local.bat`). Check the ML console for crashes or memory errors, then press ↻
+  Retry transcription."), with ZERO Google/API-key/demand-spike mention; the Gemini candidate/
+  demand-spike copy survives ONLY for an explicitly gemini-pinned deployment. The FR-30
+  escape hatch stays available in BOTH branches (NewRecordingPanel).
+- **aierrors cap 180 → 320** (`vox-soap.aierrors.ts`): the actionable remediation tail was being
+  cut mid-word at 180 chars ("and retry i…"), hiding the instructions it exists to show.
+- **Engine /health pre-check** (`assertLocalServiceHealthy`): a 2 s `AbortSignal.timeout(2000)`
+  health GET before ANY multi-megabyte POST — a dead/crashed/OOM service now surfaces in ~2 s
+  with the acceptance wording (`…could not be reached. Restart both windows
+  (start-voxsoap-local.bat) and retry… (engine pre-check code=ECONNREFUSED)`) instead of wasting
+  the transcription budget. The unhealthy-HTTP case re-raises verbatim through its catch via the
+  "Local ML service answered HTTP" sentinel.
+- **Engine transport migration (live-drill-driven)**: the 5-min drill caught the REAL root cause
+  of long-run failures — undici's fixed 300 s `headersTimeout` killed the engine's `fetch` to
+  `/draft` at exactly 300 s (`code=UND_ERR_HEADERS_TIMEOUT`); `AbortSignal.timeout` cannot raise
+  that cap. BOTH long local calls now ride `node:http` (`postMultipartLocal` for the WAV,
+  `postJsonLocal` for `/draft`; `connection: 'close'`, budget enforced via
+  `req.setTimeout(budgetMs)` which destroys the request with a `TIMEOUT_BUDGET_<N>s` sentinel —
+  classification: flat `.code` first (node:http errors carry ECONNREFUSED directly), nested
+  `.cause?.code`, and the `TIMEOUT_BUDGET_` sentinel → honest processing-timeout wording).
+  The 2 s /health pre-check stays on fetch (it answers long before any header cap).
+- **POST-migration live proof** (5-min synthetic 220 Hz tone, service FULL/FULL): HTTP 201 in
+  **626.3 s** with `sourceType=ML_Local_Draft` — the full `/transcribe` + `/draft` chain
+  SUSTAINED 626 s through the transport that undici had capped at 300 s; audit event
+  `ML_LOCAL_TRANSCRIPTION_DRAFT` recorded `transcriptionWindows=15`, `aiModel=
+  voxsoap-local-ml:whisper(language=en)→qwen-draft(vet_scribenote)`, `aiError: null`, and the
+  visit mapped STRUCTURED SOAP sections (23-parameter objective, source-quoted diagnoses, a
+  validated 0.85-confidence fluid order) from Whisper's honest "Music Music…" hallucination of
+  the non-speech tone — nothing invented, structure only. This also answers §10's open
+  warm-latency question: a WARM (second-call) Qwen draft completes in ~450-470 s, INSIDE the
+  900 s `ML_DRAFT_TIMEOUT_MS`; the 989-1132 s cold-load measurements stand, so pre-warm the
+  service once after a restart before the first real session.
+- **Per-chunk crash-proofing + CPU memory hygiene** (`providers.py::transcribe`): each 20 s
+  chunk decode can no longer take the uvicorn worker down — an unexpected per-chunk failure is
+  re-raised as a CONTROLLED `InferenceError` naming `[start:end]`, the sample count and the
+  chunk index (→ `ok:false, error:'inference_error'`, HTTP 503 via app.py's ProviderError
+  handler), and on CPU every finished chunk releases its tensors (`del chunk`, `gc.collect()`,
+  wrapped so cleanup arithmetic can never break inference) and `_decode_window` releases
+  `feats`/`ids` before returning — a 13-minute consult keeps a flat resident profile.
+- **Lint scope fix** (`eslint.config.mjs`): `npm run lint` (`eslint`, bare) was scanning
+  `.venv-ml64`'s vendored torch browser bundles (72 untrue findings incl. 1 error); the venv is
+  now ignored so the gate measures project sources (0/0 across all four touched TS files).
+- **Final gates**: py_compile 0; pytest mocked `-m "not real"` **48 passed**; `tsc --noEmit` 0;
+  per-file eslint 0; **`npm run lint` 0**. Live drills: service-DOWN **8/8** (banner wording,
+  1.8-2.5 s ToF, zero Google wording in response AND banner); 5-min UP **9/9 effective** (the
+  single "FAIL" during the session was the probe reading the note from the wrong payload path —
+  corrected; the structured-section evidence above is from the stored visit itself).

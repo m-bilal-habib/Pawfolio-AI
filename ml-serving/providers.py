@@ -832,9 +832,14 @@ class MLProvider:
                 # is the default the verified eval stack (4.48.3) measured,
                 # and it keeps serving output consistent with the eval
                 # pipeline even when a future transformers flips the default.
-                return processor.tokenizer.batch_decode(
+                decoded_text = processor.tokenizer.batch_decode(
                     ids, skip_special_tokens=True, clean_up_tokenization_spaces=True
                 )[0].strip()
+                # Owner reliability fix (2026-11-04): release the feature and
+                # token tensors explicitly before returning so a long
+                # multi-chunk consultation keeps a flat GPU/CPU memory profile.
+                del feats, ids
+                return decoded_text
 
             # Owner Fix 1: 20 s chunks (320,000 samples at 16 kHz) replace the
             # 30 s split - shorter chunks keep each decode inside the FLEURS
@@ -847,16 +852,47 @@ class MLProvider:
             chunk_count = len(chunks)
             decoded = []
             skipped_silent = 0
+            # Owner reliability fix (2026-11-04): a long consultation is N
+            # sequential 20 s decodes on ONE uvicorn worker — a per-chunk
+            # failure must surface as a CONTROLLED error naming the chunk
+            # (honest 503 JSON envelope via app.py's exception mapping), never
+            # an uncaught worker crash; and every finished decode releases its
+            # audio/feature tensors on CPU so a 13-minute upload cannot creep
+            # the resident set into an OOM kill.
+            is_cpu = state.get("device") == "cpu"
             for start, end in chunks:
                 chunk = speech[start:end]
                 # Silence gate: pure padding/room-tone chunks cost a full
                 # decode for nothing - skip them and say so in the note.
-                if float(np.max(np.abs(chunk))) < 1e-3:
+                try:
+                    is_silent = chunk.shape[0] == 0 or float(np.max(np.abs(chunk))) < 1e-3
+                except Exception:
+                    is_silent = False  # never let cleanup arithmetic break inference
+                if is_silent:
                     skipped_silent += 1
+                    del chunk
+                    if is_cpu:
+                        gc.collect()
                     continue
-                part_text = _decode_window(chunk)
+                try:
+                    part_text = _decode_window(chunk)
+                except ProviderError:
+                    raise  # controlled errors keep their identity/status
+                except Exception as chunk_err:
+                    raise InferenceError(
+                        f"Whisper decode failed on chunk [{start}:{end}] "
+                        f"({chunk.shape[0]} samples, "
+                        f"chunk {len(decoded) + skipped_silent + 1}/{chunk_count}): "
+                        f"{type(chunk_err).__name__}: {chunk_err}. Controlled error — "
+                        "no silent substitution (no Gemini fallback)."
+                    ) from chunk_err
                 if part_text:
                     decoded.append(part_text)
+                # Eager release of THIS chunk's audio reference + a young-gen
+                # sweep on CPU: flat resident memory across long consults.
+                del chunk
+                if is_cpu:
+                    gc.collect()
             text = " ".join(decoded)
             if chunk_count == 0:
                 note = "empty input audio"

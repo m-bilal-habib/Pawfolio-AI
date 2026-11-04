@@ -118,8 +118,9 @@ const MAX_BYTES = 25 * 1024 * 1024; // VOX_SOAP_MAX_AUDIO_MB default (server 413
 const PUBLIC_TRANSCRIBE_PROVIDER =
   process.env.NEXT_PUBLIC_VOXSOAP_TRANSCRIBE_PROVIDER === 'gemini' ? 'gemini' : 'ml';
 
-/** Honest 13-minute guard: 26 Whisper 30 s windows; the local fp32 CPU decode
- * runs window-serial and the engine/proxy budgets are sized for 13 min. */
+/** Honest 13-minute guard: 39 Whisper 20 s chunks (owner Fix 1, 2026-11-01
+ * replaced the 30 s windows); the local fp32 CPU decode runs chunk-serial and
+ * the engine/proxy budgets are sized for 13 min. */
 const MAX_WAV_SECONDS = 13 * 60;
 
 export const UploadAudioPanel: React.FC<{
@@ -682,18 +683,43 @@ export const UploadAudioPanel: React.FC<{
             </div>
           )}
 
-          {/* Honest failure breakdown + "↻ Retry transcription" affordance */}
-          {stage === 'failed' && (
-            <div className="p-3 rounded-xl border bg-amber-950/80 border-amber-500/50 text-amber-100 text-xs leading-relaxed">
-              <strong>Why:</strong>{' '}
-              {lastAiError ??
-                'the AI service could not finish this audio within its retry budget.'}{' '}
-              — every key and model candidate was already tried automatically. Press{' '}
-              <span className="font-bold">↻ Retry transcription</span> to re-send this exact file
-              without recording anything again — brief demand spikes on Google&apos;s side usually
-              clear within minutes, and the retry lands on whichever model is serving.
-            </div>
-          )}
+          {/* Honest failure breakdown + "↻ Retry transcription" affordance.
+              Owner fix (2026-11-04): the remediation copy is PROVIDER-AWARE —
+              a local-ml failure must say exactly what is true (service down?
+              restart start-voxsoap-local.bat; check the ML console) and must
+              NEVER mention Google keys/demand spikes; only an explicitly
+              gemini-pinned deployment keeps the Gemini retry copy. */}
+          {stage === 'failed' && (() => {
+            const isLocalMlFailure =
+              PUBLIC_TRANSCRIBE_PROVIDER !== 'gemini' ||
+              /Local ML|127\.0\.0\.1:8321/i.test(lastAiError ?? '');
+            return (
+              <div className="p-3 rounded-xl border bg-amber-950/80 border-amber-500/50 text-amber-100 text-xs leading-relaxed">
+                <strong>Why:</strong>{' '}
+                {lastAiError ??
+                  'the AI service could not finish this audio within its retry budget.'}
+                {isLocalMlFailure ? (
+                  <>
+                    <br />
+                    Make sure the local ML service is running at{' '}
+                    <span className="font-mono">http://127.0.0.1:8321</span> (run{' '}
+                    <span className="font-bold">start-voxsoap-local.bat</span>). Check the ML
+                    console for crashes or memory errors, then press{' '}
+                    <span className="font-bold">↻ Retry transcription</span> to re-send this
+                    exact file without recording anything again.
+                  </>
+                ) : (
+                  <>
+                    {' '}— every key and model candidate was already tried automatically. Press{' '}
+                    <span className="font-bold">↻ Retry transcription</span> to re-send this
+                    exact file without recording anything again — brief demand spikes on
+                    Google&apos;s side usually clear within minutes, and the retry lands on
+                    whichever model is serving.
+                  </>
+                )}
+              </div>
+            );
+          })()}
 
           {/* Retention note */}
           <p className={`text-[11px] leading-relaxed ${t.retention}`}>

@@ -18,6 +18,10 @@ const eslintConfig = [
       "out/**",
       "build/**",
       "next-env.d.ts",
+      // Python ML venv vendored inside the repo root (not JS lint scope);
+      // its bundled torch minimised bundles also violate browser lint rules.
+      ".venv-ml64/**",
+      ".venv/**",
     ],
   },
 ];

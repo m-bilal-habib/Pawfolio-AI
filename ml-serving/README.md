@@ -178,3 +178,19 @@ there). Re-run the gate after any re-pin; the 4th real test (real
 /draft with the full-scale SOAP adapter) is the live regression guard for the
 drift caught above. `/roman` stays 501 (Model C **DEPRECATED**). ML failures
 in a torch-absent process surface as honest 503s - never a Gemini swap.
+
+**Local-ML transport + hygiene contract (2026-11-04):** the Next.js engine calls
+this service through `node:http` (NOT undici fetch — its fixed 300 s
+`headersTimeout` was live-proven killing minutes-long `/draft` calls with
+`UND_ERR_HEADERS_TIMEOUT`, and `AbortSignal.timeout` cannot raise that cap),
+after a 2 s `/health` pre-check so a dead service fails in seconds with the
+`start-voxsoap-local.bat` guidance instead of burning the whole budget. A
+5-minute recording is 15 × 20 s chunk decodes: an unexpected per-chunk failure
+is re-raised as a CONTROLLED `InferenceError` naming `[start:end]` and the
+chunk index (honest `ok:false, error:'inference_error'` HTTP 503 — never a
+worker crash), and on CPU every finished chunk releases its tensors
+(`del` + `gc.collect()`) between decodes so long consults keep flat resident
+memory. Latency honesty: a WARM `/draft` measured ~450-470 s (inside the 900 s
+`ML_DRAFT_TIMEOUT_MS` budget); the COLD first draft after a service restart
+remains ~989-1132 s — pre-warm the service once (any small `/draft`) before
+the first real session, or raise `VOXSOAP_ML_DRAFT_TIMEOUT_MS`.
