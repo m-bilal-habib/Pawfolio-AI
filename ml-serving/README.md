@@ -194,3 +194,30 @@ memory. Latency honesty: a WARM `/draft` measured ~450-470 s (inside the 900 s
 `ML_DRAFT_TIMEOUT_MS` budget); the COLD first draft after a service restart
 remains ~989-1132 s — pre-warm the service once (any small `/draft`) before
 the first real session, or raise `VOXSOAP_ML_DRAFT_TIMEOUT_MS`.
+
+## Owner reliability batch 2026-11-04/05 (proxy node:http + draft hygiene)
+
+- The PANEL-facing Next.js proxy (`/api/voxsoap/[route]`) moved its POSTs from
+  global `fetch` - undici enforces a FIXED 300 s `headersTimeout` there, so the
+  browser panel died at ~5:00 with a wrong `502 service_unreachable` - to
+  `node:http` with the whole budget on `req.setTimeout(TIMEOUT_MS)` (default
+  900 000 ms, `VOXSOAP_TIMEOUT_MS`). Budget elapse fires the
+  `TIMEOUT_BUDGET_<N>s` sentinel → honest **504 `upstream_timeout`**; a
+  refusal stays **502 `service_unreachable` (code=ECONNREFUSED)**. GET /health
+  stays on fetch (≤30 s; instant answers).
+- CPU draft hygiene: the intra-op pool is bounded to `max(2, cpus - 2)` for the
+  long draft (`VOXSOAP_DRAFT_THREADS` override; never up-sizes another session's
+  explicit choice) so the uvicorn loop keeps answering `/health` while torch
+  generates (measured 5-202 ms polls across a 25-minute draft); `transcribe()`
+  re-applies the full-core Fix-1 saturation on every call. Before generating,
+  `draft()` runs `gc.collect()` and - when free RAM is under 2 GB
+  (`VOXSOAP_ASR_RELEASE_FREE_RAM_GB`) - drops the resident Whisper first; the
+  next `/transcribe` reloads it on demand.
+- Measured on the owner 4-logical-core box (drill 13/13 through the proxy): the
+  sustained 1 108.8 s long draft answered **HTTP 200** with the full
+  vet_scribenote contract (23-parameter objective_map + deterministic guard
+  note) on ONE socket - undici would have killed it at 300 s; under the DEFAULT
+  900 s budget a heavily-paged box (≤2 GB free) honestly 504s at exactly
+  900.1 s. Windows sleeps on its IDLE timer (not CPU load) - a system-awake
+  flag (`SetThreadExecutionState`) is required for unattended long runs; when
+  the box is unavoidably loaded, raise `VOXSOAP_TIMEOUT_MS` above the default.

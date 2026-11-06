@@ -42,6 +42,21 @@ TASK_PREFIX = "transliterate to roman urdu: "
 
 COMPONENT_KEYS = ("asr", "soap", "roman")
 
+# Owner reliability fix (2026-11-04): pre-draft ASR release policy. On CPU
+# the fp32 Whisper (~1.2 GB) stays resident while the bf16 3B SOAP model
+# generates; on a 16 GB Windows box with Chrome + the dev server running,
+# tight RAM pages and long drafts balloon (health checks answer late).
+# When free physical RAM is under this threshold BEFORE a draft generation,
+# the ASR weights are dropped first (the next /transcribe reloads them on
+# demand - one cold Whisper load). Env override honoured (never a silent
+# default change); introspection failures never break inference.
+try:
+    _ASR_RELEASE_FREE_RAM_GB = max(
+        0.5, float(_boot_os.environ.get("VOXSOAP_ASR_RELEASE_FREE_RAM_GB", "2.0"))
+    )
+except ValueError:
+    _ASR_RELEASE_FREE_RAM_GB = 2.0
+
 # ---- Vet Scribenote contract (owner Fix 2, 2026-11-01) ----------------------
 # The medscribe soap-lora adapter forces SHORT human-medical summaries and
 # building a 23-parameter objective by generating "Not mentioned" 21 times
@@ -675,8 +690,11 @@ class MLProvider:
         if device == "cpu":
             # Owner Fix 1 (2026-11-01): saturate every physical core - the
             # default intra-op pool leaves half the machine idle on Whisper
-            # decode. Idempotent per call; applied again defensively in
-            # transcribe() on CPU.
+            # decode. torch.set_num_threads is PROCESS-GLOBAL and sticky: the
+            # draft path deliberately re-bounds it lower (loop headroom, see
+            # draft()), so transcribe() re-applies this Fix-1 saturation
+            # defensively on every call (the comment previously promised that
+            # re-apply and it was missing).
             threads = _boot_os.cpu_count() or 1
             torch.set_num_threads(threads)
             if _boot_os.environ.get("VOXSOAP_ASR_QUANT", "").strip() == "1":
@@ -762,6 +780,73 @@ class MLProvider:
 
     # ---------- inference ----------
 
+    def _free_ram_gb(self) -> Optional[float]:
+        """Best-effort free-physical-RAM probe with NO new dependency (the
+        pinned stack stays untouched): Win32 GlobalMemoryStatusEx via ctypes,
+        /proc/meminfo MemAvailable on POSIX. Returns None when unanswerable -
+        introspection must NEVER break inference."""
+        try:
+            if _boot_os.name == "nt":
+                import ctypes
+
+                class _MemoryStatusEx(ctypes.Structure):
+                    _fields_ = [
+                        ("dwLength", ctypes.c_ulong),
+                        ("dwMemoryLoad", ctypes.c_ulong),
+                        ("ullTotalPhys", ctypes.c_ulonglong),
+                        ("ullAvailPhys", ctypes.c_ulonglong),
+                        ("ullTotalPageFile", ctypes.c_ulonglong),
+                        ("ullAvailPageFile", ctypes.c_ulonglong),
+                        ("ullTotalVirtual", ctypes.c_ulonglong),
+                        ("ullAvailVirtual", ctypes.c_ulonglong),
+                        ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                    ]
+
+                stat = _MemoryStatusEx()
+                stat.dwLength = ctypes.sizeof(_MemoryStatusEx)
+                if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
+                    return stat.ullAvailPhys / (1024.0 ** 3)
+                return None
+            with open("/proc/meminfo", "r", encoding="utf-8") as fh:
+                for line_ in fh:
+                    if line_.startswith("MemAvailable:"):
+                        return float(line_.split()[1]) / (1024.0 * 1024.0)
+        except Exception:
+            return None
+        return None
+
+    def _maybe_release_asr_for_draft(self) -> None:
+        """Owner reliability fix (2026-11-04): on CPU the fp32 Whisper stays
+        resident (~1.2 GB) while the bf16 3B SOAP model generates; on the 16 GB
+        Windows owner box (Chrome + Next dev server running) tight RAM pages
+        and health answers get late. When free physical RAM is under the
+        threshold, drop the ASR weights BEFORE generation; the next
+        /transcribe reloads them on demand (one cold Whisper load). Threshold:
+        VOXSOAP_ASR_RELEASE_FREE_RAM_GB (default 2.0)."""
+        if not self._loaded.get("asr"):
+            return
+        free_gb = self._free_ram_gb()
+        if free_gb is None or free_gb >= _ASR_RELEASE_FREE_RAM_GB:
+            return
+        try:
+            self.unload("asr")
+            free_after = self._free_ram_gb()
+            after_label = (
+                "?" if free_after is None else f"{free_after:.1f} GB"
+            )
+            print(
+                "[voxsoap-ml] ASR released before draft generation to free RAM "
+                f"(free={free_gb:.1f} GB < {_ASR_RELEASE_FREE_RAM_GB:.1f} GB threshold; "
+                f"free_after={after_label}; the next /transcribe reloads Whisper on demand).",
+                flush=True,
+            )
+        except Exception as cleanup_err:  # never let the sweep break the draft
+            print(
+                f"[voxsoap-ml] ASR pre-draft release skipped "
+                f"({type(cleanup_err).__name__}: {cleanup_err}).",
+                flush=True,
+            )
+
     def transcribe(self, samples, sample_rate: int, audio_bytes: Optional[bytes] = None,
                    language: str = "ur") -> Dict[str, Any]:
         try:
@@ -771,6 +856,16 @@ class MLProvider:
 
             model = state["model"]
             processor = state["processor"]
+            # Owner Fix 1 contract (the comment promised this per-call
+            # re-apply and it was missing): torch.set_num_threads is
+            # process-global and STICKY - after draft() bounded it to keep
+            # loop headroom, every transcribe re-applies the Fix-1 saturation
+            # (never shrinks: an explicit VOXSOAP_DRAFT_THREADS setting stays
+            # a draft-only cap; Fix-1 saturation treats WHISPER decode only).
+            if state.get("device") == "cpu":
+                saturate = _boot_os.cpu_count() or 1
+                if torch.get_num_threads() < saturate:
+                    torch.set_num_threads(saturate)
             speech = np.asarray(samples, dtype=np.float32)
 
             # Language contract for /transcribe: explicit "ur"/"en" tag the
@@ -932,6 +1027,16 @@ class MLProvider:
             torch = self._real_stack()
             model = state["model"]
             tok = state["tokenizer"]
+            is_cpu = state.get("device") == "cpu"
+            if is_cpu:
+                # Owner reliability fix (2026-11-04): a young-generation sweep
+                # before the minutes-long generation, and - when free physical
+                # RAM is under the threshold - the resident ASR Whisper is
+                # dropped FIRST so a 16 GB Windows box never slips into paging
+                # during the draft (health keeps answering; the next
+                # /transcribe reloads Whisper on demand).
+                self._maybe_release_asr_for_draft()
+                gc.collect()
             # return_dict=True is EXPLICIT: the unpinned Colab resolve revealed
             # that implicit template-return shape drifted across transformers
             # versions (raw Tensor -> BatchEncoding) and crashed the real
@@ -969,7 +1074,7 @@ class MLProvider:
             tokens_cap = self._cfg.draft_max_new_tokens
             if max_new_tokens is not None:
                 tokens_cap = int(max_new_tokens)
-            elif self._resolve_device() == "cpu":
+            elif is_cpu:
                 tokens_cap = min(448 if fmt == "vet_scribenote" else 256, tokens_cap)
             gen_kwargs: Dict[str, Any] = {
                 "input_ids": prompt_ids.to(model.device),
@@ -979,6 +1084,23 @@ class MLProvider:
             }
             if prompt_mask is not None:
                 gen_kwargs["attention_mask"] = prompt_mask.to(model.device)
+            if is_cpu:
+                # Owner reliability fix (2026-11-04): bound the intra-op pool
+                # for the LONG DRAFT so headroom stays for the uvicorn loop
+                # (on the 16 GB owner box a fully saturated pool made
+                # /health answers late enough to trip the engine's 2 s
+                # pre-check). Fix-1 ASR saturation is untouched - the next
+                # /transcribe re-applies it defensively. Env override:
+                # VOXSOAP_DRAFT_THREADS. Never UP-sizes: an explicitly lower
+                # pool stays lower.
+                cap_env = _boot_os.environ.get("VOXSOAP_DRAFT_THREADS", "").strip()
+                draft_threads = (
+                    max(1, int(cap_env))
+                    if cap_env.isdigit()
+                    else max(2, (_boot_os.cpu_count() or 2) - 2)
+                )
+                if torch.get_num_threads() > draft_threads:
+                    torch.set_num_threads(draft_threads)
             with torch.no_grad():
                 if fmt == "vet_scribenote":
                     with model.disable_adapter():

@@ -469,3 +469,75 @@ side") on a local-ML failure — dishonest copy on an honest fallback.
   1.8-2.5 s ToF, zero Google wording in response AND banner); 5-min UP **9/9 effective** (the
   single "FAIL" during the session was the probe reading the note from the wrong payload path —
   corrected; the structured-section evidence above is from the stored visit itself).
+
+## 12. Owner proxy-sustain + CPU hygiene batch (2026-11-04/05) - ACCEPTANCE MET (long drill 13/13)
+
+Issue the owner hit in the panel: `Generate assistive SOAP draft` on long consults died at
+~5:00 with `HTTP 502 · service_unreachable`. Root cause was the LAST undici fetch in the
+chain - the PANEL-facing proxy `src/app/api/voxsoap/[route]/route.ts` POST still had the
+FIXED 300 s `headersTimeout` nobody can raise through `AbortSignal.timeout` (the engine
+hopper was migrated in §11 but its proxy hop was not).
+
+- **Proxy transport migration** (`route.ts`): POST `/transcribe|draft|roman|unload` now
+  rides `node:http` via `postUpstream()` (byte-for-byte body + staff headers,
+  `connection: close`, NO headersTimeout), whole budget on `req.setTimeout(TIMEOUT_MS)`
+  (default 900 000 ms, `VOXSOAP_TIMEOUT_MS` override). The budget destroys the request
+  with a `TIMEOUT_BUDGET_<N>s` sentinel classified as the honest **504
+  `upstream_timeout`**; refusals stay **502 `service_unreachable`** and now carry the OS
+  code suffix (`(code=ECONNREFUSED)`). GET /health stays on fetch (≤30 s). New
+  observability prints: the forward line `POST /<route> → BASE (budget Ns, body B)` on
+  stdout and the classified failure (`504 upstream_timeout Error: TIMEOUT_BUDGET_900s`)
+  on stderr - drill-4's stderr line alone proved the sentinel classification end-to-end.
+- **CPU draft hygiene** (`providers.py`): `draft()` on CPU now runs `gc.collect()` first
+  and, when free RAM is under 2 GB, drops the RESIDENT ASR before generating
+  (`VOXSOAP_ASR_RELEASE_FREE_RAM_GB` override; Win32 `GlobalMemoryStatusEx` / POSIX
+  `MemAvailable` probes - zero new dependencies; `[voxsoap-ml] ASR released…` diagnostic);
+  the intra-op pool is bounded to `max(2, cpu_count - 2)` for the long generation
+  (`VOXSOAP_DRAFT_THREADS` override, never up-sizes), while `transcribe()` re-applies the
+  Fix-1 full-core saturation defensively on every call (the per-call re-apply its comment
+  promised and was missing).
+- **Panel guidance** (`MLAssistPanel.tsx`): the DRAFTING status now reads "generating the
+  veterinary draft locally (on CPU this typically takes 3-7 minutes - please do not close
+  this window) - running M:SS"; the "Keep transcript, retry draft" button keeps the
+  transcript intact for a re-run.
+
+Drill evidence (probe: raw-socket POST with per-shot `firstData` / total / response
+`Date` / wall-clock anchors, never two drafts in flight; box pinned awake via
+`SetThreadExecutionState` ES_CONTINUOUS because the Windows idle timer does NOT count
+CPU load - Kernel-Power event 42):
+- **Service DOWN**: **5/5** - the 502 `service_unreachable` envelope keeps the contract
+  shape, carries `(code=ECONNREFUSED)`, stays a controlled passthrough (not a model
+  answer), and contains zero Google/API-key/demand-spike wording (the Gemini mention in
+  the honesty note is the long-established contract; the PANELS carry the zero-Gemini
+  branch).
+- **Default budget (drill-5)**: pre-warm 200 @ 418.5 s; the long shot held **ONE socket
+  900.1 s with ZERO data until the sentinel fired at exactly 900.1 s** → the designed
+  honest 504 `upstream_timeout` envelope (budget precision proven to 0.1 s).
+- **Raised budget (drill-6, `VOXSOAP_TIMEOUT_MS=1800000` dev on :3101)**: pre-warm 200 @
+  353.6 s; long shot **ONE socket 1 108.8 s → HTTP 200** (undici would have cut it at
+  300.0 s): `ok:true`, `format:vet_scribenote`, draft 1 768 chars,
+  `sections.objective_map` EXACTLY the 23 canonical parameters (14 "Not mentioned"
+  hydration lines), deterministic guard note attached, `max_new_tokens=448` echoed
+  honestly, zero `UND_ERR_HEADERS_TIMEOUT`, zero Gemini outside the honesty note.
+  **13/13 surgical checks**; uvicorn logged BOTH `POST /draft 200 OK` completions.
+- **Loop headroom under load**: 27/27 mid-draft `/health` polls answered in **5-202 ms**
+  (direct AND through the proxy) across the 2- and 3-thread bounds and free RAM from
+  6.7 GB down to 1.1 GB - the engine's 2 s pre-check has hours of margin during real
+  generation.
+- **Environment lesson (why drill-B froze ~3.2 h and drill-4 ~1.5 h)**: NOT a proxy
+  defect. The machine SLEPT on its idle timer (probe and proxy independently measured
+  the IDENTICAL freeze, e.g. both at 6 858 s, and timers resumed simultaneously on
+  wake; Windows power events confirm the sleep entries). Never run minutes-long drills
+  from across-turn background shells; keep the SYSTEM awake (ES_CONTINUOUS flag) and
+  run the drill foreground.
+- **The honest latency curve on this box (4 logical cores, bf16 3B)**: warm draft ≈
+  450-470 s at 4 threads with ~8 GB free (§11 measurement); the same 448-token draft at
+  the 3-thread bound under 1.1-2.5 GB free measured ~1 100-1 500 s → the DEFAULT 900 s
+  budget returns the designed honest 504 there. Practical guidance: keep the machine
+  calm (Chrome/IDE/dev-server closures matter at this RAM pressure) and pre-warm the
+  service once after any restart; when the box is unavoidably loaded, run panel sessions
+  with `VOXSOAP_TIMEOUT_MS` raised above the default - the panel copy and the
+  transcript-preserving retry already expect that wait.
+
+**Final gates**: py_compile 0; pytest mocked `-m "not real"` **48 passed**; `tsc --noEmit`
+0; **`npm run lint` 0**.

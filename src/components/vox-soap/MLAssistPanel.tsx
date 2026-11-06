@@ -638,7 +638,7 @@ export const MLAssistPanel: React.FC<{
       : stage === 'reviewTranscript'
       ? 'REVIEW — edit the transcript, then request the assistive draft.'
       : stage === 'drafting'
-      ? `DRAFTING — the 3B SOAP model loads on demand (~12–13 GB fp32 on CPU; on GPU ~6 GB) — running ${elapsedLabel}…`
+      ? `DRAFTING — generating the veterinary draft locally (on CPU this typically takes 3–7 minutes — please do not close this window) — running ${elapsedLabel}…`
       : stage === 'reviewDraft'
       ? 'REVIEW DRAFT — assistive note with guard annotations; vet confirmation is MANDATORY.'
       : stage === 'error'
@@ -932,7 +932,7 @@ export const MLAssistPanel: React.FC<{
                     type="button"
                     onClick={() => void postDraft()}
                     className="px-5 py-2 rounded-xl bg-primary hover:bg-primary-dark text-canvas text-sm font-bold"
-                    title="Draft inference runs locally; on CPU it can take a couple of minutes (3B fp32)"
+                    title="Draft inference runs locally — on CPU a warm draft typically takes 3–7 minutes; please do not close this window"
                   >
                     ✨ Generate assistive SOAP draft
                   </button>

@@ -1,4 +1,5 @@
 // File: d:\Pawfolio AI\src\app\api\voxsoap\[route]\route.ts
+import http from 'node:http';
 import { NextRequest, NextResponse } from 'next/server';
 import { ClinicStaffRole } from '@/lib/vox-soap/vox-soap.types';
 
@@ -81,9 +82,70 @@ async function passThrough(upstream: Response): Promise<NextResponse> {
   });
 }
 
+/**
+ * Owner proxy fix (2026-11-04): undici's global fetch enforces a FIXED 300 s
+ * `headersTimeout` — a minutes-long local draft gets its socket killed with
+ * `UND_ERR_HEADERS_TIMEOUT` (surfacing as an honest-but-wrong 502
+ * `service_unreachable` around the 5-minute mark) and `AbortSignal.timeout`
+ * CANNOT raise that cap. The long POST routes therefore ride `node:http`
+ * (no headersTimeout), with the whole proxy budget enforced via
+ * `req.setTimeout` and a sentinel `TIMEOUT_BUDGET_<N>s` error classified as
+ * the honest 504 `upstream_timeout`; a connection refusal stays 502
+ * `service_unreachable`.
+ */
+function postUpstream(
+  urlString: string,
+  headers: Record<string, string>,
+  body: Buffer,
+  budgetMs: number
+): Promise<{ status: number; contentType: string | null; body: string }> {
+  return new Promise((resolve, reject) => {
+    const url = new URL(urlString);
+    const upstream = http.request(
+      {
+        host: url.hostname,
+        port: Number(url.port || 80),
+        path: `${url.pathname}${url.search}`,
+        method: 'POST',
+        headers: {
+          ...headers,
+          'content-length': String(body.length),
+          connection: 'close',
+        },
+      },
+      (res) => {
+        const chunks: Buffer[] = [];
+        res.on('data', (chunk: Buffer) => chunks.push(chunk));
+        res.on('error', (resErr) => reject(resErr));
+        res.on('end', () => {
+          resolve({
+            status: res.statusCode ?? 0,
+            contentType: res.headers['content-type'] ?? null,
+            body: Buffer.concat(chunks).toString('utf8'),
+          });
+        });
+      }
+    );
+    // CPU draft inference is SILENT until the final envelope, so socket
+    // inactivity IS the honest budget — nothing beneath it can abort at 300 s.
+    upstream.setTimeout(budgetMs, () => {
+      upstream.destroy(new Error(`TIMEOUT_BUDGET_${Math.round(budgetMs / 1000)}s`));
+    });
+    upstream.on('error', (reqErr) => reject(reqErr));
+    upstream.end(body);
+  });
+}
+
 function describeUpstreamError(err: unknown): { status: number; code: string; message: string } {
   const name = err instanceof Error ? err.name : '';
-  if (name === 'TimeoutError' || name === 'AbortError') {
+  // The node:http budget sentinel and the fetch-era AbortSignal timeouts are
+  // the SAME diagnosis (the budget elapsed while the model was busy) → 504;
+  // every un-classified failure (ECONNREFUSED first) stays 502.
+  const isBudgetTimeout =
+    (err instanceof Error && /^TIMEOUT_BUDGET_/.test(err.message)) ||
+    name === 'TimeoutError' ||
+    name === 'AbortError';
+  if (isBudgetTimeout) {
     return {
       status: 504,
       code: 'upstream_timeout',
@@ -91,11 +153,13 @@ function describeUpstreamError(err: unknown): { status: number; code: string; me
         'The VoxSOAP ML service did not answer within the proxy budget — CPU draft inference can take minutes; retry or start the service.',
     };
   }
+  const flatCode = (err as NodeJS.ErrnoException).code;
   return {
     status: 502,
     code: 'service_unreachable',
-    message:
-      'The local VoxSOAP ML service is not reachable at VOXSOAP_BASE_URL. Start it (uvicorn app:app --host 127.0.0.1 --port 8321, see ml-serving/reports/phase5_integration_plan.md §1) and retry. Nothing was invented.',
+    message: `The local VoxSOAP ML service is not reachable at VOXSOAP_BASE_URL. Start it (uvicorn app:app --host 127.0.0.1 --port 8321, see ml-serving/reports/phase5_integration_plan.md §1) and retry. Nothing was invented.${
+      typeof flatCode === 'string' ? ` (code=${flatCode})` : ''
+    }`,
   };
 }
 
@@ -146,21 +210,44 @@ export async function POST(
     );
   }
   try {
+    // Owner observability (2026-11-04): minutes-long CPU drafts are invisible
+    // without a start anchor in the dev-server console — the drill evidence
+    // (probe-side first-data + this line) explains any budget-timing anomaly
+    // without guessing.
+    console.info(
+      `[voxsoap-proxy] POST /${route} → ${BASE_URL} (budget ${Math.round(TIMEOUT_MS / 1000)}s, body ${req.headers.get('content-length') ?? '?'}B)`
+    );
     // Byte-for-byte passthrough (multipart boundary stays valid; JSON bodies
     // untouched). Size policy stays with the ML service (VOXSOAP_MAX_AUDIO_MB,
     // transcript_max_chars) — the proxy never invents its own limits.
-    const upstream = await fetch(`${BASE_URL}/${route}`, {
-      method: 'POST',
-      body: await req.arrayBuffer(),
-      headers: {
+    // Owner proxy fix (2026-11-04): undici's fetch aborts minutes-long POSTs
+    // at its fixed 300 s headersTimeout — the body rides node:http instead
+    // (same bytes, same headers) with the FULL proxy budget enforced.
+    const answer = await postUpstream(
+      `${BASE_URL}/${route}`,
+      {
         'content-type': req.headers.get('content-type') ?? '',
         ...forwardStaffHeaders(req),
       },
-      signal: AbortSignal.timeout(TIMEOUT_MS),
+      Buffer.from(await req.arrayBuffer()),
+      TIMEOUT_MS
+    );
+    return new NextResponse(answer.body, {
+      status: answer.status,
+      headers: {
+        'content-type': answer.contentType ?? 'application/json',
+        'cache-control': 'no-store',
+      },
     });
-    return await passThrough(upstream);
   } catch (err) {
     const { status, code, message } = describeUpstreamError(err);
+    // Owner observability (2026-11-04): controlled failures must carry their
+    // OS-level cause into the dev-server console, not only the browser
+    // envelope (drill-B lesson: the classification was invisible server-side).
+    console.warn(
+      `[voxsoap-proxy] POST /${route} upstream failure → ${status} ${code}`,
+      err instanceof Error ? `${err.name}: ${err.message}` : String(err)
+    );
     return proxyError(status, code, message);
   }
 }
