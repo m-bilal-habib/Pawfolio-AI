@@ -81,7 +81,10 @@ class ServingConfig:
     max_audio_mb: float = 25.0
     transcript_max_chars: int = 14000  # prepare_soap_data.py MAX_CHARS cap
     asr_max_new_tokens: int = 256      # evaluate_asr.py generate recipe
-    draft_max_new_tokens: int = 512    # phase-3 fix for the 256-token truncations
+    draft_max_new_tokens: int = 320    # owner budget realignment 2026-11-05: the 23-param
+    # Objective hydration is code-side and deterministic, so 320 tokens keeps
+    # the active clinical findings + plan while cutting ~35% off CPU decode
+    # (the 512 phase-3 anti-truncation default predates the hydration fix).
     # SOAP base dtype: "auto" = fp16 on CUDA, bfloat16 on CPU (2026-10-31
     # local-speed fix: bf16 halves the 3B CPU RAM footprint ~12.4 -> ~6.2 GB
     # and is FASTER on x86_64/oneDNN). Override honestly:
@@ -136,7 +139,7 @@ def load_config() -> ServingConfig:
         max_audio_mb=float(_env_str("VOXSOAP_MAX_AUDIO_MB", "25.0")),
         transcript_max_chars=int(_env_str("VOXSOAP_TRANSCRIPT_MAX_CHARS", "14000")),
         asr_max_new_tokens=int(_env_str("VOXSOAP_ASR_MAX_NEW_TOKENS", "256")),
-        draft_max_new_tokens=int(_env_str("VOXSOAP_DRAFT_MAX_NEW_TOKENS", "512")),
+        draft_max_new_tokens=int(_env_str("VOXSOAP_DRAFT_MAX_NEW_TOKENS", "320")),
         soap_dtype=_env_str("VOXSOAP_SOAP_DTYPE", "auto").strip().lower(),
         roman_max_new_tokens=int(_env_str("VOXSOAP_ROMAN_MAX_NEW_TOKENS", "256")),
     )

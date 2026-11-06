@@ -541,3 +541,82 @@ CPU load - Kernel-Power event 42):
 
 **Final gates**: py_compile 0; pytest mocked `-m "not real"` **48 passed**; `tsc --noEmit`
 0; **`npm run lint` 0**.
+
+## 13. Budget realignment batch (2026-11-05/06) — the ~15:00 504 on a real consult
+
+Owner symptom: the ML Assistive Draft panel dies at ~15:00 with `HTTP 504
+upstream_timeout` while a real 5-minute consult (~2 900 chars) is still generating on
+CPU. The 2026-11-04/05 drills had already shown the shape of the truth (cold load
+472.6 s load-only; full drafts 1 108.8–1 500 s under RAM pressure) — the DEFAULT
+900 s budget is simply tighter than CPU reality on this box. Realigned every layer;
+no honesty was loosened anywhere; the 5-route contract is untouched.
+
+### A. Alignment changes (panel ↔ proxy ↔ service config)
+
+1. **Proxy budget**: `route.ts` default `TIMEOUT_MS` 900 000 → **1 200 000 ms** (20
+   min). `VOXSOAP_TIMEOUT_MS` still overrides; the `TIMEOUT_BUDGET_<N>s` sentinel
+   logs the effective seconds (proven live to 0.1 s at 900.1 s AND 1 200.1 s).
+2. **Client budget**: `voxsoap-ml.client.ts` 912 000 → **1 215 000 ms** = proxy + 15 s.
+   Rationale: the proxy's CONTROLLED 504 envelope must reach the browser before an
+   opaque client-side abort; a client that out-waits the proxy turns a designed
+   error into a dead socket.
+3. **CPU draft ceiling**: `config.py` `draft_max_new_tokens` 512 → **320**
+   (`VOXSOAP_DRAFT_MAX_NEW_TOKENS` default in env docs and code). The 23-parameter
+   Objective hydration is DETERMINISTIC and code-side (unstated parameters hydrate
+   "Not mentioned" in Python), so the contract shape never depended on generating
+   those tokens; 320 keeps the active findings + plan and cuts ~35% CPU decode.
+   The 448/256 provider clamp constants stay as CEILINGS for env-raised configs
+   (only the default moved). `.env.example` documents both knobs with rationale.
+4. **Unconditional ASR release on CPU**: `_ASR_RELEASE_FREE_RAM_GB` removed →
+   boolean `_ASR_RELEASE_BEFORE_DRAFT=1` (env `VOXSOAP_ASR_RELEASE_BEFORE_DRAFT=0`
+   to keep the old resident-Whisper behaviour). Helper renamed
+   `_maybe_release_asr_for_draft` → `_release_asr_before_draft`, now called BEFORE
+   `_load_soap()` in `draft()` with the device resolved pre-load via
+   `self._resolve_device()` (the old post-load `state.get("device")` derivation
+   dropped). Why unconditional: with Whisper resident (~1.2 GB) the 16 GB box pages
+   during generation anyway on busy days (drill-6: ~1 100 s vs ~470 s calm; drill-7:
+   free RAM crashed to 0.5–0.6 GB mid-decode).
+5. **Decode hygiene**: draft generate wrapped in `torch.inference_mode()` (was
+   `no_grad` — drops autograd version-counter bookkeeping on a minute-scale loop);
+   intra-op pool default `max(2, cpus-1)` (was cpus-2 → 3 of 4 logical cores here;
+   `VOXSOAP_DRAFT_THREADS` unchanged: overrides win, never up-sizes). Transcribe's
+   full-core saturation and roman's `no_grad` are untouched.
+6. **Panel UX**: drafting status runs the operator-timer copy ("typically takes 4-8
+   minutes on warm models and up to 15-18 minutes on a cold initial load" +
+   `Elapsed: M:SS` + keep-this-tab-active); on a budget 504 the transcript is
+   preserved and the retry reads "⚡ Retry Warm Draft (Model is now loaded in
+   memory)" (`isDraftBudgetTimeout` on status 504 + error `upstream_timeout`).
+
+### B. Drill evidence (2026-11-05/06)
+
+- **Sentinel at the new default fires exactly**: drill-7 long shot cut at
+  **1 200.1 s** → controlled honest 504 (envelope dispatches `provider: "ml"`,
+  `upstream_timeout`, nothing rerouted to Gemini). Matches drill-5's 900.1 s proof.
+- **Load-only cold shot inside budget**: drill-7 pre-warm 200 **@ 472.6 s**
+  (bf16 3B load + 32 tokens) — the LOAD is never the failure alone.
+- **Cold one-shot acceptance (drill-8a, 11/11)**: first request on a CLEAN service
+  carried the full 2 935-char consult → **HTTP 200 in 1 528.8 s** on ONE socket
+  (undici would cut at 300.0 s), FULL contract: 23/23 `sections.objective_map`
+  keys, 19 hydrated objective lines, honest `max_new_tokens=320` echo,
+  deterministic guard note, zero `UND_ERR`, zero Gemini outside the honesty note.
+  Box was mid-thrash (free RAM collapsed during decode → ~3.3 s/token measured);
+  the briefing's ~11–14 min expectation is the CALM-box case (~470 s load +
+  ~1 s/token decode ≈ 770–810 s). On a loaded box the operator knob applies
+  (`VOXSOAP_TIMEOUT_MS=1800000` here; probe client 2 000 000 ms).
+- **Environment discipline**: fresh ES_CONTINUOUS holder launched before the drills
+  (the 2026-11-04/05 Kernel-Power 42 sleep lesson); keep-awake heartbeat clean for
+  the whole 1 528.8 s run; supervision polls kept /health responsive throughout.
+- **Warm fast-path measured (drill-8b)**: immediately after 8a on the resident
+  model, the same one-shot answered **HTTP 200 in 954.0 s** (11/11, full contract)
+  at ~0.7 GB free — the 320-token ceiling beat the warm 448-token paged benchmark
+  (1 108.8 s, drill-6) by ~14% on a WORSE-RAM day, and it sits inside the new
+  1 200 s default by 246 s (the OLD 900 s default would have 504'd it by 54 s).
+  The < 360 s warm criterion remains the CALM-box case (~290-340 s extrapolated
+  from the historical ~450-470 s @ ~8 GB free 448-token curve); this batch
+  documents both truths instead of faking the calm number.
+
+### C. Gates
+
+py_compile 0; pytest mocked `-m "not real"` **48 passed** (the 320-cap honest-400
+contract re-anchored); `tsc --noEmit` 0; **`npm run lint` 0**; probe
+`node --check` 0; drill-8a 11/11; warm drill-8b 11/11 @ 954.0 s.

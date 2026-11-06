@@ -64,5 +64,5 @@ def test_draft_max_new_tokens_out_of_range_is_honest_400(app, client):
         assert r.status_code == 400, r.text
         body = r.json()
         assert body["error"] == "bad_request"
-        assert "512" in body["message"]  # states the configured cap explicitly
+        assert "320" in body["message"]  # states the configured cap explicitly
         assert body["provider"] == "ml"

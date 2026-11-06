@@ -638,7 +638,7 @@ export const MLAssistPanel: React.FC<{
       : stage === 'reviewTranscript'
       ? 'REVIEW — edit the transcript, then request the assistive draft.'
       : stage === 'drafting'
-      ? `DRAFTING — generating the veterinary draft locally (on CPU this typically takes 3–7 minutes — please do not close this window) — running ${elapsedLabel}…`
+      ? `Drafting veterinary SOAP note on CPU… (Elapsed: ${elapsedLabel} — on CPU without GPU acceleration, this typically takes 4–8 minutes on warm models and up to 15–18 minutes on a cold initial load. Please keep this tab active.)`
       : stage === 'reviewDraft'
       ? 'REVIEW DRAFT — assistive note with guard annotations; vet confirmation is MANDATORY.'
       : stage === 'error'
@@ -646,6 +646,17 @@ export const MLAssistPanel: React.FC<{
       : stage === 'forbidden'
       ? 'FORBIDDEN — receptionists cannot initiate clinical SOAP dictation (FR-6).'
       : 'Service reachable — consent, then record.';
+
+  // Owner budget realignment (2026-11-05): a proxy-budget 504 means the bf16
+  // 3B model is warm in memory — the retry fast-path is the whole point, so
+  // the recovery button says that instead of a generic retry label. The
+  // transcript is preserved either way (state flows never drop it).
+  const isDraftBudgetTimeout =
+    Boolean(
+      draftCall &&
+        draftCall.status === 504 &&
+        draftCall.envelope.error === 'upstream_timeout'
+    );
 
   const sizeMBText = (sizeBytes / (1024 * 1024)).toFixed(2);
   const healthScale =
@@ -932,7 +943,7 @@ export const MLAssistPanel: React.FC<{
                     type="button"
                     onClick={() => void postDraft()}
                     className="px-5 py-2 rounded-xl bg-primary hover:bg-primary-dark text-canvas text-sm font-bold"
-                    title="Draft inference runs locally — on CPU a warm draft typically takes 3–7 minutes; please do not close this window"
+                    title="Draft inference runs locally — on CPU this typically takes 4–8 minutes on warm models and up to 15–18 minutes on a cold initial load; please keep this tab active"
                   >
                     ✨ Generate assistive SOAP draft
                   </button>
@@ -1015,9 +1026,16 @@ export const MLAssistPanel: React.FC<{
                       setDraftCall(null);
                       setStage('reviewTranscript');
                     }}
+                    title={
+                      isDraftBudgetTimeout
+                        ? 'The bf16 3B model is already loaded in memory — a warm retry distances itself from the cold load and usually returns in minutes'
+                        : undefined
+                    }
                     className={`px-4 py-2 rounded-xl text-sm font-semibold ${t.secondaryBtn}`}
                   >
-                    Keep transcript, retry draft
+                    {isDraftBudgetTimeout
+                      ? '⚡ Retry Warm Draft (Model is now loaded in memory)'
+                      : 'Keep transcript, retry draft'}
                   </button>
                 ) : null}
                 <button type="button" onClick={resetFlow} className={`px-4 py-2 rounded-xl text-sm font-semibold ${t.secondaryBtn}`}>

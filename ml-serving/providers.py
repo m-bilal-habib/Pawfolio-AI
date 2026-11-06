@@ -42,20 +42,23 @@ TASK_PREFIX = "transliterate to roman urdu: "
 
 COMPONENT_KEYS = ("asr", "soap", "roman")
 
-# Owner reliability fix (2026-11-04): pre-draft ASR release policy. On CPU
-# the fp32 Whisper (~1.2 GB) stays resident while the bf16 3B SOAP model
-# generates; on a 16 GB Windows box with Chrome + the dev server running,
-# tight RAM pages and long drafts balloon (health checks answer late).
-# When free physical RAM is under this threshold BEFORE a draft generation,
-# the ASR weights are dropped first (the next /transcribe reloads them on
-# demand - one cold Whisper load). Env override honoured (never a silent
-# default change); introspection failures never break inference.
+# Owner budget fix (2026-11-05): on CPU EVERY draft releases the resident
+# fp32 Whisper (~1.2 GB) BEFORE the bf16 3B SOAP model loads/generates. The
+# 2026-11-04/05 drills on the owner 16 GB box showed free physical RAM at
+# 1.1-2.5 GB during drafts (Chrome + dev server + IDE resident) and the same
+# 448-token draft stretching ~470 s -> ~1,100 s under paging; unconditional
+# release takes the cold-load RAM peak off the table entirely (the panel has
+# already finished transcribing by then; the next /transcribe reloads Whisper
+# on demand - one cold Whisper load per draft-then-transcribe round trip).
+# Opt-out: VOXSOAP_ASR_RELEASE_BEFORE_DRAFT=0 keeps the conditional-2.0-GB-era
+# behaviour of leaving Whisper resident across drafts. Introspection or
+# unload failures NEVER break inference.
 try:
-    _ASR_RELEASE_FREE_RAM_GB = max(
-        0.5, float(_boot_os.environ.get("VOXSOAP_ASR_RELEASE_FREE_RAM_GB", "2.0"))
+    _ASR_RELEASE_BEFORE_DRAFT = (
+        _boot_os.environ.get("VOXSOAP_ASR_RELEASE_BEFORE_DRAFT", "1").strip() != "0"
     )
-except ValueError:
-    _ASR_RELEASE_FREE_RAM_GB = 2.0
+except Exception:
+    _ASR_RELEASE_BEFORE_DRAFT = True
 
 # ---- Vet Scribenote contract (owner Fix 2, 2026-11-01) ----------------------
 # The medscribe soap-lora adapter forces SHORT human-medical summaries and
@@ -815,29 +818,32 @@ class MLProvider:
             return None
         return None
 
-    def _maybe_release_asr_for_draft(self) -> None:
-        """Owner reliability fix (2026-11-04): on CPU the fp32 Whisper stays
-        resident (~1.2 GB) while the bf16 3B SOAP model generates; on the 16 GB
-        Windows owner box (Chrome + Next dev server running) tight RAM pages
-        and health answers get late. When free physical RAM is under the
-        threshold, drop the ASR weights BEFORE generation; the next
-        /transcribe reloads them on demand (one cold Whisper load). Threshold:
-        VOXSOAP_ASR_RELEASE_FREE_RAM_GB (default 2.0)."""
+    def _release_asr_before_draft(self) -> None:
+        """Owner budget fix (2026-11-05): on CPU the fp32 Whisper (~1.2 GB) is
+        released BEFORE the SOAP model load/generation on EVERY draft. The
+        2026-11-04/05 drills proved the alternative: with Whisper resident the
+        16 GB owner box (Chrome + Next dev + IDE) drops to 1.1-2.5 GB free and
+        the same draft stretches from ~470 s to ~1,100 s under disk paging; on
+        a COLD load the Whisper+Qwen peak is what tips it over. The next
+        /transcribe reloads Whisper on demand (one cold Whisper load per
+        transcribe-after-draft turn). Opt-out: VOXSOAP_ASR_RELEASE_BEFORE_DRAFT
+        =0 (Whisper stays resident; owner unloads via POST /unload {asr})."""
         if not self._loaded.get("asr"):
             return
-        free_gb = self._free_ram_gb()
-        if free_gb is None or free_gb >= _ASR_RELEASE_FREE_RAM_GB:
+        if not _ASR_RELEASE_BEFORE_DRAFT:
             return
+        free_gb = self._free_ram_gb()
         try:
             self.unload("asr")
             free_after = self._free_ram_gb()
+            before_label = "?" if free_gb is None else f"{free_gb:.1f} GB"
             after_label = (
                 "?" if free_after is None else f"{free_after:.1f} GB"
             )
             print(
-                "[voxsoap-ml] ASR released before draft generation to free RAM "
-                f"(free={free_gb:.1f} GB < {_ASR_RELEASE_FREE_RAM_GB:.1f} GB threshold; "
-                f"free_after={after_label}; the next /transcribe reloads Whisper on demand).",
+                "[voxsoap-ml] ASR released before draft generation "
+                f"(free RAM {before_label} -> {after_label}; the next "
+                "/transcribe reloads Whisper on demand).",
                 flush=True,
             )
         except Exception as cleanup_err:  # never let the sweep break the draft
@@ -1023,20 +1029,19 @@ class MLProvider:
                     "vet_scribenote | medscribe."
                 )
             fmt = (note_format or "").strip().lower()
+            # Owner budget fix (2026-11-05): resolve the device BEFORE loading
+            # anything - on CPU the resident ASR Whisper is released here
+            # (unconditionally) so its ~1.2-2 GB is free when the bf16 3B SOAP
+            # model loads or generates next; the cold-load RAM peak is exactly
+            # when the 16 GB owner box starts paging.
+            is_cpu = self._resolve_device() == "cpu"
+            if is_cpu:
+                self._release_asr_before_draft()
+                gc.collect()
             state = self._loaded["soap"] or self._load_soap()
             torch = self._real_stack()
             model = state["model"]
             tok = state["tokenizer"]
-            is_cpu = state.get("device") == "cpu"
-            if is_cpu:
-                # Owner reliability fix (2026-11-04): a young-generation sweep
-                # before the minutes-long generation, and - when free physical
-                # RAM is under the threshold - the resident ASR Whisper is
-                # dropped FIRST so a 16 GB Windows box never slips into paging
-                # during the draft (health keeps answering; the next
-                # /transcribe reloads Whisper on demand).
-                self._maybe_release_asr_for_draft()
-                gc.collect()
             # return_dict=True is EXPLICIT: the unpinned Colab resolve revealed
             # that implicit template-return shape drifted across transformers
             # versions (raw Tensor -> BatchEncoding) and crashed the real
@@ -1064,13 +1069,18 @@ class MLProvider:
             prompt_ids, prompt_mask = _unwrap_chat_prompt(prompt)
             # 2026-10-31 local-speed: an explicit request-level cap wins
             # (validated 1..cfg cap at the API layer and echoed in the
-            # envelope). None -> a fast CPU default; CUDA keeps the configured
-            # 512 (the phase-3 anti-truncation value). Honest, explicit, and
-            # visible in the response — never a silent edit of the note.
-            # Owner Fix 2: the vet_scribenote shape needs the 23-line hydrated
-            # objective TWICE the sketch budget - the CPU default is raised
-            # 256 -> 448 (still far below the 512 configured cap), echoed here
-            # and in the envelope. The medscribe legacy path keeps 256.
+            # envelope). None -> the configured cap, clamped tighter on CPU.
+            # Honest, explicit, and visible in the response - never a silent
+            # edit of the note.
+            # Owner Fix 2 (2026-11-01): the vet_scribenote shape needs the
+            # 23-line hydrated objective TWICE the sketch budget - the CPU
+            # clamp was raised 256 -> 448. Owner budget realignment
+            # (2026-11-05): draft_max_new_tokens CONFIG DEFAULT is now 320
+            # (the 23-parameter Objective hydration is DETERMINISTIC and
+            # code-side, so the contract shape never depended on generating
+            # those tokens; 320 keeps the active clinical findings + plan and
+            # cuts ~35% off CPU decode on the budget-critical box). The clamp
+            # constants remain CEILINGS for env-raised configurations.
             tokens_cap = self._cfg.draft_max_new_tokens
             if max_new_tokens is not None:
                 tokens_cap = int(max_new_tokens)
@@ -1093,15 +1103,26 @@ class MLProvider:
                 # /transcribe re-applies it defensively. Env override:
                 # VOXSOAP_DRAFT_THREADS. Never UP-sizes: an explicitly lower
                 # pool stays lower.
+                # Owner budget fix (2026-11-05): default max(2, cpus-1) - ONE
+                # logical core stays clear for the loop + Windows UI instead
+                # of two; the 2026-11-04 drills measured healthy mid-draft
+                # /health answers (5-202 ms across 27 polls) at the 3-thread
+                # bound on the 4-logical-core owner box, so cpu-1 is the new
+                # safe default there.
                 cap_env = _boot_os.environ.get("VOXSOAP_DRAFT_THREADS", "").strip()
                 draft_threads = (
                     max(1, int(cap_env))
                     if cap_env.isdigit()
-                    else max(2, (_boot_os.cpu_count() or 2) - 2)
+                    else max(2, (_boot_os.cpu_count() or 4) - 1)
                 )
                 if torch.get_num_threads() > draft_threads:
                     torch.set_num_threads(draft_threads)
-            with torch.no_grad():
+            # Owner budget fix (2026-11-05): inference_mode instead of
+            # no_grad for the draft decode - it disables autograd version
+            # counters/bookkeeping outright, a measurable CPU win on a
+            # minute-scale generation loop; the draft path never touches
+            # gradients afterwards.
+            with torch.inference_mode():
                 if fmt == "vet_scribenote":
                     with model.disable_adapter():
                         out = model.generate(**gen_kwargs)

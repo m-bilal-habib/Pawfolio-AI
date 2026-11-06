@@ -22,11 +22,13 @@ export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
 const BASE_URL = process.env.VOXSOAP_BASE_URL ?? 'http://127.0.0.1:8321';
-/** Draft inference on CPU: bf16 3B + a fast 256-token cap keeps a warm draft
- * inside ~2-4 minutes, but the FIRST draft after a cold load (bf16 3B load +
- * possible hub resume) can still take longer — the honest budget is 15 min,
- * the failure is communicated, never fabricated. */
-const TIMEOUT_MS = Number(process.env.VOXSOAP_TIMEOUT_MS ?? 900_000);
+/** Draft inference on CPU: bf16 3B + the 320-token cap keeps a warm draft
+ * inside ~4-8 minutes on a calm box, but the FIRST draft after a cold load
+ * (bf16 3B load + possible hub resume) measured 989-1,132 s, and under the
+ * owner box's worst memory pressure a full warm draft reached ~1,100 s
+ * (2026-11-05 drills) - the honest budget is 20 min, the failure is
+ * communicated, never fabricated. */
+const TIMEOUT_MS = Number(process.env.VOXSOAP_TIMEOUT_MS ?? 1_200_000);
 
 const ALLOWED_GET = new Set(['health']);
 const ALLOWED_POST = new Set(['transcribe', 'draft', 'roman', 'unload']);

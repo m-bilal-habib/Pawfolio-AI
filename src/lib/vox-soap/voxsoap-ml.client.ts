@@ -19,9 +19,12 @@ export interface VoxSoapMLStaffHeaders {
   name: string;
 }
 
-/** Slightly above the proxy timeout so the proxy's controlled 504 wins the
- * race instead of an opaque client-side abort (proxy budget: 900 s). */
-const CLIENT_TIMEOUT_MS = 912_000;
+/** Slightly above the proxy budget so the proxy's controlled 504 always wins
+ * the race instead of an opaque client-side abort (proxy budget default:
+ * 1,200,000 ms = 20 min; +15 s here). Cold bf16 3B loads measured 989-1,132 s
+ * and a paged warm draft reached ~1,100 s - the client must never be the
+ * first one to give up on a healthy inference. */
+const CLIENT_TIMEOUT_MS = 1_215_000;
 
 function staffHeadersToInit(staff: VoxSoapMLStaffHeaders): Record<string, string> {
   return {

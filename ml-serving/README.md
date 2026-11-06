@@ -116,8 +116,11 @@ Every response (success **and** controlled error) carries:
    exactly in owner order, normalizes every section bullet, and returns the
    structured `sections` object the frontend maps into the workspace cards.
    `format:"medscribe"` preserves the legacy adapter behaviour (and its 256
-   CPU token cap; vet_scribenote's hydrated shape gets 448, still under the
-   512 configured maximum). `hf_xet`: UNINSTALLED in `.venv-ml64` (its
+   CPU token ceiling; vet_scribenote's hydrated shape uses the configured
+   320 default — the 2026-11-05 realignment: the 23-parameter Objective
+   hydration is deterministic Python post-processing, so the contract shape
+   never depended on generating 448/512 tokens, and 320 cuts ~35% off CPU
+   decode). `hf_xet`: UNINSTALLED in `.venv-ml64` (its
    import crashed huggingface_hub 0.36.2 downloads) — snapshot downloads
    work cleanly without it.
 
@@ -190,18 +193,23 @@ is re-raised as a CONTROLLED `InferenceError` naming `[start:end]` and the
 chunk index (honest `ok:false, error:'inference_error'` HTTP 503 — never a
 worker crash), and on CPU every finished chunk releases its tensors
 (`del` + `gc.collect()`) between decodes so long consults keep flat resident
-memory. Latency honesty: a WARM `/draft` measured ~450-470 s (inside the 900 s
-`ML_DRAFT_TIMEOUT_MS` budget); the COLD first draft after a service restart
-remains ~989-1132 s — pre-warm the service once (any small `/draft`) before
-the first real session, or raise `VOXSOAP_ML_DRAFT_TIMEOUT_MS`.
+memory. Latency honesty (2026-11-05/06 realignment): the proxy budget default
+is now 1 200 000 ms (20 min, `VOXSOAP_TIMEOUT_MS`); a WARM `/draft` measured
+~450-470 s at ~8 GB free (inside the budget), and the client panel budgets
+proxy + 15 s so the proxy's controlled 504 always reaches the browser first.
+The COLD first draft (bf16 3B load + generation) is the long pole — measured
+1 529 s under memory pressure even with the 320-token cap (drill-8a), with a
+~770-810 s calm-box projection; raise `VOXSOAP_TIMEOUT_MS` when the box is
+loaded (the drill dev instance ran 1 800 000 ms).
 
 ## Owner reliability batch 2026-11-04/05 (proxy node:http + draft hygiene)
 
 - The PANEL-facing Next.js proxy (`/api/voxsoap/[route]`) moved its POSTs from
   global `fetch` - undici enforces a FIXED 300 s `headersTimeout` there, so the
   browser panel died at ~5:00 with a wrong `502 service_unreachable` - to
-  `node:http` with the whole budget on `req.setTimeout(TIMEOUT_MS)` (default
-  900 000 ms, `VOXSOAP_TIMEOUT_MS`). Budget elapse fires the
+  `node:http` with the whole budget on `req.setTimeout(TIMEOUT_MS)`
+  (`VOXSOAP_TIMEOUT_MS`; the default was 900 000 ms at that time, raised to
+  1 200 000 ms in the 2026-11-05/06 realignment below). Budget elapse fires the
   `TIMEOUT_BUDGET_<N>s` sentinel → honest **504 `upstream_timeout`**; a
   refusal stays **502 `service_unreachable` (code=ECONNREFUSED)**. GET /health
   stays on fetch (≤30 s; instant answers).
@@ -221,3 +229,57 @@ the first real session, or raise `VOXSOAP_ML_DRAFT_TIMEOUT_MS`.
   900.1 s. Windows sleeps on its IDLE timer (not CPU load) - a system-awake
   flag (`SetThreadExecutionState`) is required for unattended long runs; when
   the box is unavoidably loaded, raise `VOXSOAP_TIMEOUT_MS` above the default.
+
+## Owner budget realignment batch 2026-11-05/06 (the ~15:00 504 on a real consult)
+
+The owner's ML Assistive Draft panel died at ~15:00 on the exact 900 s sentinel while
+the Leo consult (~2 900 chars) was still generating on CPU. Nothing dishonest
+happened — the DEFAULT budget was tighter than the measured cold-load reality.
+Every layer realigned; honesty untouched:
+
+- `route.ts`: proxy budget default 900 000 → **1 200 000 ms** (20 min;
+  `VOXSOAP_TIMEOUT_MS` still overrides) and the `TIMEOUT_BUDGET_<N>s` sentinel
+  logs the effective seconds accurately.
+- `voxsoap-ml.client.ts`: client abort budget = proxy + **15 s** (1 215 000 ms) so
+  the proxy's controlled 504 always reaches the browser before an opaque
+  client-side abort.
+- `config.py` + `.env.example`/`.env.local`: CPU draft ceiling default 512 → **320**
+  (`VOXSOAP_DRAFT_MAX_NEW_TOKENS`). The 23-parameter Objective hydration is
+  deterministic and code-side (unstated parameters stay "Not mentioned"), so the
+  contract shape never depended on generating 448/512 tokens; 320 cuts ~35% off
+  CPU decode. The 448/256 provider clamps remain ceilings for env-raised configs.
+- `providers.py`: the pre-draft ASR release is now **UNCONDITIONAL** on CPU
+  (`VOXSOAP_ASR_RELEASE_BEFORE_DRAFT=1`, opt-out `=0`; the old conditional
+  <2.0 GB-free rule fired too late on the thrash days) and runs BEFORE
+  `_load_soap()` — the device resolves pre-load, so the bf16 3B load peak never
+  shares RAM with fp32 Whisper. Draft decode switched to
+  `torch.inference_mode()`; intra-op pool default `max(2, cpus - 1)` (3 of the 4
+  logical cores here; `VOXSOAP_DRAFT_THREADS` still overrides, never up-sizes).
+- `MLAssistPanel.tsx`: drafting status carries the operator guidance —
+  "typically takes 4-8 minutes on warm models and up to 15-18 minutes on a cold
+  initial load" with the elapsed timer; a budget 504 PRESERVES the transcript and
+  offers "⚡ Retry Warm Draft (Model is now loaded in memory)".
+
+Drill evidence (2026-11-06; fresh ES_CONTINUOUS holder; twin-pair zombie rule
+respected; one-shot mode via `PROBE_SKIP_PREWARM=1`):
+
+- Cold one-shot (drill-8a): the FULL 2 935-char consult rode the FIRST request of
+  a clean service — **HTTP 200 in 1 528.8 s** on ONE socket with 11/11 surgical
+  checks (23/23 objective parameters, 19 hydrated lines, honest
+  `max_new_tokens=320` echo, deterministic guard note, zero undici, zero Gemini).
+- New-default sentinel precision: honest 504 at exactly **1 200.1 s** (drill-7),
+  matching the 900.1 s drill-5 proof to 0.1 s; the load-only cold shot answered
+  200 @ **472.6 s** (drill-7 pre-warm) — the load alone is never the failure.
+- Box-condition honesty: 1 528.8 s = ~470 s load + ~1 050 s generation
+  (~3.3 s/token) with free RAM collapsed mid-decode; the CALM-box projection is
+  ~770-810 s (~1 s/token). When the box is unavoidably loaded, raise
+  `VOXSOAP_TIMEOUT_MS` (this drill's dev instance ran 1 800 000 ms; probe client
+  2 000 000 ms) — the panel copy and ⚡ retry already prepare the user for the wait.
+- Warm fast-path one-shot (drill-8b, immediately after 8a on the resident model):
+  **HTTP 200 in 954.0 s** (11/11, same full contract) at ~0.7 GB free — beats the
+  warm 448-token paged benchmark (1 108.8 s, drill-6) by ~14% on a WORSE box
+  (the 320-token ceiling win, live), and it fits the new 1 200 s default with
+  margin where the OLD 900 s default would have honestly 504'd by 54 s. The
+  < 360 s warm criterion is the CALM-box case (~290-340 s extrapolated from the
+  historical ~450-470 s @ ~8 GB free 448-token curve); today's thrashing box
+  documents the paged truth instead of faking the calm number.
