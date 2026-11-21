@@ -28,12 +28,26 @@ export default function OwnerPortalLayout({ children }: { children: ReactNode })
             body="Use the pet owner sign-in page to open your home care dashboard."
           />
         </div>
-        <Link
-          href="/owner/login"
-          className="rounded-full bg-accent px-6 py-3 text-sm font-bold text-canvas transition-colors hover:bg-accent-dark"
-        >
-          Go to Pet Owner Login
-        </Link>
+        <div className="flex flex-wrap items-center justify-center gap-3">
+          <Link
+            href="/owner/login"
+            className="rounded-full bg-accent px-6 py-3 text-sm font-bold text-canvas transition-colors hover:bg-accent-dark"
+          >
+            Go to Pet Owner Login
+          </Link>
+          <Link
+            href="/"
+            className="rounded-full border border-line px-5 py-3 text-sm font-semibold text-muted transition-colors hover:border-accent/40 hover:text-ink"
+          >
+            ← Pawfolio Home
+          </Link>
+          <Link
+            href="/clinic/login"
+            className="rounded-full border border-primary/40 px-5 py-3 text-sm font-semibold text-primary-dark transition-colors hover:bg-primary/10"
+          >
+            Clinic Portal →
+          </Link>
+        </div>
       </div>
     );
   }
@@ -42,12 +56,23 @@ export default function OwnerPortalLayout({ children }: { children: ReactNode })
     <div className="min-h-screen bg-canvas pb-24">
       <header className="sticky top-0 z-40 border-b border-line bg-surface/85 backdrop-blur-md">
         <div className="mx-auto flex h-16 max-w-3xl items-center justify-between px-4">
-          <Link href="/owner/dashboard" className="flex items-center gap-2">
-            <span className="flex h-9 w-9 items-center justify-center rounded-xl bg-accent text-canvas">
-              <PawPrint className="h-5 w-5" />
-            </span>
-            <span className="font-display text-lg font-extrabold text-ink">Pet Portal</span>
-          </Link>
+          <div className="flex items-center gap-3">
+            <Link href="/owner/dashboard" className="flex items-center gap-2">
+              <span className="flex h-9 w-9 items-center justify-center rounded-xl bg-accent text-canvas">
+                <PawPrint className="h-5 w-5" />
+              </span>
+              <span className="font-display text-lg font-extrabold text-ink">Pet Portal</span>
+            </Link>
+            <div className="hidden items-center gap-2 border-l border-line pl-3 text-xs font-semibold sm:flex">
+              <Link href="/" className="text-muted transition-colors hover:text-ink">
+                ← Pawfolio Home
+              </Link>
+              <span className="text-line">·</span>
+              <Link href="/clinic/login" className="text-primary-dark transition-colors hover:underline">
+                Clinic Portal →
+              </Link>
+            </div>
+          </div>
           <div className="flex items-center gap-3">
             <div className="text-right">
               <p className="text-sm font-semibold text-ink">Ali Raza</p>

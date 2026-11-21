@@ -76,6 +76,8 @@ export interface MedicationOrderValidationResult {
   drugValidationStatus: ValidationBadge;
   matchedCanonicalDrug: string | null;
   similarityScore: number | null;
+  confidenceTier?: 'HIGH' | 'MEDIUM' | 'LOW';
+  suggestedPrompt?: string | null;
   allergyConflictDetected: boolean;
   allergyConflictReason: string | null;
   canConfirmOrder: boolean;

@@ -49,7 +49,10 @@ stays a diagnostics-only override; `/roman` answers an honest 501 by design.
 | --- | --- | --- |
 | `GET /health` | - | component/status/scale report; loads nothing |
 | `POST /transcribe` | multipart `audio` (16 kHz PCM WAV), form `provider` optional | ASR transcription; other sample rates => honest 400. English (`language=en`) decodes with the ADAPTER-DISABLED base Whisper weights (owner Fix 1) and audio longer than 20 s is processed as sequential 20 s chunks (silent chunks skipped, reported in `note`) |
-| `POST /draft` | JSON `{transcript, provider?, max_new_tokens?, format?}` | `format:"vet_scribenote"` (DEFAULT): base-weights Qwen + deterministic hydration of ALL 23 canonical objective parameters (missing/bare-placeholder values -> "Not mentioned") + a verbatim-trace gate that DROPS stated values the transcript never contains; envelope carries `draft` + `sections{subjective, objective_map, objective_text, assessment, plan}`. `format:"medscribe"`: legacy soap-lora adapter behaviour. Unknown format => honest 400 |
+| `POST /draft` | JSON `{transcript, provider?, max_new_tokens?, format?}` | `format:"vet_scribenote"` (DEFAULT): base-weights Qwen + deterministic hydration of ALL 23 canonical objective parameters (missing/bare-placeholder values -> "Not mentioned") + a verbatim-trace gate that DROPS stated values the transcript never contains; envelope carries `draft` + `sections{subjective, objective_map, objective_text, assessment, plan}`. `format:"medscribe"`: legacy soap-lora adapter behaviour. Unknown format => honest 400. Runs under the same single-flight lock as the async jobs (honest 409 when one is in flight) |
+| `POST /draft/start` | same JSON body as `/draft` | **202 Accepted** `{job_id, status:"queued", max_new_tokens, model_scale, poll, cancel}` in milliseconds: validation + a worker thread, never a held-open socket. Concurrent start => honest 409 `draft_busy` |
+| `GET /draft/status/{job_id}` | - | Pure in-memory snapshot (<10 ms): `status` (`queued\|loading_model\|generating\|completed\|failed\|cancelled`), `tokens_generated`, `max_new_tokens`, `elapsed_s`, `cancel_requested`, and the FULL `/draft` envelope in `result` once completed. Unknown id => honest 400. Jobs are in-memory only: a restart clears them |
+| `POST /draft/cancel/{job_id}` | - | Flips the per-token cancel Event; the worker raises `DraftCancelled` and reports `cancelled` (no partial note, no zombie decode). Idempotent |
 | `POST /roman` | JSON `{text, provider?}` | **501** - Model C DEPRECATED (runs 9/10/11 failed); diagnostics-only via `VOXSOAP_ROMAN_ADAPTER_DIR` |
 | `POST /unload` | JSON `{component: asr|soap|roman|all}` | frees weights + gc + CUDA cache; swap = change env, restart |
 
@@ -59,6 +62,49 @@ Every response (success **and** controlled error) carries:
 "provider": "ml", "serving_mode": "real-provider|mocked-test-double",
 "model_scale": "<label|source>", "note": "..."
 ```
+
+## Fast CPU draft backend — GGUF (2026-11-19)
+
+The bf16 torch path measured 989-1132 s just to LOAD the 3B base on the owner's
+CPU, which is why a quantized GGUF backend now serves `vet_scribenote` drafts
+on CPU:
+
+```text
+VOXSOAP_SOAP_BACKEND=auto|gguf|torch   # auto: GGUF on CPU when llama_cpp is importable
+VOXSOAP_SOAP_GGUF_REPO=Qwen/Qwen2.5-1.5B-Instruct-GGUF
+VOXSOAP_SOAP_GGUF_FILE=qwen2.5-1.5b-instruct-q4_k_m.gguf  # auto-discovered in ml-serving/models/
+VOXSOAP_SOAP_GGUF_PATH=<explicit local .gguf>              # wins over auto-discovery & repo/file
+VOXSOAP_SOAP_N_CTX=4096
+VOXSOAP_SOAP_N_THREADS=3               # 0 = max(2, cpus-1)
+VOXSOAP_DRAFT_MAX_NEW_TOKENS=512       # completes all 4 SOAP sections on 5-min consults
+```
+
+Contract guarantees of the GGUF path:
+
+1. **Same prompt, same post-processing.** `VET_SCRIBENOTE_SYSTEM_PROMPT`, the
+   raw transcript, greedy decoding (temperature 0), the deterministic 23-param
+   hydration, placeholder collapse and verbatim-trace gate are IDENTICAL to
+   the torch path — only the weight format changed.
+2. **Honest provenance.** Envelopes carry `backend:"gguf"`, `gguf_model`, and
+   `model_scale` = `FULL-BASE-GGUF(...)` with an explicit note that the LoRA
+   adapter was NOT applied. A quantized base is never presented as the
+   unquantized PEFT adapter. `/health` adds a `soap_backend` block
+   (configured/effective/loaded/file/n_ctx/n_threads); `model_scale["soap"]`
+   keeps its manifest label.
+3. **State hygiene.** The GGUF state nests inside the existing `_loaded["soap"]`
+   slot (`{"backend":"gguf","llm":...}`), so `/unload`, `/health` and swap
+   semantics stay untouched.
+4. **Cancellation.** The decode loop checks the cancel Event on every streamed
+   chunk (one token) — cancel stops CPU use immediately.
+5. **Explicit-but-missing is honest.** `VOXSOAP_SOAP_BACKEND=gguf` without
+   `llama_cpp` answers 503 with install instructions; `auto` falls back to
+   torch. The legacy `medscribe` format and CUDA always stay on torch.
+
+Model fetch helper: `scripts/fetch_gguf_blob.py` (resumable, SHA-256-verified
+download of an Ollama registry GGUF blob — this network measured ~0.8 MB/s
+there vs ~0.03 MB/s on the HuggingFace CDN). Real-hardware benchmark:
+`scripts/bench_soap_gguf.py`; measured numbers live in
+`reports/phase5_integration_plan.md` §14.
 
 ## model_scale labels (never fabricated)
 

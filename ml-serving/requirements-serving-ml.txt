@@ -27,3 +27,18 @@ numpy>=1.26,<3
 # (CUDA) / fp32 (CPU). 4-bit compute stays Linux/Colab-only (Windows RAM
 # safeguard in config.py); on Windows this installs but is unused by serving.
 bitsandbytes==0.49.2
+
+# ---- Fast CPU draft backend (owner fix 2026-11-19, OPTIONAL) ----------------
+# llama-cpp-python is the quantized GGUF backend for vet_scribenote on CPU.
+# Version 0.3.36 verified live on the owner box (Python 3.12.10, win_amd64):
+# the PyPI source build needs MSVC, and the CPU wheel index has no cp312
+# win_amd64 wheel for 0.3.36 - install the prebuilt release wheel directly:
+#
+#   .venv-ml64\Scripts\python -m pip install ^
+#     https://github.com/abetlen/llama-cpp-python/releases/download/v0.3.36/llama_cpp_python-0.3.36-py3-none-win_amd64.whl
+#
+# Verified after install: `import llama_cpp` -> 0.3.36, no compiler required.
+# OPTIONAL by design: VOXSOAP_SOAP_BACKEND=auto falls back to the torch path
+# when llama_cpp is absent; VOXSOAP_SOAP_BACKEND=gguf answers an honest 503
+# instead of silently swapping anything.
+llama-cpp-python==0.3.36

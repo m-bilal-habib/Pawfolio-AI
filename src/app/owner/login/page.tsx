@@ -1,7 +1,7 @@
 "use client";
 
 import { motion } from "framer-motion";
-import { Home, PawPrint, Wand2 } from "lucide-react";
+import { ArrowLeft, Home, PawPrint, Wand2 } from "lucide-react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useState } from "react";
@@ -31,8 +31,17 @@ export default function OwnerLogin() {
   };
 
   return (
-    <div className="flex min-h-screen items-center justify-center bg-accent/5 px-4 py-16">
+    <div className="flex min-h-screen items-center justify-center bg-accent/5 px-4 py-12">
       <PageFade className="w-full max-w-md">
+        <div className="mb-4 flex items-center justify-between text-xs font-semibold">
+          <Link href="/" className="inline-flex items-center gap-1.5 text-muted transition-colors hover:text-ink">
+            <ArrowLeft className="h-3.5 w-3.5" />
+            Pawfolio Home
+          </Link>
+          <Link href="/clinic/login" className="text-primary-dark hover:underline">
+            Clinic Portal →
+          </Link>
+        </div>
         <motion.div
           initial={{ opacity: 0, y: 24, scale: 0.98 }}
           animate={{ opacity: 1, y: 0, scale: 1 }}

@@ -60,6 +60,62 @@ export interface VoxSoapMLDraftPayload {
   max_new_tokens: number;
   note: string;
   guard: VoxSoapMLGuard;
+  /** "gguf" (quantized CPU backend) or "torch" (PEFT/CUDA path). */
+  backend?: string;
+  gguf_model?: string | null;
+  format?: string;
+  sections?: {
+    subjective: string;
+    objective_map: Record<string, string>;
+    objective_text: string;
+    assessment: string;
+    plan: string;
+  };
+}
+
+/** Async draft job lifecycle (owner fix 2026-11-19). The POST returns 202
+ * immediately; the UI polls `status` every ~2 s and can cancel per token. */
+export type VoxSoapMLDraftJobStatus =
+  | 'queued'
+  | 'loading_model'
+  | 'generating'
+  | 'completed'
+  | 'failed'
+  | 'cancelled';
+
+/** `GET /draft/status/<jobId>` snapshot (also returned by start/cancel). */
+export interface VoxSoapMLDraftJobSnapshot {
+  ok: boolean;
+  job_id: string;
+  status: VoxSoapMLDraftJobStatus;
+  stage_label?: string;
+  tokens_generated: number;
+  max_new_tokens: number;
+  elapsed_s: number;
+  cancel_requested?: boolean;
+  accepted?: boolean;
+  service?: string;
+  phase?: string;
+  format?: string;
+  provider?: string | null;
+  serving_mode?: string | null;
+  model_scale?: VoxSoapMLScale;
+  poll?: string;
+  cancel?: string;
+  note?: string | null;
+  /** Full legacy `/draft` envelope once `status === "completed"`. */
+  result?: VoxSoapMLEnvelope;
+  /** Controlled failure envelope once `status === "failed"`. */
+  error?: VoxSoapMLErrorFields;
+}
+
+/** A job call keeps the HTTP status, the parsed job snapshot (when the body
+ * is one) and the envelope-ish error body side by side, so the panel never
+ * mistakes a 409/400/403/5xx for progress. */
+export interface VoxSoapMLDraftJobCall {
+  status: number;
+  job: VoxSoapMLDraftJobSnapshot | null;
+  envelope: VoxSoapMLEnvelope;
 }
 
 export interface VoxSoapMLRomanPayload {
@@ -115,6 +171,10 @@ export interface VoxSoapMLEnvelope extends VoxSoapMLErrorFields {
   generation?: string;
   max_new_tokens?: number;
   guard?: VoxSoapMLGuard;
+  /** "gguf" (quantized CPU backend) or "torch" (PEFT/CUDA path). */
+  backend?: string;
+  gguf_model?: string | null;
+  format?: string;
 
   // /roman success payload
   roman?: string;

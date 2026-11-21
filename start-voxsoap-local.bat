@@ -6,6 +6,12 @@ REM   Probe:   node "D:\Pawfolio AI\ml-serving\probe_local_service.mjs"
 REM Stop: close the two windows (uvicorn may also be stopped via POST /unload
 REM for RAM; Ctrl+C in the windows kills the processes cleanly).
 set HF_HUB_DISABLE_SYMLINKS_WARNING=1
+REM Fast local CPU GGUF defaults (2026-11-20): skips unnecessary ~400 MB torch
+REM import on cold GGUF drafts; ml-serving auto-discovers ml-serving\models\.
+set VOXSOAP_DEVICE=cpu
+set VOXSOAP_SOAP_BACKEND=auto
+set VOXSOAP_SOAP_GGUF_FILE=qwen2.5-1.5b-instruct-q4_k_m.gguf
+set VOXSOAP_DRAFT_MAX_NEW_TOKENS=512
 start "voxsoap-ml (uvicorn 8321)" /min "D:\Pawfolio AI\.venv-ml64\Scripts\python.exe" -m uvicorn app:app --app-dir "D:\Pawfolio AI\ml-serving" --host 127.0.0.1 --port 8321
 start "voxsoap-next (3000)" cmd /k "cd /d D:\Pawfolio AI && npx.cmd next dev --port 3000"
 echo Launched: uvicorn 8321 (minimized) + Next dev 3000.

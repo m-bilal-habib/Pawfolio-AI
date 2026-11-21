@@ -19,6 +19,7 @@ The API-level tests pin the /draft `format` routing contract.
 from __future__ import annotations
 
 from conftest import FakeMLProvider
+from guards import clinical_guard
 from providers import (
     VET_NOTE_FORMAT,
     VET_NOTE_FORMATS,
@@ -192,6 +193,68 @@ def test_untraceable_objective_values_drop_with_transcript_trace():
     assert drops_nt == 0
 
 
+def test_spelled_out_spoken_vitals_trace_their_digit_forms():
+    # ASR hears vitals as words ("twenty-four point one"); the model writes
+    # digits ("24.1 kg"). The deterministic normalizer appends digit forms to
+    # the trace corpus so TRUE spoken values survive — without rewriting the
+    # note and without accepting unspoken numbers.
+    transcript = (
+        "weight twenty-four point one kilograms, temperature thirty-eight point nine "
+        "degrees celsius, heart rate one hundred twenty beats per minute, "
+        "body condition score four out of nine, pain score two out of ten"
+    )
+    raw = (
+        "SUBJECTIVE:\nHistory.\n\n"
+        "OBJECTIVE_MENTIONED:\n"
+        "Weight: 24.1 kg\n"
+        "Temperature: 38.9 degrees Celsius\n"
+        "Heart Rate: 120 bpm\n"
+        "Body Condition Score: 4/9\n"
+        "Pain Score: 2/10\n\n"
+        "ASSESSMENT:\n- otitis externa\n\nPLAN:\n- recheck in two weeks"
+    )
+    _, sections, unknown, drops = _vet_hydrated_story(raw, transcript=transcript)
+    obj = sections["objective_map"]
+    assert unknown == 0
+    assert drops == 0
+    assert obj["Weight"] == "24.1 kg"
+    assert obj["Temperature"] == "38.9 degrees Celsius"
+    assert obj["Heart Rate"] == "120 bpm"
+    assert obj["Body Condition Score"] == "4/9"
+    assert obj["Pain Score"] == "2/10"
+
+
+def test_spelled_out_normalizer_never_accepts_unspoken_numbers():
+    transcript = "weight twenty-four point one kilograms"
+    raw = (
+        "SUBJECTIVE:\nHistory.\n\n"
+        "OBJECTIVE_MENTIONED:\nWeight: 24.5 kg\n\n"
+        "ASSESSMENT:\n- otitis externa\n\nPLAN:\n- recheck"
+    )
+    _, sections, _, drops = _vet_hydrated_story(raw, transcript=transcript)
+    assert sections["objective_map"]["Weight"] == "Not mentioned"
+    assert drops == 1
+
+
+def test_guard_accepts_spoken_numbers_and_spelled_units():
+    # ASR words vs model digits must not create false "unsupported" flags.
+    transcript = (
+        "weight twenty-four point one kilograms, heart rate one hundred twenty "
+        "beats per minute, Apoquel five point four milligrams once daily"
+    )
+    draft = (
+        "SUBJECTIVE:\nOn Apoquel 5.4 milligrams once daily.\n\n"
+        "OBJECTIVE:\nWeight: 24.1 kg\nHeart Rate: 120 bpm\n\n"
+        "ASSESSMENT:\n- otitis externa\n\nPLAN:\n- recheck"
+    )
+    guard = clinical_guard(draft, transcript)
+    assert guard["facts"]["unsupported_numbers_in_draft"] == []
+    assert guard["facts"]["unsupported_med_tokens_in_draft"] == []
+    # An unspoken number still flags (the correction removes only false positives).
+    bad = clinical_guard(draft.replace("24.1 kg", "24.5 kg"), transcript)
+    assert "24.5" in bad["facts"]["unsupported_numbers_in_draft"]
+
+
 def test_alias_matching_covers_common_variants():
     raw = (
         "SUBJECTIVE:\nHistory.\n\n"
@@ -277,3 +340,32 @@ def test_draft_unknown_format_is_honest_400(app, client):
     body = r.json()
     assert body["error"] == "bad_request"
     assert "vet_scribenote" in body["message"]
+
+
+def test_markdown_bold_headings_do_not_leave_stray_asterisks():
+    raw = (
+        "**SUBJECTIVE:**\nLeo is a 3.5-year-old Labrador.\n\n"
+        "**OBJECTIVE_MENTIONED:**\nWeight: 24.1 kg\n\n"
+        "**ASSESSMENT:**\n- Bilateral otitis externa\n\n"
+        "**PLAN:**\n- Ear cytology today"
+    )
+    _, sections, unknown, _ = _vet_hydrated_story(raw)
+    assert unknown == 0
+    assert sections["subjective"] == "Leo is a 3.5-year-old Labrador."
+    assert sections["objective_map"]["Weight"] == "24.1 kg"
+    assert sections["assessment"] == "- Bilateral otitis externa"
+    assert sections["plan"] == "- Ear cytology today"
+
+
+def test_spoken_half_number_normalizes_for_guard():
+    transcript = (
+        "He is a three-and-a-half-year-old neutered male Labrador weighing "
+        "twenty-four point one kilograms, urine specific gravity of one point zero three five."
+    )
+    draft = (
+        "SUBJECTIVE:\n3.5-year-old neutered male Labrador.\n\n"
+        "OBJECTIVE:\nWeight: 24.1 kg\n\n"
+        "ASSESSMENT:\n- Checkup\n\nPLAN:\n- USG 1.035 noted"
+    )
+    guard = clinical_guard(draft, transcript)
+    assert guard["facts"]["unsupported_numbers_in_draft"] == []

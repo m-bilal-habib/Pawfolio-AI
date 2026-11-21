@@ -1,7 +1,8 @@
 "use client";
 
 import { AnimatePresence, motion } from "framer-motion";
-import { Mic, MicOff, Plus, Stethoscope } from "lucide-react";
+import { ArrowLeft, ArrowRight, Mic, Plus, Stethoscope } from "lucide-react";
+import Link from "next/link";
 import { useParams } from "next/navigation";
 import { useState } from "react";
 import { AIDraftPanel, DocumentCard, TimelineEvent } from "@/components/cards";
@@ -18,7 +19,6 @@ export default function PatientWorkspace() {
   const params = useParams<{ id: string }>();
   const pet = petById(params.id);
   const [tab, setTab] = useState<Tab>("Snapshot");
-  const [listening, setListening] = useState(false);
   const [orders, setOrders] = useState<OrderRow[]>([]);
   const [order, setOrder] = useState<OrderRow>(emptyOrder);
   const [orderError, setOrderError] = useState("");
@@ -58,6 +58,16 @@ export default function PatientWorkspace() {
 
   return (
     <div className="space-y-6">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <Link
+          href="/clinic/patients"
+          className="inline-flex items-center gap-1.5 text-xs font-semibold text-muted transition-colors hover:text-primary-dark"
+        >
+          <ArrowLeft className="h-3.5 w-3.5" />
+          All Patients
+        </Link>
+      </div>
+
       <div className="rounded-2xl border border-line bg-surface p-6 shadow-sm">
         <div className="flex flex-wrap items-center justify-between gap-4">
           <div className="flex items-center gap-4">
@@ -74,7 +84,7 @@ export default function PatientWorkspace() {
               </p>
             </div>
           </div>
-          <div className="flex flex-wrap gap-2">
+          <div className="flex flex-wrap items-center gap-2">
             {pet.badges.map((b) => (
               <span
                 key={b}
@@ -89,6 +99,13 @@ export default function PatientWorkspace() {
                 {b}
               </span>
             ))}
+            <Link
+              href={`/clinic/vox-soap?petId=${pet.id}&action=ml-assist`}
+              className="inline-flex items-center gap-2 rounded-full bg-primary px-4 py-2 text-xs font-bold text-canvas shadow-sm shadow-primary/20 transition-colors hover:bg-primary-dark"
+            >
+              <Mic className="h-3.5 w-3.5" />
+              Start VoxSOAP Note for {pet.name}
+            </Link>
           </div>
         </div>
 
@@ -177,29 +194,19 @@ export default function PatientWorkspace() {
           {tab === "Visit Workspace" && (
             <div className="grid gap-6 xl:grid-cols-[1.5fr_1fr]">
               <div className="rounded-2xl border border-line bg-surface p-5 shadow-sm">
-                <div className="flex items-center justify-between">
+                <div className="flex flex-wrap items-center justify-between gap-2">
                   <h2 className="font-display text-lg font-bold text-ink">Consultation note</h2>
-                  <motion.button
-                    whileTap={{ scale: 0.95 }}
-                    onClick={() => setListening((v) => !v)}
-                    className={`inline-flex items-center gap-2 rounded-full px-4 py-2 text-sm font-semibold transition-colors ${
-                      listening ? "bg-error text-white" : "bg-primary/10 text-primary-dark hover:bg-primary hover:text-canvas"
-                    }`}
+                  <Link
+                    href={`/clinic/vox-soap?petId=${pet.id}&action=ml-assist`}
+                    className="inline-flex items-center gap-2 rounded-full bg-primary px-4 py-2 text-sm font-bold text-canvas transition-colors hover:bg-primary-dark"
                   >
-                    {listening ? <MicOff className="h-4 w-4" /> : <Mic className="h-4 w-4" />}
-                    {listening ? "Stop dictation" : "Dictate note"}
-                  </motion.button>
+                    <Mic className="h-4 w-4" />
+                    Open VoxSOAP Scribe for {pet.name}
+                  </Link>
                 </div>
-                {listening && (
-                  <motion.p
-                    initial={{ opacity: 0 }}
-                    animate={{ opacity: 1 }}
-                    className="mt-3 flex items-center gap-2 rounded-lg bg-primary/10 px-3 py-2 text-sm font-medium text-primary-dark"
-                  >
-                    <span className="h-2 w-2 animate-pulse rounded-full bg-error" />
-                    Listening. Speech is transcribed into the draft panel for review.
-                  </motion.p>
-                )}
+                <p className="mt-2 rounded-lg bg-sidebar px-3 py-2 text-xs text-muted">
+                  Use <strong className="text-ink">VoxSOAP Scribe</strong> to record or upload audio and auto-draft Subjective, Objective, Assessment &amp; Plan notes with clinical verification.
+                </p>
 
                 <div className="mt-4 space-y-4">
                   <div>
@@ -286,9 +293,16 @@ export default function PatientWorkspace() {
                 </div>
               </div>
 
-              <div>
+              <div className="space-y-3">
                 <AIDraftPanel draft={draft} />
-                <p className="mt-3 text-xs leading-relaxed text-muted">
+                <Link
+                  href={`/clinic/vox-soap?petId=${pet.id}`}
+                  className="inline-flex w-full items-center justify-center gap-2 rounded-xl border border-primary/50 bg-primary/10 px-4 py-2.5 text-sm font-bold text-primary-dark transition-colors hover:bg-primary hover:text-canvas"
+                >
+                  Open Full SOAP Editor
+                  <ArrowRight className="h-4 w-4" />
+                </Link>
+                <p className="text-xs leading-relaxed text-muted">
                   Draft fields come from dictation and uploaded reports. Nothing here enters the record until a
                   veterinarian confirms it.
                 </p>

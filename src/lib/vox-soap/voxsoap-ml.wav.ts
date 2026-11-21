@@ -132,10 +132,101 @@ function mergeChunks(chunks: Float32Array[]): Float32Array {
   return merged;
 }
 
+export interface WavSignalAnalysis {
+  byteSize: number;
+  sampleCount: number;
+  durationSeconds: number;
+  rms: number;
+  peak: number;
+  isSilent: boolean;
+  isTooShort: boolean;
+}
+
+const SILENT_PEAK_THRESHOLD = 0.002;
+const SILENT_RMS_THRESHOLD = 0.0005;
+const MIN_CLIP_SECONDS = 0.5;
+
+/** Compute peak, RMS and duration directly from Float32 PCM chunks. */
+export function analyzePcmSamples(
+  chunks: Float32Array[],
+  sampleRate: number
+): WavSignalAnalysis {
+  let sampleCount = 0;
+  let sumSq = 0;
+  let peak = 0;
+  for (const chunk of chunks) {
+    sampleCount += chunk.length;
+    for (let i = 0; i < chunk.length; i += 1) {
+      const abs = Math.abs(chunk[i]);
+      if (abs > peak) peak = abs;
+      sumSq += chunk[i] * chunk[i];
+    }
+  }
+  const rms = sampleCount > 0 ? Math.sqrt(sumSq / sampleCount) : 0;
+  const durationSeconds = sampleRate > 0 ? sampleCount / sampleRate : 0;
+  const isSilent = sampleCount === 0 || (peak < SILENT_PEAK_THRESHOLD && rms < SILENT_RMS_THRESHOLD);
+  const isTooShort = durationSeconds < MIN_CLIP_SECONDS;
+  return {
+    byteSize: 44 + sampleCount * 2,
+    sampleCount,
+    durationSeconds: Number(durationSeconds.toFixed(2)),
+    rms: Number(rms.toFixed(5)),
+    peak: Number(peak.toFixed(5)),
+    isSilent,
+    isTooShort,
+  };
+}
+
+/** Verify an encoded 16 kHz mono 16-bit PCM WAV Blob has >44 bytes, >=0.5s duration, and non-zero signal. */
+export async function analyzeWavBlob(wav: Blob): Promise<WavSignalAnalysis> {
+  if (wav.size <= 44) {
+    return {
+      byteSize: wav.size,
+      sampleCount: 0,
+      durationSeconds: 0,
+      rms: 0,
+      peak: 0,
+      isSilent: true,
+      isTooShort: true,
+    };
+  }
+  const buf = await wav.arrayBuffer();
+  const view = new DataView(buf);
+  const sampleRate = view.byteLength >= 28 ? view.getUint32(24, true) || TARGET_SAMPLE_RATE : TARGET_SAMPLE_RATE;
+  const dataBytes = Math.max(0, view.byteLength - 44);
+  const sampleCount = Math.floor(dataBytes / 2);
+  let sumSq = 0;
+  let peak = 0;
+  for (let i = 0; i < sampleCount; i += 1) {
+    const s = view.getInt16(44 + i * 2, true) / 32768;
+    const abs = Math.abs(s);
+    if (abs > peak) peak = abs;
+    sumSq += s * s;
+  }
+  const rms = sampleCount > 0 ? Math.sqrt(sumSq / sampleCount) : 0;
+  const durationSeconds = sampleRate > 0 ? sampleCount / sampleRate : 0;
+  return {
+    byteSize: wav.size,
+    sampleCount,
+    durationSeconds: Number(durationSeconds.toFixed(2)),
+    rms: Number(rms.toFixed(5)),
+    peak: Number(peak.toFixed(5)),
+    isSilent: sampleCount === 0 || (peak < SILENT_PEAK_THRESHOLD && rms < SILENT_RMS_THRESHOLD),
+    isTooShort: durationSeconds < MIN_CLIP_SECONDS,
+  };
+}
+
+export interface Pcm16CaptureOptions {
+  /** Optional real-time RMS/peak level callback for VU metering (throttled per audio frame). */
+  onLevel?: (rms: number, peak: number) => void;
+}
+
 export interface Pcm16CaptureHandle {
   /** Actual rate of the capture context — 16 kHz when the browser honoured
    * the forced rate, otherwise the device rate (resampled before upload). */
   readonly contextSampleRate: number;
+  /** Capture backend selected at start ('worklet' | 'script-processor'). */
+  readonly captureMode: 'worklet' | 'script-processor';
   setPaused: (paused: boolean) => void;
   /** Stops capture, resamples if needed, and returns the 16 kHz PCM WAV.
    * Throws honestly (no fabricated silence) when nothing was captured. */
@@ -205,9 +296,12 @@ export async function decodeAndResampleToWav16k(file: File): Promise<Blob> {
   }
 }
 
-/** Starts capturing `stream` as Float32 chunks via the pcm-recorder worklet.
- * Caller owns the MediaStream lifecycle. */
-export async function startPcm16Capture(stream: MediaStream): Promise<Pcm16CaptureHandle> {
+/** Starts capturing `stream` as Float32 chunks via AudioWorkletNode with automatic
+ * ScriptProcessorNode fallback. Caller owns the MediaStream lifecycle. */
+export async function startPcm16Capture(
+  stream: MediaStream,
+  options?: Pcm16CaptureOptions
+): Promise<Pcm16CaptureHandle> {
   if (typeof window === 'undefined') {
     throw new Error('Microphone capture is a browser-only API.');
   }
@@ -226,13 +320,12 @@ export async function startPcm16Capture(stream: MediaStream): Promise<Pcm16Captu
     // the stop() path resamples to 16 kHz before encoding.
     context = new Ctor();
   }
-  if (context.state === 'suspended') {
-    await context.resume().catch(() => undefined);
+  // Explicitly resume inside user gesture so Chrome/Edge Windows drivers start delivering frames.
+  if (context.state !== 'running') {
+    await context.resume();
   }
-  await context.audioWorklet.addModule('/worklets/pcm-recorder.js');
 
   const source = context.createMediaStreamSource(stream);
-  const worklet = new AudioWorkletNode(context, 'pcm-recorder');
   // Zero-gain tap into the destination keeps the pull-chain alive across
   // engines while guaranteeing no monitoring echo leaves the machine.
   const muter = context.createGain();
@@ -242,28 +335,77 @@ export async function startPcm16Capture(stream: MediaStream): Promise<Pcm16Captu
   let paused = false;
   let stopped = false;
 
-  worklet.port.onmessage = (event: MessageEvent) => {
-    if (stopped || paused) return;
-    const data = event.data;
-    if (data instanceof ArrayBuffer && data.byteLength > 0) {
-      chunks.push(new Float32Array(data));
+  const pushFrame = (samples: Float32Array) => {
+    if (stopped || paused || samples.length === 0) return;
+    chunks.push(samples);
+    if (options?.onLevel) {
+      let sumSq = 0;
+      let peak = 0;
+      for (let i = 0; i < samples.length; i += 1) {
+        const s = samples[i];
+        const abs = Math.abs(s);
+        if (abs > peak) peak = abs;
+        sumSq += s * s;
+      }
+      options.onLevel(Math.sqrt(sumSq / samples.length), peak);
     }
   };
 
-  source.connect(worklet);
-  worklet.connect(muter);
-  muter.connect(context.destination);
+  let captureMode: 'worklet' | 'script-processor' = 'worklet';
+  let worklet: AudioWorkletNode | null = null;
+  let processorNode: ScriptProcessorNode | null = null;
+
+  try {
+    if (!context.audioWorklet) throw new Error('AudioWorklet unsupported');
+    await context.audioWorklet.addModule('/worklets/pcm-recorder.js');
+    worklet = new AudioWorkletNode(context, 'pcm-recorder');
+    worklet.port.onmessage = (event: MessageEvent) => {
+      const data = event.data;
+      if (data instanceof ArrayBuffer && data.byteLength > 0) {
+        pushFrame(new Float32Array(data));
+      } else if (data instanceof Float32Array && data.length > 0) {
+        pushFrame(data);
+      }
+    };
+    source.connect(worklet);
+    worklet.connect(muter);
+    muter.connect(context.destination);
+  } catch {
+    // Clean deterministic fallback if AudioWorklet registration fails in this browser/origin.
+    captureMode = 'script-processor';
+    processorNode = context.createScriptProcessor(4096, 1, 1);
+    processorNode.onaudioprocess = (event: AudioProcessingEvent) => {
+      const channel = event.inputBuffer.getChannelData(0);
+      if (channel && channel.length > 0) {
+        pushFrame(channel.slice(0));
+      }
+    };
+    source.connect(processorNode);
+    processorNode.connect(muter);
+    muter.connect(context.destination);
+  }
 
   const teardown = () => {
+    if (stopped && context.state === 'closed') return;
     stopped = true;
     try {
-      source.disconnect(worklet);
-      worklet.disconnect(muter);
+      if (worklet) {
+        worklet.port.onmessage = null;
+        source.disconnect(worklet);
+        worklet.disconnect(muter);
+      }
+      if (processorNode) {
+        processorNode.onaudioprocess = null;
+        source.disconnect(processorNode);
+        processorNode.disconnect(muter);
+      }
       muter.disconnect(context.destination);
     } catch {
       // Graph already torn down by close() — non-fatal.
     }
-    void context.close().catch(() => undefined);
+    if (context.state !== 'closed') {
+      void context.close().catch(() => undefined);
+    }
   };
 
   const encode = async (): Promise<Blob> => {
@@ -271,29 +413,36 @@ export async function startPcm16Capture(stream: MediaStream): Promise<Pcm16Captu
     if (chunks.length === 0) {
       throw new Error('No audio samples were captured — nothing was uploaded, nothing invented.');
     }
+    let wav: Blob;
     if (deviceRate === TARGET_SAMPLE_RATE) {
-      return encodeWavMono16(chunks, TARGET_SAMPLE_RATE);
+      wav = encodeWavMono16(chunks, TARGET_SAMPLE_RATE);
+    } else {
+      // Browser could not deliver native 16 kHz: resample CLIENT-side via an
+      // OfflineAudioContext (the ML service contract stays untouched).
+      const merged = mergeChunks(chunks);
+      const frameCount = Math.max(1, Math.ceil((merged.length / deviceRate) * TARGET_SAMPLE_RATE));
+      const offline = new OfflineAudioContext(1, frameCount, TARGET_SAMPLE_RATE);
+      const audioBuffer = offline.createBuffer(1, merged.length, deviceRate);
+      audioBuffer.getChannelData(0).set(merged);
+      const bufferSource = offline.createBufferSource();
+      bufferSource.buffer = audioBuffer;
+      bufferSource.connect(offline.destination);
+      bufferSource.start();
+      const rendered = await offline.startRendering();
+      wav = encodeWavMono16([rendered.getChannelData(0)], TARGET_SAMPLE_RATE);
     }
-    // Browser could not deliver native 16 kHz: resample CLIENT-side via an
-    // OfflineAudioContext (the ML service contract stays untouched).
-    const merged = mergeChunks(chunks);
-    const frameCount = Math.max(1, Math.ceil((merged.length / deviceRate) * TARGET_SAMPLE_RATE));
-    const offline = new OfflineAudioContext(1, frameCount, TARGET_SAMPLE_RATE);
-    const audioBuffer = offline.createBuffer(1, merged.length, deviceRate);
-    // copyToChannel's exact Float32Array<ArrayBuffer> typing fights with the
-    // BufferLike default — .set() is equivalent and type-clean here.
-    audioBuffer.getChannelData(0).set(merged);
-    const bufferSource = offline.createBufferSource();
-    bufferSource.buffer = audioBuffer;
-    bufferSource.connect(offline.destination);
-    bufferSource.start();
-    const rendered = await offline.startRendering();
-    return encodeWavMono16([rendered.getChannelData(0)], TARGET_SAMPLE_RATE);
+    if (wav.size <= 44) {
+      throw new Error('Recorded WAV buffer contained no audio payload (<= 44 bytes) — check your microphone.');
+    }
+    return wav;
   };
 
   return {
     get contextSampleRate() {
       return context.sampleRate;
+    },
+    get captureMode() {
+      return captureMode;
     },
     setPaused(nextPaused: boolean) {
       paused = Boolean(nextPaused);

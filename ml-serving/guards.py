@@ -5,6 +5,16 @@ NUMBER_RE / MED_TOKEN_RE / UNSTATED_MARKERS / section-presence / fact-set
 arithmetic are the SAME rules, applied at serving time to annotate every
 /draft response with honest, purely mechanical observations.
 
+2026-11-20 correction (spoken-number parity): ASR writes vitals as words
+("twenty-four point one kilograms", "one hundred twenty beats per minute")
+while the model writes digits ("24.1 kg", "120 bpm"). The original literal
+comparison flagged those TRUE spoken values as "unsupported" (false positives
+that also made the trace gate look broken). Number sets are now compared
+symmetrically through `spoken_numbers.spoken_number_tokens`, and unit tokens
+accept their spelled-out form ("kg" vs "kilograms"). This only removes false
+positives: an unspoken value ("24.5" against a spoken "24.1") still shows up as
+unsupported.
+
 THIS IS NOT A CLINICAL-SAFETY VERDICT. It can flag suspicious facts; it can
 never certify correctness. The contract is explicit: the vet remains the
 reviewer of record, and the UI must surface the draft as an editable draft.
@@ -13,6 +23,8 @@ from __future__ import annotations
 
 import re
 from typing import Any, Dict, List
+
+from spoken_numbers import spoken_number_tokens
 
 SECTION_LABELS = ("SUBJECTIVE", "OBJECTIVE", "ASSESSMENT", "PLAN")
 NUMBER_RE = re.compile(r"\d+(?:[.,]\d+)?")
@@ -24,6 +36,31 @@ MED_TOKEN_RE = re.compile(
 # Same tuple as evaluate_soap.py's UNTREATED_MARKERS.
 UNSTATED_MARKERS = ("not stated", "not mentioned", "no information", "not documented", "not provided")
 
+# Unit abbreviations accept their spelled-out transcript form: ASR hears
+# "kilograms"/"milligrams", the model writes "kg"/"mg".
+_UNIT_SPELLINGS = {
+    "kg": ("kilogram", "kilograms", "kilo", "kilos"),
+    "g": ("gram", "grams"),
+    "mg": ("milligram", "milligrams"),
+    "mcg": ("microgram", "micrograms"),
+    "ml": ("milliliter", "milliliters", "millilitre", "millilitres"),
+}
+
+
+def _number_set(text: str) -> set:
+    """Literal digits plus spoken-number digit renderings (symmetric)."""
+    return set(NUMBER_RE.findall(text)) | set(spoken_number_tokens(text))
+
+
+def _med_set(text: str) -> set:
+    """Med/unit tokens, canonicalized so spelled-out units match abbreviations."""
+    tokens = {tok.lower() for tok in MED_TOKEN_RE.findall(text)}
+    lower = text.lower()
+    for unit, spellings in _UNIT_SPELLINGS.items():
+        if any(spelling in lower for spelling in spellings):
+            tokens.add(unit)
+    return tokens
+
 
 def sections_present(draft: str) -> Dict[str, bool]:
     upper = str(draft or "").upper()
@@ -32,10 +69,10 @@ def sections_present(draft: str) -> Dict[str, bool]:
 
 def fact_sets(source: str, draft: str) -> Dict[str, List[str]]:
     return {
-        "numbers_src": sorted(set(NUMBER_RE.findall(source))),
-        "numbers_draft": sorted(set(NUMBER_RE.findall(draft))),
-        "meds_src": sorted({tok.lower() for tok in MED_TOKEN_RE.findall(source)}),
-        "meds_draft": sorted({tok.lower() for tok in MED_TOKEN_RE.findall(draft)}),
+        "numbers_src": sorted(_number_set(source)),
+        "numbers_draft": sorted(_number_set(draft)),
+        "meds_src": sorted(_med_set(source)),
+        "meds_draft": sorted(_med_set(draft)),
     }
 
 

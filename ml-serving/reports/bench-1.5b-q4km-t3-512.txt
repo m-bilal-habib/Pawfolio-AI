@@ -1,0 +1,49 @@
+SUBJECTIVE:
+- Age: 3.5 years
+- Species: Labrador Retriever
+- Presenting Complaint: Shaking head, red ears with brownish discharge and foul odor.
+- Duration: Last few days
+- Observed Clinical Signs: Shaking head more than usual, reddened ears, foul-smelling discharge, left ear more affected.
+- Recent Grooming/Bathing/Exposures: Swimming in the canal almost every weekend.
+- Past Medical History: Previous ear infection treated with antibiotics and ear drops. On Apoquel 5.4 mg daily for allergies since spring. Monthly heartworm prevention. Vaccines up to date last spring.
+
+OBJECTIVE_MENTIONED:
+Temperature: 38.9°C
+Heart Rate: 120 bpm
+Weight: 24.1 kg
+Respiratory Rate: 28 breaths per minute
+Capillary Refill Time: <2 seconds
+Mucous Membranes: Pink, mild tartar on upper carnassials
+Hydration Status: Good
+Body Condition Score: 4/9
+Pain Score: Not mentioned
+Fear Anxiety Stress Score: Not mentioned
+Eyes: Not mentioned
+Ears: Not mentioned
+Nasal: Not mentioned
+Oral/Dental: Not mentioned
+Cardiovascular: Not mentioned
+Respiratory: Not mentioned
+Neurological: Not mentioned
+Musculoskeletal: Not mentioned
+Lymphatic: Not mentioned
+Gastrointestinal: Not mentioned
+Reproductive/Urinary: Not mentioned
+Integument: Not mentioned
+Masses: Not mentioned
+
+ASSESSMENT:
+- **Red Ears with Brown Discharge and Yeasty Odor:** Likely due to an ear infection.
+- **Pyoderma Papules on Ventral Abdomen and Elbows:** Possible pyodermatitis or secondary bacterial infection.
+
+PLAN:
+- **Ear Cytology from Both Ears First to Confirm Organisms:** To determine the causative agent (bacteria, yeast, or mixed organisms).
+- **Otic Preparation Twice Daily for 14 Days:** Using a ceruminolytic solution.
+- **Oral Anti-Itch Medication as Prescribed:** No change unless cytology results indicate a different picture.
+- **Recheck Weight and Ears in Two Weeks:** To monitor progress.
+- **Diet Transition to Hydrolyzed Trial for 6 Weeks Starting Next Monday:** Transitioning from large-breed kibble to hydrolyzed food, starting on the following Monday. The owner will buy two-month bag of hydrolyzed food and log daily scratch score on home worksheet.
+- **Previous Bloodwork:**
+- Packed Cell Volume: 42%
+- Total Protein: 6.8 g/dL
+- Albumin: 3.2 g/dL
+- Urine Specific Gravity: 1.035

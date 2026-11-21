@@ -357,6 +357,20 @@ function coerceObjectiveMap(sections: {
   return { map, unknownLines };
 }
 
+function cleanSpokenMedicineLabel(rawHead: string): string | null {
+  let name = rawHead.trim();
+  const unverifiedMatch = name.match(/^\[UNVERIFIED DRUG:\s*"([^"]*)"\]$/i);
+  if (unverifiedMatch) {
+    name = unverifiedMatch[1].trim();
+  } else {
+    name = name
+      .replace(/\s*\[Needs Confirmation[^\]]*\]$/i, '')
+      .replace(/\s*\(matched:\s*[^)]*\)$/i, '')
+      .trim();
+  }
+  return name || null;
+}
+
 function bulletToMedicationOrder(bullet: string): GroundedSoapExtractionOutput['plan']['medication_orders'][number] {
   const doseMatch = bullet.match(DOSE_RE);
   const freqMatch = bullet.match(FREQUENCY_RE);
@@ -364,8 +378,15 @@ function bulletToMedicationOrder(bullet: string): GroundedSoapExtractionOutput['
   const earRouteMatch = bullet.match(EAR_ROUTE_RE);
   const startMatch = bullet.match(/\b(today|tonight|tomorrow)\b/i);
   let medicineName: string | null = null;
-  const colonIdx = bullet.indexOf(':');
-  if (colonIdx > 0 && colonIdx <= 60) medicineName = bullet.slice(0, colonIdx).trim() || null;
+  const unverifiedPrefix = bullet.match(/^\[UNVERIFIED DRUG:\s*"([^"]*)"\]\s*:/i);
+  if (unverifiedPrefix) {
+    medicineName = unverifiedPrefix[1].trim() || null;
+  } else {
+    const colonIdx = bullet.indexOf(':');
+    if (colonIdx > 0 && colonIdx <= 120) {
+      medicineName = cleanSpokenMedicineLabel(bullet.slice(0, colonIdx));
+    }
+  }
   let route: string | null = null;
   if (earRouteMatch) {
     route = `${earRouteMatch[1].toLowerCase()} ear`;

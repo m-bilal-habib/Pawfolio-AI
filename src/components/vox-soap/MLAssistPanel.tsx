@@ -3,7 +3,9 @@
 
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
-  mlDraft,
+  mlDraftCancel,
+  mlDraftStart,
+  mlDraftStatus,
   mlHealth,
   mlTranscribe,
   mlUnload,
@@ -12,14 +14,20 @@ import {
   type VoxSoapMLStaffHeaders,
 } from '@/lib/vox-soap/voxsoap-ml.client';
 import {
+  analyzeWavBlob,
   decodeAndResampleToWav16k,
   pcm16kBytesForSeconds,
   pcm16kSecondsForBytes,
   resolveUploadAudioMime,
   startPcm16Capture,
   type Pcm16CaptureHandle,
+  type WavSignalAnalysis,
 } from '@/lib/vox-soap/voxsoap-ml.wav';
-import type { VoxSoapMLCall, VoxSoapMLEnvelope } from '@/lib/vox-soap/voxsoap-ml.types';
+import type {
+  VoxSoapMLCall,
+  VoxSoapMLDraftJobSnapshot,
+  VoxSoapMLEnvelope,
+} from '@/lib/vox-soap/voxsoap-ml.types';
 import { PANEL_THEME, type PanelAccent } from './NewRecordingPanel';
 
 /**
@@ -58,6 +66,12 @@ const MAX_RECORDING_SECONDS = 12 * 60; // 720 s ≈ 23 MB — under the server's
 const WARN_MB = 20;
 const TRANSCRIPT_MAX_CHARS = 14_000; // ml-serving config VOXSOAP_TRANSCRIPT_MAX_CHARS
 const RATE_BYTES_PER_SECOND = 16_000 * 2; // s16le mono
+/** Scribenote-style job polling: the POST returns 202 instantly; status is a
+ * <10 ms in-memory read and cancel flips a per-token Event. */
+const DRAFT_POLL_INTERVAL_MS = 1_800;
+const CANCEL_SETTLE_MS = 2_500;
+const MAX_CONSECUTIVE_POLL_FAILURES = 3;
+const TRANSCRIPT_SESSION_STORAGE_KEY = 'pawfolio.voxsoap.mlTranscript.v1';
 
 interface Notice {
   tone: 'warn' | 'error' | 'info';
@@ -70,6 +84,14 @@ function scaleChips(scale: Record<string, string>): Array<{ key: string; value: 
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
+}
+
+function isTerminalDraftStatus(status: VoxSoapMLDraftJobSnapshot['status']): boolean {
+  return status === 'completed' || status === 'failed' || status === 'cancelled';
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function scaleValueToString(scale: VoxSoapMLEnvelope['model_scale']): string | null {
@@ -95,6 +117,9 @@ const EnvelopeBadges: React.FC<{ envelope: VoxSoapMLEnvelope }> = ({ envelope })
       )}
       {scale && (
         <span className="px-2 py-0.5 rounded bg-primary/10 text-primary-dark">model_scale: {scale}</span>
+      )}
+      {envelope.backend && (
+        <span className="px-2 py-0.5 rounded bg-sidebar text-muted">backend: {envelope.backend}</span>
       )}
       <span className="px-2 py-0.5 rounded bg-sidebar text-muted">latency_s: {latencyLabel(envelope.latency_s)}</span>
     </div>
@@ -217,6 +242,12 @@ const GuardBadges: React.FC<{ envelope: VoxSoapMLEnvelope }> = ({ envelope }) =>
   );
 };
 
+const SAMPLE_LEO_TRANSCRIPT =
+  "Hi Alicia, come on in. Good to see you. How is Leo doing today? Well, it's been about three days now. Leo has been shaking his head a lot and scratching at his right ear. Sometimes he whimpers when I touch the ear, and I noticed there is a pretty noticeable odor coming from it. I did give him a bath about a week ago at the groomer. No vomiting or diarrhea, eating and drinking normally. He has had summer skin allergies before, treated with Apoquel 16 mg, and he is due for DHPP and Rabies vaccinations today. Let me check his weight first: he weighs 24.5 kg. Right ear canal is very red and inflamed with brown waxy debris and foul odor; left ear looks clean. This is acute otitis externa of the right ear secondary to moisture after the bath. We will clean his ears, prescribe Posatex 4 drops in the right ear once daily for 7 days, administer DHPP and Rabies today, and recheck in 10 days.";
+
+const LANGUAGE_STORAGE_KEY = 'pawfolio.voxsoap.language';
+const HIDE_TIPS_STORAGE_KEY = 'pawfolio.voxsoap.hideMlTips';
+
 export const MLAssistPanel: React.FC<{
   open: boolean;
   staffRole: string;
@@ -224,19 +255,21 @@ export const MLAssistPanel: React.FC<{
   staffName: string;
   accent?: PanelAccent;
   contextLabel?: string;
+  initialTranscript?: string;
   onClose: () => void;
   /** Owner Fix 3.3: apply the REVIEWED draft text to the main workspace's
    * four SOAP cards (deterministic client-side vet-scribenote mapping via
    * vox-soap.vetnote.groundedFromVetNoteText). Optional — panels without a
    * hosting workspace simply don't render the button. */
-  onApplyDraft?: (draftText: string) => void;
+  onApplyDraft?: (draftText: string, transcriptText?: string) => void;
 }> = ({
   open,
   staffRole,
   staffId,
   staffName,
   accent = 'amber',
-  contextLabel = 'ML assist • local service',
+  contextLabel = 'Local AI Scribe',
+  initialTranscript,
   onClose,
   onApplyDraft,
 }) => {
@@ -248,15 +281,60 @@ export const MLAssistPanel: React.FC<{
   const [health, setHealth] = useState<VoxSoapMLCall | null>(null);
   const [transcribeCall, setTranscribeCall] = useState<VoxSoapMLCall | null>(null);
   const [draftCall, setDraftCall] = useState<VoxSoapMLCall | null>(null);
+  const [draftJob, setDraftJob] = useState<VoxSoapMLDraftJobSnapshot | null>(null);
+  const [cancelling, setCancelling] = useState(false);
   const [unloadCall, setUnloadCall] = useState<VoxSoapMLCall | null>(null);
   const [transcript, setTranscript] = useState('');
   const [draft, setDraft] = useState('');
   const [elapsedLabel, setElapsedLabel] = useState('0:00');
   const [working, setWorking] = useState(false);
+  const [showSystemDetails, setShowSystemDetails] = useState(false);
+  const [showTips, setShowTips] = useState(true);
+  const [audioInputs, setAudioInputs] = useState<MediaDeviceInfo[]>([]);
+  const [selectedMicId, setSelectedMicId] = useState<string>('');
+  const [micLevelPct, setMicLevelPct] = useState(0);
+  const [captureModeLabel, setCaptureModeLabel] = useState<string>('');
+  const [audioPreviewUrl, setAudioPreviewUrl] = useState<string | null>(null);
+  const [wavSignal, setWavSignal] = useState<WavSignalAnalysis | null>(null);
+  const lastLevelTickRef = useRef<number>(0);
+  const audioPreviewUrlRef = useRef<string | null>(null);
+  const pendingWavRef = useRef<Blob | null>(null);
   /** /transcribe language contract (default "ur" = the original scaffold
    * behaviour): "ur"/"en" tag the Whisper decoder, "auto" lets the model
-   * detect the language from the audio itself. */
+   * detect the language from the audio itself. Remembered in localStorage. */
   const [language, setLanguage] = useState<VoxSoapMLLanguage>('ur');
+
+  useEffect(() => {
+    try {
+      const savedLang = window.localStorage.getItem(LANGUAGE_STORAGE_KEY);
+      if (savedLang === 'ur' || savedLang === 'en' || savedLang === 'auto') {
+        setLanguage(savedLang);
+      }
+      if (window.localStorage.getItem(HIDE_TIPS_STORAGE_KEY) === '1') {
+        setShowTips(false);
+      }
+    } catch {
+      // localStorage unavailable
+    }
+  }, []);
+
+  const updateLanguage = (next: VoxSoapMLLanguage) => {
+    setLanguage(next);
+    try {
+      window.localStorage.setItem(LANGUAGE_STORAGE_KEY, next);
+    } catch {
+      // ignore
+    }
+  };
+
+  const dismissTips = () => {
+    setShowTips(false);
+    try {
+      window.localStorage.setItem(HIDE_TIPS_STORAGE_KEY, '1');
+    } catch {
+      // ignore
+    }
+  };
 
   const staff: VoxSoapMLStaffHeaders = { role: staffRole, id: staffId, name: staffName };
   const t = PANEL_THEME[accent];
@@ -267,6 +345,14 @@ export const MLAssistPanel: React.FC<{
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const elapsedRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const encodingRef = useRef(false);
+  /** Async draft job tracking (owner fix 2026-11-19). The ref is the single
+   * source of truth for "is this poll loop still mine?" — closing the modal
+   * or cancelling nulls it, so late status responses can never re-open a
+   * completed draft or resurrect a stage. */
+  const jobIdRef = useRef<string | null>(null);
+  const staffRef = useRef<VoxSoapMLStaffHeaders>(staff);
+  staffRef.current = staff;
+  const closedRef = useRef(false);
 
   const clearTimers = useCallback(() => {
     if (timerRef.current) {
@@ -284,6 +370,69 @@ export const MLAssistPanel: React.FC<{
     streamRef.current = null;
     captureRef.current?.cancel();
     captureRef.current = null;
+    setMicLevelPct(0);
+  }, []);
+
+  const setPreviewAudio = useCallback((wav: Blob | null, signal: WavSignalAnalysis | null) => {
+    if (audioPreviewUrlRef.current) {
+      URL.revokeObjectURL(audioPreviewUrlRef.current);
+      audioPreviewUrlRef.current = null;
+    }
+    pendingWavRef.current = wav;
+    setWavSignal(signal);
+    if (wav && wav.size > 44) {
+      const nextUrl = URL.createObjectURL(wav);
+      audioPreviewUrlRef.current = nextUrl;
+      setAudioPreviewUrl(nextUrl);
+    } else {
+      setAudioPreviewUrl(null);
+    }
+  }, []);
+
+  const refreshAudioDevices = useCallback(async () => {
+    try {
+      if (typeof navigator === 'undefined' || !navigator.mediaDevices?.enumerateDevices) return;
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const mics = devices.filter((d) => d.kind === 'audioinput');
+      setAudioInputs(mics);
+      setSelectedMicId((prev) => {
+        if (prev && mics.some((m) => m.deviceId === prev)) return prev;
+        return mics[0]?.deviceId ?? '';
+      });
+    } catch {
+      // enumerateDevices blocked before permission — non-fatal.
+    }
+  }, []);
+
+  useEffect(() => {
+    void refreshAudioDevices();
+    if (typeof navigator === 'undefined' || !navigator.mediaDevices?.addEventListener) return;
+    const onChange = () => void refreshAudioDevices();
+    navigator.mediaDevices.addEventListener('devicechange', onChange);
+    return () => {
+      navigator.mediaDevices.removeEventListener('devicechange', onChange);
+    };
+  }, [refreshAudioDevices]);
+
+  // Auto-save transcript in sessionStorage so long drafts never lose clinician text on transient hiccups.
+  useEffect(() => {
+    try {
+      if (transcript.trim()) {
+        window.sessionStorage.setItem(TRANSCRIPT_SESSION_STORAGE_KEY, transcript);
+      }
+    } catch {
+      // ignore
+    }
+  }, [transcript]);
+
+  /** Fire-and-forget cancel used by the ✕ / `open=false` / unmount paths:
+   * the server flips the per-token Event and the worker exits within one
+   * token. Modal close must NEVER block on a network round-trip. */
+  const cancelActiveJob = useCallback(() => {
+    const jobId = jobIdRef.current;
+    if (!jobId) return;
+    jobIdRef.current = null;
+    void mlDraftCancel(jobId, staffRef.current);
   }, []);
 
   const startElapsedTicker = useCallback(() => {
@@ -296,8 +445,16 @@ export const MLAssistPanel: React.FC<{
   }, []);
 
   const resetFlow = useCallback(() => {
+    cancelActiveJob();
     clearTimers();
     releaseMic();
+    setPreviewAudio(null, null);
+    setCaptureModeLabel('');
+    try {
+      window.sessionStorage.removeItem(TRANSCRIPT_SESSION_STORAGE_KEY);
+    } catch {
+      // ignore
+    }
     encodingRef.current = false;
     setSeconds(0);
     setSizeBytes(0);
@@ -305,10 +462,12 @@ export const MLAssistPanel: React.FC<{
     setDraft('');
     setTranscribeCall(null);
     setDraftCall(null);
+    setDraftJob(null);
+    setCancelling(false);
     setUnloadCall(null);
     setNotice(null);
     setStage('ready');
-  }, [clearTimers, releaseMic]);
+  }, [cancelActiveJob, clearTimers, releaseMic, setPreviewAudio]);
 
   const checkHealth = useCallback(async () => {
     setStage('checking');
@@ -320,12 +479,43 @@ export const MLAssistPanel: React.FC<{
       ? (env.model_scale as Record<string, string>)
       : null;
     if (result.status === 200 && env.ok && scaleMap) {
-      setStage('ready');
+      let savedSessionTranscript = '';
+      try {
+        savedSessionTranscript = window.sessionStorage.getItem(TRANSCRIPT_SESSION_STORAGE_KEY) ?? '';
+      } catch {
+        // ignore
+      }
+      if (initialTranscript && initialTranscript.trim()) {
+        setConsentChecked(true);
+        setTranscript(initialTranscript.trim());
+        setDraft('');
+        setDraftCall(null);
+        setTranscribeCall(null);
+        setNotice({
+          tone: 'info',
+          text: 'Sample consultation loaded — review or edit the transcript below, then click "Generate assistive SOAP draft".',
+        });
+        setStage('reviewTranscript');
+      } else if (savedSessionTranscript.trim()) {
+        setConsentChecked(true);
+        setTranscript(savedSessionTranscript.trim());
+        setDraft('');
+        setDraftCall(null);
+        setNotice({
+          tone: 'info',
+          text: 'Restored auto-saved transcript from this browser session — review it or click "Re-record" to start fresh.',
+        });
+        setStage('reviewTranscript');
+      } else {
+        void refreshAudioDevices();
+        setStage('ready');
+      }
     } else {
+      setShowSystemDetails(true);
       setStage('unavailable');
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [staff.id, staff.name, staff.role]);
+  }, [staff.id, staff.name, staff.role, initialTranscript]);
 
   useEffect(() => {
     if (!open) return;
@@ -338,13 +528,31 @@ export const MLAssistPanel: React.FC<{
   }, [open, staffRole]);
 
   useEffect(() => {
-    if (open) return;
-    // Panel closed upstream: release everything, reset next open.
+    if (open) {
+      closedRef.current = false;
+      return;
+    }
+    // Panel closed upstream: stop any in-flight draft job (no zombie CPU),
+    // release the mic/timers, reset next open.
+    closedRef.current = true;
+    cancelActiveJob();
     clearTimers();
     releaseMic();
-  }, [open, clearTimers, releaseMic]);
+  }, [open, cancelActiveJob, clearTimers, releaseMic]);
 
-  useEffect(() => () => clearTimers(), [clearTimers]);
+  useEffect(
+    () => () => {
+      closedRef.current = true;
+      cancelActiveJob();
+      clearTimers();
+      releaseMic();
+      if (audioPreviewUrlRef.current) {
+        URL.revokeObjectURL(audioPreviewUrlRef.current);
+        audioPreviewUrlRef.current = null;
+      }
+    },
+    [cancelActiveJob, clearTimers, releaseMic]
+  );
 
   const playGuardBeep = () => {
     try {
@@ -371,13 +579,41 @@ export const MLAssistPanel: React.FC<{
   const startRecording = async () => {
     if (stage !== 'ready') return;
     setNotice(null);
+    setPreviewAudio(null, null);
     setStage('recording');
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
-      });
+      const baseAudio: MediaTrackConstraints = {
+        channelCount: 1,
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+      };
+      let stream: MediaStream;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: selectedMicId ? { ...baseAudio, deviceId: { exact: selectedMicId } } : baseAudio,
+        });
+      } catch (constraintErr) {
+        if (selectedMicId && constraintErr instanceof Error && constraintErr.name === 'OverconstrainedError') {
+          stream = await navigator.mediaDevices.getUserMedia({ audio: baseAudio });
+        } else {
+          throw constraintErr;
+        }
+      }
       streamRef.current = stream;
-      const capture = await startPcm16Capture(stream);
+      void refreshAudioDevices();
+      const capture = await startPcm16Capture(stream, {
+        onLevel: (rms, peak) => {
+          const now = performance.now();
+          if (now - lastLevelTickRef.current < 75) return;
+          lastLevelTickRef.current = now;
+          const level = Math.min(100, Math.round(Math.max(rms * 320, peak * 120)));
+          setMicLevelPct(level);
+        },
+      });
+      setCaptureModeLabel(
+        capture.captureMode === 'worklet' ? 'AudioWorklet (16 kHz PCM)' : 'ScriptProcessor Fallback (16 kHz PCM)'
+      );
       captureRef.current = capture;
       setSizeBytes(0);
       setSeconds(0);
@@ -463,7 +699,7 @@ export const MLAssistPanel: React.FC<{
       captureRef.current = null;
       const wav = await capture.stop();
       capture.cancel();
-      if (wav.size === 0) {
+      if (wav.size <= 44) {
         throw new Error('No audio bytes were captured — the transcript was NOT generated.');
       }
       if (wav.size > 25 * 1024 * 1024) {
@@ -471,7 +707,20 @@ export const MLAssistPanel: React.FC<{
           `${(wav.size / (1024 * 1024)).toFixed(1)} MB exceeds the local service's 25 MB audio cap — nothing was uploaded. Record a shorter window.`
         );
       }
+      const signal = await analyzeWavBlob(wav);
       setSizeBytes(wav.size);
+      setPreviewAudio(wav, signal);
+      if (signal.isTooShort || signal.isSilent) {
+        encodingRef.current = false;
+        releaseMic();
+        setStage('ready');
+        setNotice({
+          tone: 'warn',
+          text:
+            `No microphone audio detected (${signal.durationSeconds}s, RMS ${signal.rms}) — check selected mic or Windows mic permissions, then try again or upload an audio file.`,
+        });
+        return;
+      }
       await postTranscribe(wav);
     } catch (err) {
       encodingRef.current = false;
@@ -518,7 +767,17 @@ export const MLAssistPanel: React.FC<{
           `${Math.floor(wavSeconds / 60)} min ${Math.floor(wavSeconds % 60)} s of decoded audio is beyond this panel's ${MAX_RECORDING_SECONDS / 60} min guard — nothing was uploaded. Trim or split the file.`
         );
       }
+      const signal = await analyzeWavBlob(wav);
       setSizeBytes(wav.size);
+      setPreviewAudio(wav, signal);
+      if (signal.isTooShort || signal.isSilent) {
+        setStage('ready');
+        setNotice({
+          tone: 'warn',
+          text: `The uploaded file contains silent or < 0.5 s audio (${signal.durationSeconds}s, RMS ${signal.rms}) — nothing was sent to Whisper.`,
+        });
+        return;
+      }
       setNotice({
         tone: 'info',
         text: `Decoded "${file.name}" client-side to ${(wav.size / (1024 * 1024)).toFixed(1)} MB of 16 kHz mono PCM WAV — now transcribing (${
@@ -564,6 +823,124 @@ export const MLAssistPanel: React.FC<{
     setStage('error');
   };
 
+  /** Polls `/draft/status/<jobId>` every ~1.8 s with up to 3 transient retries
+   * so brief proxy/CPU scheduling hiccups never abort a healthy job. */
+  const pollDraftJob = async (jobId: string) => {
+    let consecutiveFailures = 0;
+    while (jobIdRef.current === jobId) {
+      await sleep(DRAFT_POLL_INTERVAL_MS);
+      if (jobIdRef.current !== jobId || closedRef.current) return;
+      const call = await mlDraftStatus(jobId, staffRef.current);
+      if (jobIdRef.current !== jobId || closedRef.current) return;
+      const snap = call.job;
+      if (!snap) {
+        const isTransient = call.status === 0 || call.status >= 502;
+        if (isTransient && consecutiveFailures < MAX_CONSECUTIVE_POLL_FAILURES) {
+          consecutiveFailures += 1;
+          setNotice({
+            tone: 'warn',
+            text: `Transient status poll hiccup (retry ${consecutiveFailures}/${MAX_CONSECUTIVE_POLL_FAILURES}) — local draft job is still processing…`,
+          });
+          await sleep(1_500);
+          continue;
+        }
+        // Exhausted retries or honest 4xx: show it verbatim, stop.
+        jobIdRef.current = null;
+        clearTimers();
+        setDraftJob(null);
+        setDraftCall({ status: call.status, envelope: call.envelope });
+        setStage('error');
+        return;
+      }
+      if (consecutiveFailures > 0) {
+        consecutiveFailures = 0;
+        setNotice(null);
+      }
+      setDraftJob(snap);
+      if (snap.status === 'completed') {
+        jobIdRef.current = null;
+        clearTimers();
+        const result = snap.result;
+        if (result && result.ok && typeof result.draft === 'string') {
+          setDraftCall({ status: 200, envelope: result });
+          setDraft(result.draft);
+          setStage('reviewDraft');
+        } else {
+          setDraftCall({ status: call.status, envelope: result ?? call.envelope });
+          setStage('error');
+        }
+        return;
+      }
+      if (snap.status === 'failed') {
+        jobIdRef.current = null;
+        clearTimers();
+        const failure = snap.error;
+        const envelope: VoxSoapMLEnvelope = {
+          ok: false,
+          error: failure?.error ?? 'draft_job_failed',
+          message: failure?.message ?? 'The local draft job failed with no error message.',
+          detail: failure?.detail,
+          provider: snap.provider ?? null,
+          serving_mode: snap.serving_mode ?? null,
+          model_scale: snap.model_scale ?? 'UNKNOWN',
+          note: 'controlled error from the async draft job — nothing was rerouted to Gemini',
+        };
+        setDraftCall({ status: call.status, envelope });
+        setStage('error');
+        return;
+      }
+      if (snap.status === 'cancelled') {
+        jobIdRef.current = null;
+        clearTimers();
+        setDraftJob(null);
+        setStage('reviewTranscript');
+        setNotice({
+          tone: 'info',
+          text: 'The draft job was cancelled — the local worker stopped and no partial note was kept.',
+        });
+        return;
+      }
+    }
+  };
+
+  /** Operator cancel: ask the worker to stop, then wait (briefly) for the
+   * terminal `cancelled` snapshot so the UI can state it honestly. */
+  const cancelDraftFromUi = async () => {
+    const jobId = jobIdRef.current;
+    if (!jobId || cancelling) return;
+    setCancelling(true);
+    const cancelCall = await mlDraftCancel(jobId, staffRef.current);
+    if (cancelCall.status !== 200) {
+      setCancelling(false);
+      setNotice({
+        tone: 'error',
+        text: `Cancel was refused (HTTP ${cancelCall.status} · ${String(
+          cancelCall.envelope.error ?? 'error'
+        )}) — the draft may still be running. ${cancelCall.envelope.message ?? ''}`.trim(),
+      });
+      return;
+    }
+    jobIdRef.current = null; // the poll loop exits at its next ownership check
+    let settled = cancelCall.job;
+    const deadline = Date.now() + CANCEL_SETTLE_MS;
+    while (Date.now() < deadline && (!settled || !isTerminalDraftStatus(settled.status))) {
+      await sleep(200);
+      const next = await mlDraftStatus(jobId, staffRef.current);
+      if (next.job) settled = next.job;
+    }
+    setCancelling(false);
+    clearTimers();
+    setDraftJob(null);
+    setStage('reviewTranscript');
+    setNotice({
+      tone: 'info',
+      text:
+        settled?.status === 'cancelled'
+          ? 'Draft cancelled — the worker stopped within one token; no partial note was kept.'
+          : 'Cancel requested — the local worker stops within one token; no partial note is kept. (The job did not report "cancelled" before this check.)',
+    });
+  };
+
   const postDraft = async () => {
     const trimmed = transcript.trim();
     if (!trimmed) {
@@ -577,20 +954,30 @@ export const MLAssistPanel: React.FC<{
       });
       return;
     }
+    closedRef.current = false;
     setNotice(null);
     setDraftCall(null);
+    setDraftJob(null);
+    setCancelling(false);
     setStage('drafting');
-    startElapsedTicker();
-    const result = await mlDraft(trimmed, staff);
     clearTimers();
-    setDraftCall(result);
-    const env = result.envelope;
-    if (result.status === 200 && env.ok && typeof env.draft === 'string') {
-      setDraft(env.draft);
-      setStage('reviewDraft');
+    startElapsedTicker();
+    // 202 Accepted: validation + worker spawn only. No long-lived socket can
+    // be killed by a proxy budget, so the legacy 20-minute 504 is impossible.
+    const started = await mlDraftStart(trimmed, staff);
+    if (closedRef.current) {
+      if (started.job) void mlDraftCancel(started.job.job_id, staff);
       return;
     }
-    setStage('error');
+    if (started.status !== 202 || !started.job) {
+      clearTimers();
+      setDraftCall({ status: started.status, envelope: started.envelope });
+      setStage('error');
+      return;
+    }
+    jobIdRef.current = started.job.job_id;
+    setDraftJob(started.job);
+    await pollDraftJob(started.job.job_id);
   };
 
   const postUnload = async () => {
@@ -620,7 +1007,41 @@ export const MLAssistPanel: React.FC<{
     }
   };
 
+  /** ✕ close: auto-cancel an in-flight draft job BEFORE hiding the panel —
+   * the server stops within one token, so closing the modal can never leave a
+   * zombie Python decode burning CPU. */
+  const handleClose = () => {
+    closedRef.current = true;
+    cancelActiveJob();
+    onClose();
+  };
+
   if (!open) return null;
+
+  const draftProgressPct =
+    draftJob && draftJob.max_new_tokens > 0
+      ? Math.max(
+          0,
+          Math.min(
+            100,
+            Math.round((draftJob.tokens_generated / draftJob.max_new_tokens) * 100)
+          )
+        )
+      : 0;
+
+  const draftStageLabel = cancelling
+    ? 'CANCELLING — asking the local worker to stop…'
+    : draftJob?.stage_label && draftJob.status === 'generating'
+    ? `${draftJob.stage_label}… ${draftJob.tokens_generated} / ${draftJob.max_new_tokens} tokens · ${elapsedLabel}`
+    : draftJob?.stage_label
+    ? `${draftJob.stage_label}… (${elapsedLabel})`
+    : draftJob?.status === 'queued'
+    ? 'Queued — waiting for the local worker…'
+    : draftJob?.status === 'loading_model'
+    ? `Loading local SOAP model… (${elapsedLabel})`
+    : draftJob?.status === 'generating'
+    ? `Extracting clinical SOAP fields… ${draftJob.tokens_generated} / ${draftJob.max_new_tokens} tokens · ${elapsedLabel}`
+    : 'Queued — submitting local draft job (202 Accepted)…';
 
   const statusLine =
     stage === 'checking'
@@ -638,7 +1059,7 @@ export const MLAssistPanel: React.FC<{
       : stage === 'reviewTranscript'
       ? 'REVIEW — edit the transcript, then request the assistive draft.'
       : stage === 'drafting'
-      ? `Drafting veterinary SOAP note on CPU… (Elapsed: ${elapsedLabel} — on CPU without GPU acceleration, this typically takes 4–8 minutes on warm models and up to 15–18 minutes on a cold initial load. Please keep this tab active.)`
+      ? draftStageLabel
       : stage === 'reviewDraft'
       ? 'REVIEW DRAFT — assistive note with guard annotations; vet confirmation is MANDATORY.'
       : stage === 'error'
@@ -697,53 +1118,95 @@ export const MLAssistPanel: React.FC<{
           </div>
           <button
             type="button"
-            onClick={onClose}
+            onClick={handleClose}
             className={`text-sm disabled:opacity-40 ${t.close}`}
-            title="Close (any active recording is stopped and discarded)"
+            title="Close (any active recording is stopped and discarded; an in-flight draft job is cancelled so no CPU decode is left running)"
           >
             ✕
           </button>
         </div>
 
         <div className="px-5 py-5 space-y-4">
-          {/* Health strip */}
-          {(stage !== 'forbidden') && healthScale && (
-            <div className="flex flex-wrap items-center gap-1.5 font-mono text-[11px]">
-              <span className="text-muted">local service:</span>
-              {scaleChips(healthScale).map((chip) => (
-                <span
-                  key={chip.key}
-                  className={`px-2 py-0.5 rounded ${
-                    chip.value.startsWith('FULL')
-                      ? 'bg-emerald-950/60 text-emerald-200'
-                      : chip.value.includes('UNAVAILABLE') || chip.value.includes('UNKNOWN')
-                      ? 'bg-amber-950/60 text-amber-200'
-                      : 'bg-sidebar text-muted'
-                  }`}
-                >
-                  {chip.key}: {chip.value}
-                </span>
-              ))}
-              {isMockProvider && (
-                <span className="px-2 py-0.5 rounded bg-rose-950/60 text-rose-200">
-                  serving a MOCK provider — model_scale labels must be checked
-                </span>
-              )}
-            </div>
-          )}
+          {/* Friendly Health Status Bar + Progressive Disclosure System Details */}
+          {stage !== 'forbidden' && (
+            <div className="space-y-2">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                {stage === 'checking' ? (
+                  <span className="inline-flex items-center gap-2 rounded-full bg-sidebar px-3 py-1 text-xs font-semibold text-muted border border-line">
+                    <span className="h-2 w-2 rounded-full bg-amber-400 animate-pulse" />
+                    Checking local AI service…
+                  </span>
+                ) : stage === 'unavailable' ? (
+                  <span className="inline-flex items-center gap-2 rounded-full bg-rose-950/60 px-3 py-1 text-xs font-semibold text-rose-200 border border-rose-500/40">
+                    <span className="h-2 w-2 rounded-full bg-rose-400" />
+                    Local AI Service Offline
+                  </span>
+                ) : (
+                  <span className="inline-flex items-center gap-2 rounded-full bg-emerald-950/60 px-3 py-1 text-xs font-semibold text-emerald-200 border border-emerald-500/40">
+                    <span className="h-2 w-2 rounded-full bg-emerald-400" />
+                    Local AI Ready (Offline &amp; Private — runs on your clinic machine)
+                  </span>
+                )}
 
-          {/* Roman: honestly 501 */}
-          {stage !== 'forbidden' && stage !== 'checking' && stage !== 'unavailable' && (
-            <div className="flex items-center gap-2 text-[11px] text-muted">
-              <button
-                type="button"
-                disabled
-                className="px-2 py-1 rounded bg-sidebar text-muted border border-line cursor-not-allowed"
-                title="Model C is DEPRECATED (runs 9/10/11 failed) — /roman answers an honest 501 until a passing adapter is configured."
-              >
-                /roman
-              </button>
-              <span>transliteration is disabled — Model C DEPRECATED (2026-10-29), route answers 501.</span>
+                <button
+                  type="button"
+                  onClick={() => setShowSystemDetails((prev) => !prev)}
+                  className="text-[11px] font-semibold text-muted hover:text-ink underline underline-offset-2"
+                >
+                  {showSystemDetails ? 'Hide Model & System Details ▴' : 'Model & System Details ▾'}
+                </button>
+              </div>
+
+              {showSystemDetails && (
+                <div className="rounded-xl border border-line bg-sidebar p-3 space-y-2">
+                  {healthScale && (
+                    <div className="flex flex-wrap items-center gap-1.5 font-mono text-[11px]">
+                      <span className="text-muted">local service:</span>
+                      {scaleChips(healthScale).map((chip) => (
+                        <span
+                          key={chip.key}
+                          className={`px-2 py-0.5 rounded ${
+                            chip.value.startsWith('FULL')
+                              ? 'bg-emerald-950/60 text-emerald-200'
+                              : chip.value.includes('UNAVAILABLE') || chip.value.includes('UNKNOWN')
+                              ? 'bg-amber-950/60 text-amber-200'
+                              : 'bg-canvas text-muted'
+                          }`}
+                        >
+                          {chip.key}: {chip.value}
+                        </span>
+                      ))}
+                      {isMockProvider && (
+                        <span className="px-2 py-0.5 rounded bg-rose-950/60 text-rose-200">
+                          serving a MOCK provider — model_scale labels must be checked
+                        </span>
+                      )}
+                    </div>
+                  )}
+                  <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] text-muted">
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        disabled
+                        className="px-2 py-0.5 rounded bg-canvas text-muted border border-line cursor-not-allowed font-mono"
+                        title="Model C is DEPRECATED (runs 9/10/11 failed) — /roman answers an honest 501 until a passing adapter is configured."
+                      >
+                        /roman (501)
+                      </button>
+                      <span>Roman Urdu transliteration is disabled (Model C deprecated).</span>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => void postUnload()}
+                      disabled={working || stage === 'recording' || stage === 'paused' || stage === 'transcribing' || stage === 'drafting'}
+                      className={`px-3 py-1 rounded-lg text-[11px] font-semibold disabled:opacity-40 ${t.secondaryBtn}`}
+                      title="POST /unload — free model weights from RAM when finished"
+                    >
+                      ⏏ Unload models (free RAM)
+                    </button>
+                  </div>
+                </div>
+              )}
             </div>
           )}
 
@@ -799,6 +1262,22 @@ export const MLAssistPanel: React.FC<{
                   <span className={`text-sm ml-2 ${t.timerSub}`}>/ {Math.floor(MAX_RECORDING_SECONDS / 60)}:00</span>
                 </div>
                 <div className={`text-xs font-semibold uppercase tracking-wider ${t.status}`}>{statusLine}</div>
+                {(stage === 'recording' || stage === 'paused') && (
+                  <div className="w-full max-w-sm space-y-1.5">
+                    <div className="flex items-center justify-between text-[11px] font-mono text-muted">
+                      <span>Mic input level {stage === 'paused' ? '(paused)' : ''}</span>
+                      <span>{micLevelPct}%{captureModeLabel ? ` · ${captureModeLabel}` : ''}</span>
+                    </div>
+                    <div className="h-2.5 w-full overflow-hidden rounded-full bg-canvas border border-line">
+                      <div
+                        className={`h-full rounded-full transition-all duration-75 ${
+                          micLevelPct > 8 ? 'bg-emerald-400' : 'bg-amber-400/60'
+                        }`}
+                        style={{ width: `${Math.max(2, micLevelPct)}%` }}
+                      />
+                    </div>
+                  </div>
+                )}
                 {(sizeBytes > 0 || stage !== 'ready') && (
                   <div
                     className={`text-[11px] font-mono ${
@@ -813,13 +1292,33 @@ export const MLAssistPanel: React.FC<{
                 )}
               </div>
 
+              {stage === 'ready' && showTips && (
+                <div className="rounded-xl border border-primary/30 bg-primary/10 p-3.5 text-xs space-y-1.5">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="font-bold text-primary-dark">How VoxSOAP works (3 quick steps)</span>
+                    <button
+                      type="button"
+                      onClick={dismissTips}
+                      className="text-[11px] font-semibold text-muted hover:text-ink"
+                    >
+                      Got it ✕
+                    </button>
+                  </div>
+                  <ul className="list-disc pl-4 space-y-0.5 text-muted">
+                    <li><strong className="text-ink">1. Record or Upload:</strong> Check consent below, choose spoken language, then record or pick an audio file.</li>
+                    <li><strong className="text-ink">2. Review Transcript:</strong> Edit any words Whisper misheard, then click <em>Generate assistive SOAP draft</em> (~1–2 min).</li>
+                    <li><strong className="text-ink">3. Apply &amp; Confirm:</strong> Click <em>Apply Draft to SOAP Workspace</em> to review medications and sign off.</li>
+                  </ul>
+                </div>
+              )}
+
               <div className="flex flex-wrap items-center justify-center gap-2.5">
                 {stage === 'ready' && (
                   <button
                     type="button"
                     onClick={() => void startRecording()}
                     disabled={!consentChecked}
-                    className={`px-5 py-2 rounded-xl text-sm font-bold disabled:opacity-40 ${t.idleMic}`}
+                    className={`px-5 py-2.5 rounded-xl text-sm font-bold disabled:opacity-40 ${t.idleMic}`}
                   >
                     🎙️ Start Recording
                   </button>
@@ -829,10 +1328,28 @@ export const MLAssistPanel: React.FC<{
                     type="button"
                     onClick={pickUploadFile}
                     disabled={!consentChecked}
-                    className={`px-5 py-2 rounded-xl text-sm font-bold disabled:opacity-40 ${t.secondaryBtn}`}
-                    title="Decode an existing WAV/MP3/M4A/WebM/OGG file in-browser to 16 kHz mono PCM (client-side resample — the server never resamples), then transcribe with the local Whisper"
+                    className={`px-5 py-2.5 rounded-xl text-sm font-bold disabled:opacity-40 ${t.secondaryBtn}`}
+                    title="Decode an existing WAV/MP3/M4A/WebM/OGG file in-browser to 16 kHz mono PCM, then transcribe locally"
                   >
                     📁 Upload Audio File
+                  </button>
+                )}
+                {stage === 'ready' && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setConsentChecked(true);
+                      setTranscript(SAMPLE_LEO_TRANSCRIPT);
+                      setNotice({
+                        tone: 'info',
+                        text: 'Loaded sample consultation (Leo) — click "Generate assistive SOAP draft" to test local AI structuring.',
+                      });
+                      setStage('reviewTranscript');
+                    }}
+                    className={`px-4 py-2.5 rounded-xl text-xs font-semibold ${t.discardBtn}`}
+                    title="Load a sample veterinary consultation transcript to test SOAP drafting without audio"
+                  >
+                    ✨ Load Sample Transcript
                   </button>
                 )}
                 {stage === 'recording' && (
@@ -875,21 +1392,52 @@ export const MLAssistPanel: React.FC<{
               </div>
 
               {stage === 'ready' && (
-                <div className="flex flex-wrap items-center justify-center gap-2 text-[11px] text-muted">
-                  <label htmlFor="voxsoap-ml-language" className="font-semibold text-ink">
-                    Consultation language
-                  </label>
-                  <select
-                    id="voxsoap-ml-language"
-                    value={language}
-                    onChange={(e) => setLanguage(e.target.value as VoxSoapMLLanguage)}
-                    className="rounded-lg bg-canvas border border-line px-2 py-1 font-mono text-[11px] text-ink focus:outline-none"
-                  >
-                    <option value="ur">Urdu (ur) — default</option>
-                    <option value="en">English (en)</option>
-                    <option value="auto">Auto-detect</option>
-                  </select>
-                  <span className="text-[10px]">forwarded to POST /transcribe — anything else is an honest 400</span>
+                <div className="space-y-2.5">
+                  <div className="flex flex-wrap items-center justify-center gap-2 text-[11px] text-muted">
+                    <label htmlFor="voxsoap-ml-mic" className="font-semibold text-ink">
+                      Microphone
+                    </label>
+                    <select
+                      id="voxsoap-ml-mic"
+                      value={selectedMicId}
+                      onChange={(e) => setSelectedMicId(e.target.value)}
+                      className="max-w-xs rounded-lg bg-canvas border border-line px-2 py-1 font-mono text-[11px] text-ink focus:outline-none"
+                    >
+                      {audioInputs.length === 0 ? (
+                        <option value="">Default system microphone</option>
+                      ) : (
+                        audioInputs.map((dev, index) => (
+                          <option key={dev.deviceId || `mic-${index}`} value={dev.deviceId}>
+                            {dev.label || `Microphone ${index + 1}`}
+                          </option>
+                        ))
+                      )}
+                    </select>
+                    <button
+                      type="button"
+                      onClick={() => void refreshAudioDevices()}
+                      className="px-2 py-1 rounded-lg bg-sidebar border border-line text-[10px] font-semibold text-ink hover:bg-canvas"
+                      title="Refresh microphone list"
+                    >
+                      ↻ Refresh
+                    </button>
+                  </div>
+                  <div className="flex flex-wrap items-center justify-center gap-2 text-[11px] text-muted">
+                    <label htmlFor="voxsoap-ml-language" className="font-semibold text-ink">
+                      Consultation language
+                    </label>
+                    <select
+                      id="voxsoap-ml-language"
+                      value={language}
+                      onChange={(e) => updateLanguage(e.target.value as VoxSoapMLLanguage)}
+                      className="rounded-lg bg-canvas border border-line px-2 py-1 font-mono text-[11px] text-ink focus:outline-none"
+                    >
+                      <option value="ur">Urdu (ur)</option>
+                      <option value="en">English (en)</option>
+                      <option value="auto">Auto-detect</option>
+                    </select>
+                    <span className="text-[10px]">your language choice is remembered automatically</span>
+                  </div>
                 </div>
               )}
 
@@ -943,7 +1491,7 @@ export const MLAssistPanel: React.FC<{
                     type="button"
                     onClick={() => void postDraft()}
                     className="px-5 py-2 rounded-xl bg-primary hover:bg-primary-dark text-canvas text-sm font-bold"
-                    title="Draft inference runs locally — on CPU this typically takes 4–8 minutes on warm models and up to 15–18 minutes on a cold initial load; please keep this tab active"
+                    title="Starts an async local draft job (202 Accepted) — the panel polls in-memory status every 2 s, shows live tokens and can cancel within one token. No long-lived socket, no proxy 504."
                   >
                     ✨ Generate assistive SOAP draft
                   </button>
@@ -956,10 +1504,44 @@ export const MLAssistPanel: React.FC<{
                 </div>
               )}
               {stage === 'drafting' && (
-                <p className="text-xs text-muted">
-                  {statusLine} The envelope arrives when inference finishes; on timeout the honest
-                  failure is shown — no partial note is manufactured.
-                </p>
+                <div className="space-y-2 rounded-xl border border-line bg-sidebar p-3">
+                  <div className="text-[11px] font-mono font-semibold text-ink">{draftStageLabel}</div>
+                  <div className="h-2 w-full overflow-hidden rounded-full bg-canvas">
+                    <div
+                      className="h-full rounded-full bg-primary transition-[width] duration-500"
+                      style={{
+                        width: `${
+                          draftJob?.status === 'queued' || draftJob?.status === 'loading_model'
+                            ? 4
+                            : Math.max(4, draftProgressPct)
+                        }%`,
+                      }}
+                    />
+                  </div>
+                  <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] text-muted">
+                    <span className="font-mono">
+                      {draftJob
+                        ? `${draftJob.tokens_generated} / ${draftJob.max_new_tokens} tokens`
+                        : 'waiting for the worker'}{' '}
+                      · {elapsedLabel}
+                      {draftJob?.provider ? ` · provider ${draftJob.provider}` : ''}
+                      {draftJob?.serving_mode ? ` · ${draftJob.serving_mode}` : ''}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => void cancelDraftFromUi()}
+                      disabled={cancelling}
+                      className={`px-3 py-1.5 rounded-xl text-[11px] font-semibold disabled:opacity-40 ${t.discardBtn}`}
+                    >
+                      {cancelling ? 'Cancelling…' : '■ Cancel draft'}
+                    </button>
+                  </div>
+                  <p className="text-[11px] leading-relaxed text-muted">
+                    The submit is instant (202) and this panel polls in-memory status every{' '}
+                    {DRAFT_POLL_INTERVAL_MS / 1000} s. Cancel stops the worker within one token; no
+                    partial note is ever kept or manufactured.
+                  </p>
+                </div>
               )}
             </div>
           )}
@@ -989,7 +1571,7 @@ export const MLAssistPanel: React.FC<{
                 {onApplyDraft && (
                   <button
                     type="button"
-                    onClick={() => onApplyDraft(draft)}
+                    onClick={() => onApplyDraft(draft, transcript)}
                     className="px-5 py-2 rounded-xl bg-primary hover:bg-primary-dark text-canvas text-sm font-bold"
                     title="Apply THIS reviewed draft to the main workspace's four SOAP cards (Subjective / Objective / Assessment / Plan) — deterministic client-side vet-scribenote mapping. The note stays assistive and the visit stays a Draft until veterinary confirmation."
                   >
@@ -1045,6 +1627,21 @@ export const MLAssistPanel: React.FC<{
             </div>
           )}
 
+          {/* 16 kHz PCM WAV playback preview (available across ready/transcribe/review/error when clip captured or uploaded) */}
+          {audioPreviewUrl && stage !== 'forbidden' && stage !== 'checking' && stage !== 'recording' && stage !== 'paused' && (
+            <div className="p-3 rounded-xl border border-line bg-sidebar space-y-1.5">
+              <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] font-mono text-muted">
+                <span className="font-semibold text-ink">Captured 16 kHz Mono WAV Preview</span>
+                {wavSignal && (
+                  <span>
+                    {wavSignal.durationSeconds}s · {(wavSignal.byteSize / 1024).toFixed(1)} KB · peak {wavSignal.peak} · RMS {wavSignal.rms}
+                  </span>
+                )}
+              </div>
+              <audio controls src={audioPreviewUrl} className="w-full h-9" />
+            </div>
+          )}
+
           {/* Notice */}
           {notice && (
             <div
@@ -1083,22 +1680,18 @@ export const MLAssistPanel: React.FC<{
             </div>
           )}
 
-          {/* Footer honesty + unload */}
+          {/* Footer honesty */}
           {stage !== 'forbidden' && stage !== 'checking' && (
             <div className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-line">
-              <p className="text-[11px] leading-relaxed text-muted max-w-md">
-                Local-only ML scaffold: no cloud model is contacted from this panel, and a failing ML
-                call is a controlled error — never a Gemini replacement. Drafts are assistive; the
-                veterinary reviewer of record confirms the final note.
+              <p className="text-[11px] leading-relaxed text-muted max-w-xl">
+                Runs privately on your local machine — no cloud AI fallback. Drafts are assistive only; a veterinarian confirms the final clinical record.
               </p>
               <button
                 type="button"
-                onClick={() => void postUnload()}
-                disabled={working || stage === 'recording' || stage === 'paused' || stage === 'transcribing' || stage === 'drafting'}
-                className={`px-3 py-1.5 rounded-xl text-[11px] font-semibold disabled:opacity-40 ${t.secondaryBtn}`}
-                title="POST /unload — free the model RAM (the Windows RAM safeguard)"
+                onClick={() => setShowSystemDetails((prev) => !prev)}
+                className="text-[11px] font-semibold text-muted hover:text-ink underline underline-offset-2"
               >
-                ⏏ Unload models
+                {showSystemDetails ? 'Hide RAM / Model Controls' : 'RAM & Model Controls'}
               </button>
             </div>
           )}

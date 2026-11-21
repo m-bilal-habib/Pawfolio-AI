@@ -10,6 +10,8 @@
  */
 import type {
   VoxSoapMLCall,
+  VoxSoapMLDraftJobCall,
+  VoxSoapMLDraftJobSnapshot,
   VoxSoapMLEnvelope,
 } from './voxsoap-ml.types';
 
@@ -135,6 +137,111 @@ export function mlDraft(
     'draft',
     { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ transcript }) },
     staff
+  );
+}
+
+/** Async job routes are INSTANT by design: start validates + spawns a worker
+ * (202), status is a <10 ms in-memory read, cancel flips an Event. These
+ * budgets are deliberately short — a poll must never approach a proxy
+ * timeout, and no socket stays open for the CPU decode. */
+const START_CLIENT_TIMEOUT_MS = 35_000;
+const POLL_CLIENT_TIMEOUT_MS = 10_000;
+
+function toJobSnapshot(raw: string): VoxSoapMLDraftJobSnapshot | null {
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (
+      parsed &&
+      typeof parsed === 'object' &&
+      typeof (parsed as { job_id?: unknown }).job_id === 'string' &&
+      typeof (parsed as { status?: unknown }).status === 'string'
+    ) {
+      return parsed as VoxSoapMLDraftJobSnapshot;
+    }
+  } catch {
+    // fall through: the envelope carries the honest unparseable response
+  }
+  return null;
+}
+
+async function callJob(
+  path: string,
+  init: RequestInit,
+  staff: VoxSoapMLStaffHeaders,
+  timeoutMs: number
+): Promise<VoxSoapMLDraftJobCall> {
+  try {
+    const res = await fetch(`/api/voxsoap/${path}`, {
+      ...init,
+      headers: { ...init.headers, ...staffHeadersToInit(staff) },
+      cache: 'no-store',
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    const raw = await res.text();
+    return { status: res.status, job: toJobSnapshot(raw), envelope: toEnvelope(raw) };
+  } catch (err) {
+    return {
+      status: 0,
+      job: null,
+      envelope: {
+        ok: false,
+        error: 'transport_failure',
+        message:
+          err instanceof Error && err.name === 'TimeoutError'
+            ? 'The VoxSOAP ML proxy did not answer the draft-job request before the client budget elapsed.'
+            : 'The VoxSOAP ML proxy could not be reached from this page.',
+        serving_mode: null,
+        model_scale: 'UNKNOWN',
+        note: 'client-side transport error — nothing invented, nothing rerouted',
+      },
+    };
+  }
+}
+
+/** `POST /draft/start` → 202 `{job_id, status:"queued", ...}`. */
+export function mlDraftStart(
+  transcript: string,
+  staff: VoxSoapMLStaffHeaders
+): Promise<VoxSoapMLDraftJobCall> {
+  return callJob(
+    'draft/start',
+    {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ transcript, format: 'vet_scribenote' }),
+    },
+    staff,
+    START_CLIENT_TIMEOUT_MS
+  );
+}
+
+/** `GET /draft/status/<jobId>` — pure in-memory snapshot, poll every ~2 s. */
+export function mlDraftStatus(
+  jobId: string,
+  staff: VoxSoapMLStaffHeaders
+): Promise<VoxSoapMLDraftJobCall> {
+  return callJob(
+    `draft/status/${encodeURIComponent(jobId)}`,
+    { method: 'GET' },
+    staff,
+    POLL_CLIENT_TIMEOUT_MS
+  );
+}
+
+/** `POST /draft/cancel/<jobId>` — the worker stops within one token. */
+export function mlDraftCancel(
+  jobId: string,
+  staff: VoxSoapMLStaffHeaders
+): Promise<VoxSoapMLDraftJobCall> {
+  return callJob(
+    `draft/cancel/${encodeURIComponent(jobId)}`,
+    {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({}),
+    },
+    staff,
+    POLL_CLIENT_TIMEOUT_MS
   );
 }
 

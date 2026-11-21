@@ -19,9 +19,14 @@ const fuseCatalog = new Fuse<ReviewedDrugEntry>(CLINIC_REVIEWED_DRUG_CATALOG, {
   threshold: 0.45,
 });
 
+function normalizeAlphaNum(raw: string): string {
+  return raw.toLowerCase().replace(/[^a-z0-9]+/g, '');
+}
+
 function computeNormalizedSimilarity(a: string, b: string): number {
-  const s1 = a.toLowerCase().trim();
-  const s2 = b.toLowerCase().trim();
+  const s1 = normalizeAlphaNum(a);
+  const s2 = normalizeAlphaNum(b);
+  if (!s1 || !s2) return 0;
   if (s1 === s2) return 1.0;
 
   const matrix: number[][] = Array.from({ length: s1.length + 1 }, (_, i) => [i]);
@@ -38,7 +43,83 @@ function computeNormalizedSimilarity(a: string, b: string): number {
     }
   }
   const distance = matrix[s1.length][s2.length];
-  return Number((1 - distance / Math.max(s1.length, s2.length, 1)).toFixed(2));
+  return Number((1 - distance / Math.max(s1.length, s2.length, 1)).toFixed(3));
+}
+
+/** Double-Metaphone-inspired veterinary pharmacology phonetic encoder. */
+export function computeVetPhoneticKey(raw: string): string {
+  let s = normalizeAlphaNum(raw);
+  if (!s) return '';
+  const rules: Array<[RegExp, string]> = [
+    [/ph/g, 'f'],
+    [/kef/g, 'sef'],
+    [/cef/g, 'sef'],
+    [/c([iey])/g, 's$1'],
+    [/[cq]/g, 'k'],
+    [/x/g, 'ks'],
+    [/z/g, 's'],
+    [/y/g, 'i'],
+    [/wh/g, 'w'],
+    [/sh/g, 's'],
+    [/ch/g, 'k'],
+    [/th/g, 't'],
+    [/mycin/g, 'misin'],
+    [/myzin/g, 'misin'],
+    [/brizin/g, 'misin'],
+  ];
+  for (const [pattern, replacement] of rules) {
+    s = s.replace(pattern, replacement);
+  }
+  let deduped = '';
+  for (const ch of s) {
+    if (!deduped || deduped[deduped.length - 1] !== ch) deduped += ch;
+  }
+  if (deduped.length <= 2) return deduped;
+  return deduped[0] + deduped.slice(1).replace(/[aeiou]/g, '');
+}
+
+function computeCompositeDrugScore(spoken: string, candidate: string): number {
+  const s1 = normalizeAlphaNum(spoken);
+  const s2 = normalizeAlphaNum(candidate);
+  if (!s1 || !s2) return 0;
+  if (s1 === s2) return 1.0;
+
+  const lev = computeNormalizedSimilarity(s1, s2);
+  const phonSim = computeNormalizedSimilarity(
+    computeVetPhoneticKey(spoken),
+    computeVetPhoneticKey(candidate)
+  );
+  if (s1.length >= 5 && (s1.includes(s2) || s2.includes(s1))) {
+    return Number(Math.min(0.95, Math.max(lev, phonSim, 0.85)).toFixed(2));
+  }
+  return Number((0.58 * lev + 0.42 * phonSim).toFixed(2));
+}
+
+function detectAllergyConflict(
+  entry: ReviewedDrugEntry,
+  knownAllergies: string[]
+): string | null {
+  const classes = (entry.allergyClasses ?? []).map((c) => c.toLowerCase());
+  const ing = entry.activeIngredientClass.toLowerCase();
+  const canon = entry.canonicalName.toLowerCase();
+  for (const rawAllergy of knownAllergies) {
+    const allergy = rawAllergy.trim().toLowerCase();
+    if (!allergy) continue;
+    if (
+      ing.includes(allergy) ||
+      canon.includes(allergy) ||
+      classes.some((c) => c.includes(allergy) || allergy.includes(c))
+    ) {
+      return `Patient has a documented allergy (${rawAllergy}) conflicting with ${entry.activeIngredientClass}.`;
+    }
+    if (
+      (allergy.includes('chicken') || allergy.includes('beef') || allergy.includes('protein')) &&
+      entry.containsAnimalProtein
+    ) {
+      return `Patient has a documented food protein sensitivity (${rawAllergy}) that may conflict with flavored chewable/protein base in ${entry.canonicalName}.`;
+    }
+  }
+  return null;
 }
 
 export function formatObjectiveWithNullLabels(
@@ -71,10 +152,11 @@ export function crossVerifyWeight(
     return { status: 'MATCH', note: 'First recorded weight for patient.' };
   }
   const deltaRatio = Math.abs(extractedWeightKg - snapshot.lastRecordedWeightKg) / snapshot.lastRecordedWeightKg;
-  if (deltaRatio > 0.25) {
+  if (deltaRatio > 0.10) {
+    const pct = Math.round(deltaRatio * 100);
     return {
       status: 'NEEDS_REVIEW',
-      note: `Weight changed by >25% compared to prior record (${snapshot.lastRecordedWeightKg} kg -> ${extractedWeightKg} kg).`,
+      note: `Weight drifted by ${pct}% (>10% alert) compared to prior record (${snapshot.lastRecordedWeightKg} kg -> ${extractedWeightKg} kg).`,
     };
   }
   return {
@@ -98,39 +180,62 @@ export function validateExtractedMedicationOrders(
     let drugValidationStatus: ValidationBadge = 'UNKNOWN';
     let matchedCanonicalDrug: string | null = null;
     let similarityScore: number | null = null;
+    let confidenceTier: 'HIGH' | 'MEDIUM' | 'LOW' = 'LOW';
+    let suggestedPrompt: string | null = null;
     let allergyConflictDetected = false;
     let allergyConflictReason: string | null = null;
 
     if (order.medicine_name) {
       const spokenName = order.medicine_name.trim();
-      const exactEntry = CLINIC_REVIEWED_DRUG_CATALOG.find(
-        (entry) =>
-          entry.canonicalName.toLowerCase() === spokenName.toLowerCase() ||
-          entry.aliases.some((alias) => alias.toLowerCase() === spokenName.toLowerCase())
-      );
+      // Stage 1 + 2: Exact / Fuse fuzzy + phonetic composite evaluation across entire reviewed catalog
+      let bestEntry: ReviewedDrugEntry | null = null;
+      let bestScore = 0;
 
-      if (exactEntry) {
-        drugValidationStatus = 'MATCH';
-        matchedCanonicalDrug = exactEntry.canonicalName;
-        similarityScore = 1.0;
-        allergyConflictDetected = snapshot.knownAllergies.some((allergy) =>
-          exactEntry.activeIngredientClass.toLowerCase().includes(allergy.toLowerCase())
+      for (const entry of CLINIC_REVIEWED_DRUG_CATALOG) {
+        const score = Math.max(
+          computeCompositeDrugScore(spokenName, entry.canonicalName),
+          ...entry.aliases.map((alias) => computeCompositeDrugScore(spokenName, alias))
         );
-        if (allergyConflictDetected) {
-          allergyConflictReason = `Patient has a documented allergy conflicting with ${exactEntry.activeIngredientClass}.`;
-          drugValidationStatus = 'MISMATCH';
+        if (score > bestScore) {
+          bestScore = score;
+          bestEntry = entry;
         }
-      } else {
-        const fuzzyHits = fuseCatalog.search(spokenName);
-        if (fuzzyHits.length > 0) {
-          const topHit = fuzzyHits[0].item;
-          const bestAliasScore = Math.max(
-            computeNormalizedSimilarity(spokenName, topHit.canonicalName),
-            ...topHit.aliases.map((a) => computeNormalizedSimilarity(spokenName, a))
-          );
-          matchedCanonicalDrug = topHit.canonicalName;
-          similarityScore = bestAliasScore;
+      }
+
+      const fuseHits = fuseCatalog.search(spokenName);
+      if (fuseHits.length > 0) {
+        const fuseEntry = fuseHits[0].item;
+        const fuseComposite = Math.max(
+          computeCompositeDrugScore(spokenName, fuseEntry.canonicalName),
+          ...fuseEntry.aliases.map((alias) => computeCompositeDrugScore(spokenName, alias))
+        );
+        if (fuseComposite > bestScore) {
+          bestScore = fuseComposite;
+          bestEntry = fuseEntry;
+        }
+      }
+
+      if (bestEntry) {
+        similarityScore = Number(bestScore.toFixed(2));
+        allergyConflictReason = detectAllergyConflict(bestEntry, snapshot.knownAllergies);
+        allergyConflictDetected = Boolean(allergyConflictReason);
+
+        if (bestScore >= 0.80) {
+          confidenceTier = 'HIGH';
+          matchedCanonicalDrug = bestEntry.canonicalName;
+          drugValidationStatus = allergyConflictDetected ? 'MISMATCH' : 'MATCH';
+        } else if (bestScore >= 0.55) {
+          confidenceTier = 'MEDIUM';
+          matchedCanonicalDrug = bestEntry.canonicalName;
           drugValidationStatus = 'NEEDS_REVIEW';
+          suggestedPrompt = `Needs Confirmation — Did you mean ${bestEntry.canonicalName}?`;
+        } else {
+          confidenceTier = 'LOW';
+          matchedCanonicalDrug = null;
+          allergyConflictDetected = false;
+          allergyConflictReason = null;
+          drugValidationStatus = 'UNKNOWN';
+          suggestedPrompt = `[UNVERIFIED DRUG: "${spokenName}"] — do not substitute; manual clinician confirmation required.`;
         }
       }
     }
@@ -144,6 +249,8 @@ export function validateExtractedMedicationOrders(
         drugValidationStatus,
         matchedCanonicalDrug,
         similarityScore,
+        confidenceTier,
+        suggestedPrompt,
         allergyConflictDetected,
         allergyConflictReason,
         canConfirmOrder:

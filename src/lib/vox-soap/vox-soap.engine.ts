@@ -1187,6 +1187,12 @@ MANDATORY CLINICAL SAFETY & GROUNDING RULES:
     } catch {
       envelope = null;
     }
+    if (response.status === 409) {
+      const detail = (envelope?.message ?? envelope?.error ?? response.body).toString().slice(0, 240);
+      throw new Error(
+        `Local ML /draft is busy — another draft is already in flight on this machine (single-flight guard, HTTP 409). ${detail} Wait for it to finish or cancel it in the ML Assistive Draft panel, then retry. Nothing was invented and nothing was rerouted.`
+      );
+    }
     if (response.status < 200 || response.status >= 300 || !envelope || envelope.ok !== true) {
       const detail = (envelope?.message ?? envelope?.error ?? response.body).toString().slice(0, 240);
       throw new Error(

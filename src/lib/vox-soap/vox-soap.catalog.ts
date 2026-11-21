@@ -11,38 +11,118 @@ export interface ReviewedDrugEntry {
   aliases: string[];
   activeIngredientClass: string;
   defaultRoute: string;
+  allergyClasses?: string[];
+  containsAnimalProtein?: boolean;
 }
 
 export const CLINIC_REVIEWED_DRUG_CATALOG: ReviewedDrugEntry[] = [
   {
     canonicalName: 'Posatex Otic Suspension',
-    aliases: ['Posatex', 'Posatex ear drops', 'Posatex drops'],
+    aliases: ['Posatex', 'Posatex ear drops', 'Posatex drops', 'Orbifloxacin Mometasone Posaconazole'],
     activeIngredientClass: 'Orbifloxacin / Mometasone / Posaconazole',
     defaultRoute: 'otic (ear)',
+    allergyClasses: ['fluoroquinolone', 'steroid'],
   },
   {
     canonicalName: 'Epi-Otic Advanced Ear Cleaner',
-    aliases: ['Epi-Otic', 'daily ear cleaner', 'medicated ear cleaner'],
+    aliases: ['Epi-Otic', 'EpiOtic', 'daily ear cleaner', 'medicated ear cleaner'],
     activeIngredientClass: 'Salicylic Acid Otic Cleanser',
     defaultRoute: 'otic (ear)',
+    allergyClasses: ['salicylate'],
   },
   {
     canonicalName: 'Apoquel 16mg Chewable',
-    aliases: ['Apoquel', 'Apoquel 16mg', 'Oclacitinib'],
+    aliases: ['Apoquel', 'Apoquel 16mg', 'Apoquel 16 mg', 'Oclacitinib'],
     activeIngredientClass: 'JAK Inhibitor',
     defaultRoute: 'oral',
+    allergyClasses: ['jak inhibitor'],
+    containsAnimalProtein: true,
   },
   {
     canonicalName: 'Clavamox Drops / Tablets',
-    aliases: ['Clavamox', 'Amoxicillin-Clavulanate'],
+    aliases: ['Clavamox', 'Amoxicillin-Clavulanate', 'Amoxicillin Clavulanate', 'Augmentin'],
     activeIngredientClass: 'Penicillin / Beta-Lactam',
     defaultRoute: 'oral',
+    allergyClasses: ['penicillin', 'beta-lactam', 'amoxicillin'],
   },
   {
     canonicalName: 'Metacam Oral Suspension',
     aliases: ['Metacam', 'Meloxicam'],
-    activeIngredientClass: 'NSAID',
+    activeIngredientClass: 'NSAIDs / Meloxicam',
     defaultRoute: 'oral',
+    allergyClasses: ['nsaid', 'nsaids', 'meloxicam'],
+  },
+  {
+    canonicalName: 'Simplicef (Cefpodoxime Proxetil)',
+    aliases: ['Simplicef', 'Cefpodoxime', 'Cefpodoxime Proxetil'],
+    activeIngredientClass: 'Cephalosporin / Beta-Lactam Cross-Reactive',
+    defaultRoute: 'oral',
+    allergyClasses: ['cephalosporin', 'beta-lactam'],
+  },
+  {
+    canonicalName: 'Terramycin Ophthalmic Ointment',
+    aliases: ['Terramycin', 'Terramycin eye ointment', 'Oxytetracycline'],
+    activeIngredientClass: 'Tetracycline Ophthalmic',
+    defaultRoute: 'ophthalmic',
+    allergyClasses: ['tetracycline'],
+  },
+  {
+    canonicalName: 'Rimadyl (Carprofen)',
+    aliases: ['Rimadyl', 'Carprofen', 'Carprofen chewable'],
+    activeIngredientClass: 'NSAIDs / Carprofen',
+    defaultRoute: 'oral',
+    allergyClasses: ['nsaid', 'nsaids', 'carprofen'],
+    containsAnimalProtein: true,
+  },
+  {
+    canonicalName: 'Gabapentin',
+    aliases: ['Gabapentin', 'Neurontin'],
+    activeIngredientClass: 'Gabapentinoid Analgesic',
+    defaultRoute: 'oral',
+    allergyClasses: ['gabapentin'],
+  },
+  {
+    canonicalName: 'Semintra Oral Solution',
+    aliases: ['Semintra', 'Telmisartan'],
+    activeIngredientClass: 'Angiotensin Receptor Blocker',
+    defaultRoute: 'oral',
+    allergyClasses: ['arb', 'telmisartan'],
+  },
+  {
+    canonicalName: 'Revolution Plus',
+    aliases: ['Revolution Plus', 'Revolution', 'Selamectin', 'Sarolaner'],
+    activeIngredientClass: 'Isoxazoline / Avermectin Parasiticide',
+    defaultRoute: 'topical',
+    allergyClasses: ['isoxazoline', 'selamectin'],
+  },
+  {
+    canonicalName: 'Cerenia (Maropitant)',
+    aliases: ['Cerenia', 'Maropitant', 'Maropitant citrate'],
+    activeIngredientClass: 'NK-1 Receptor Antagonist Antiemetic',
+    defaultRoute: 'oral / subcutaneous',
+    allergyClasses: ['maropitant'],
+  },
+  {
+    canonicalName: 'Metronidazole',
+    aliases: ['Metronidazole', 'Flagyl'],
+    activeIngredientClass: 'Nitroimidazole Antibiotic',
+    defaultRoute: 'oral',
+    allergyClasses: ['metronidazole', 'nitroimidazole'],
+  },
+  {
+    canonicalName: 'FortiFlora Probiotic',
+    aliases: ['FortiFlora', 'Purina FortiFlora', 'Fortiflora probiotic'],
+    activeIngredientClass: 'Probiotic Supplement',
+    defaultRoute: 'oral (top-dressed)',
+    allergyClasses: [],
+    containsAnimalProtein: true,
+  },
+  {
+    canonicalName: 'Sulfadimethoxine (Albon)',
+    aliases: ['Sulfadimethoxine', 'Albon', 'TMS', 'Trimethoprim-Sulfa', 'Sulfa'],
+    activeIngredientClass: 'Sulfonamides',
+    defaultRoute: 'oral',
+    allergyClasses: ['sulfonamide', 'sulfonamides', 'sulfa'],
   },
 ];
 
@@ -63,6 +143,42 @@ const MOCK_PATIENT_SNAPSHOTS: Record<string, PatientSnapshotContext> = {
     lastRecordedWeightKg: 24.0,
     knownAllergies: ['Penicillin', 'Beta-Lactam'],
     activeMedications: [],
+  },
+  buddy: {
+    petId: 'buddy',
+    petName: 'Buddy',
+    species: 'canine',
+    ageYears: 4,
+    lastRecordedWeightKg: 28.4,
+    knownAllergies: ['Penicillin'],
+    activeMedications: ['Amoxicillin 500 mg', 'Ear drops'],
+  },
+  milo: {
+    petId: 'milo',
+    petName: 'Milo',
+    species: 'feline',
+    ageYears: 2,
+    lastRecordedWeightKg: 4.6,
+    knownAllergies: [],
+    activeMedications: [],
+  },
+  luna: {
+    petId: 'luna',
+    petName: 'Luna',
+    species: 'feline',
+    ageYears: 6,
+    lastRecordedWeightKg: 3.9,
+    knownAllergies: [],
+    activeMedications: ['Methimazole 2.5 mg'],
+  },
+  coco: {
+    petId: 'coco',
+    petName: 'Coco',
+    species: 'canine',
+    ageYears: 7,
+    lastRecordedWeightKg: 12.1,
+    knownAllergies: ['Chicken protein'],
+    activeMedications: ['Joint supplement'],
   },
 };
 

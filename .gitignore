@@ -89,6 +89,8 @@ ml-serving/artifacts/
 *.pt
 *.onnx
 *.ckpt
+*.gguf
+*.gguf.part
 __pycache__/
 *.pyc
 # Colab upload zips must live OUTSIDE ml-training (never committed; never re-zipped recursively)

@@ -620,3 +620,109 @@ no honesty was loosened anywhere; the 5-route contract is untouched.
 py_compile 0; pytest mocked `-m "not real"` **48 passed** (the 320-cap honest-400
 contract re-anchored); `tsc --noEmit` 0; **`npm run lint` 0**; probe
 `node --check` 0; drill-8a 11/11; warm drill-8b 11/11 @ 954.0 s.
+
+## 14. Quantized GGUF draft backend + async jobs (2026-11-19/20)
+
+Owner goal: a cold local draft must finish in **UNDER 3 MINUTES** with peak
+Python RSS **UNDER 3 GB** on the i5-6300U (2C/4T Skylake, no BF16/AVX-512,
+15.88 GB RAM). The bf16 torch path cannot meet that: measured cold LOAD alone
+was 472.6-1 132 s and full drafts 954.0-1 528.8 s. This batch changes the
+weight FORMAT and the REQUEST SHAPE; it does not change the clinical contract.
+
+### A. Backend: quantized GGUF on CPU, torch preserved
+
+1. **Engine**: `llama-cpp-python==0.3.36`, installed on the owner box from the
+   prebuilt `py3-none-win_amd64` release wheel (PyPI source builds need MSVC;
+   the CPU wheel index has no cp312 win_amd64 wheel for this version). Import
+   verified: `llama_cpp OK 0.3.36`. It stays OPTIONAL: `VOXSOAP_SOAP_BACKEND=auto`
+   uses it when importable; `=gguf` without it is an honest 503; `=torch`
+   keeps the old path; CUDA always resolves to torch.
+2. **Model**: Qwen2.5-3B-Instruct Q4_K_M GGUF (~1.93 GB). The owner network
+   throttled the HuggingFace CDN to ~0.03 MB/s with mid-stream drops, so
+   `scripts/fetch_gguf_blob.py` fetches the identical weights from the Ollama
+   registry (~0.8 MB/s) with HTTP-Range resume and SHA-256 verification.
+   `VOXSOAP_SOAP_GGUF_PATH` points the service at the verified file; the
+   HF-cache repo/file resolution remains as the default.
+3. **Contract preservation** (hard): the SAME `VET_SCRIBENOTE_SYSTEM_PROMPT`
+   and raw transcript are fed, greedy (`temperature=0`), through the SAME
+   deterministic pipeline — 23-parameter hydration in owner order, placeholder
+   collapse to "Not mentioned", verbatim-trace gate, `guards.py` annotations,
+   `sections{subjective, objective_map, objective_text, assessment, plan}`.
+   `format:"medscribe"` stays on the legacy PEFT/torch path ALWAYS.
+4. **Honest provenance**: `backend:"gguf"`, `gguf_model`, and
+   `model_scale="FULL-BASE-GGUF(<file>; quantized base weights; LoRA adapter
+   NOT applied)"` per draft. The adapter manifest label is never reused to
+   imply the GGUF equals the unquantized adapter. `/health` gains
+   `soap_backend{configured,effective,loaded,...}`; `model_scale["soap"]`
+   keeps its manifest label.
+5. **State hygiene**: `_loaded` keeps its exact `COMPONENT_KEYS` shape — GGUF
+   nests as `_loaded["soap"]={"backend":"gguf","llm":...}` so `/unload`,
+   `/health`, `describe()` and the deepcopy tests are untouched. `/unload`
+   drops the llama model and returns RAM.
+6. **Trace-gate true-data fix**: ASR spells vitals ("twenty-four point one
+   kilograms") while the model writes digits ("24.1 kg"); the literal gate
+   would DROP a true spoken value. `_vet_spoken_number_tokens` appends digit
+   renderings of spoken-number runs to the trace corpus ONLY — the note value
+   is never rewritten and an unspoken number ("24.5") still drops.
+
+### B. Async job API (202 + poll + cancel, single-flight)
+
+A multi-minute decode inside one proxy socket is structurally fragile (the
+2026-11-05/06 drills needed a 20-minute budget). The panel now uses jobs:
+
+| Route | Behavior |
+| --- | --- |
+| `POST /draft/start` | validate (empty/oversize transcript, cap range, format) then **202** `{job_id,status:"queued",max_new_tokens,model_scale,poll,cancel}` in ms; worker thread loads/generates |
+| `GET /draft/status/{job_id}` | pure in-memory snapshot **< 10 ms**; no disk reads (the scale label is cached at start); statuses `queued\|loading_model\|generating\|completed\|failed\|cancelled`, `tokens_generated`, `max_new_tokens` (the cap actually applied), `elapsed_s`, `cancel_requested`, full `/draft` envelope in `result` on completion |
+| `POST /draft/cancel/{job_id}` | sets the per-token `threading.Event`; the GGUF loop checks every streamed chunk and raises `DraftCancelled`; torch uses a `StoppingCriteria`; terminal status `cancelled` with NO partial note |
+
+- **Single-flight**: one shared lock; concurrent `start` (and the synchronous
+  `POST /draft`) answer an honest **409 `draft_busy`** with the active job id —
+  two 3B decodes on 2 cores would page-thrash the box.
+- **No zombie threads**: worker always releases the slot in `finally`; cancel
+  is checked before the first token too.
+- **Restart semantics**: jobs live in the serving process only; a restart
+  clears them (documented in every response's `note` and the panel).
+- The synchronous `POST /draft` remains fully supported under the same lock.
+
+### C. Proxy + panel
+
+- New static proxy routes (they win over the `[route]` dynamic segment):
+  `/api/voxsoap/draft/start`, `/draft/status/[jobId]`, `/draft/cancel/[jobId]`,
+  all on the shared `_lib/voxsoap-proxy.ts` transport (node:http, no hidden
+  300 s cap), FR-6 receptionist **403**, and the same controlled 502/504
+  envelopes. The existing `[route]` was refactored onto the same helper with
+  byte-identical behavior (health/transcribe/draft/roman/unload intact).
+- Panel: start → poll every 2 s → live stage text ("Loading local veterinary
+  SOAP model…", "Generating SOAP note … N / M tokens · M:SS") + progress bar
+  + working **Cancel**; auto-cancel on ✕ / modal close / unmount / reset;
+  completed job opens the SAME reviewDraft view (4 SOAP sections + backend
+  badge + "📋 Apply Draft to SOAP Workspace"). A late poll response can never
+  resurrect a cancelled/closed job (job-id ref ownership check).
+- Client budgets: start 45 s, status/cancel 20 s (all instant by design);
+  proxy budgets 30 s / 15 s / 15 s. The legacy 20-minute sync budget remains
+  only for the legacy sync route.
+
+### D. Measured on the owner box (2026-11-20, Intel i5-6300U 2C/4T, 15.88 GB RAM)
+
+All rows run the identical 2 934-char 5-minute Leo consultation transcript (`ml-serving/tests/fixtures/leo_consult_5min.txt`, `VOXSOAP_DEVICE=cpu`, `n_ctx=4096`):
+
+| Model | Threads / Batch / Cap | Cold load | Generate | Cold total | tok/s | TTFT | Peak RSS | 23/23 | Sections & clinical facts |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| PyTorch BF16 3B (baseline §13) | 3T / — / 320 | 472.6 s | ~1 056 s | **1 528.8 s** | ~0.3 | — | ~6 300 MB | 23/23 | Timed out at 1 200 s proxy budget |
+| GGUF 3B Q4_K_M (initial `n_batch=512`) | 3T / 512 / 320 | 5.08 s | 150.53 s | 155.61 s | 2.13 | 70.4 s | 3 441 MB | 23/23 | Truncated at Pain Score (320 cap); Ears/Assessment/Plan cut off |
+| GGUF 3B Q4_K_M (`n_batch=128`, 512 cap) | 3T / 128 / 512 | 4.67 s | 222.16 s | 226.84 s | 2.31 | 74.9 s | 3 367 MB | 23/23 | 18/23 objective params (Weight 24.1, Ears, GI, MSK, Integ); Plan truncated at 512 |
+| **GGUF 1.5B Q4_K_M (SELECTED DEFAULT)** | **3T / 128 / 512** | **3.67 s** | **104.33 s** | **108.01 s** | **4.86** | **34.1 s** | **1 760 MB** | **23/23** | **All 4 sections COMPLETE naturally (507/512 tok)**: Subjective + 23-param Objective (Weight 24.1 kg, Temp 38.9°C, HR 120 bpm, RR 28, CRT, MM, Hydration, BCS 4/9) + Assessment + full 6-bullet Plan; **0 unsupported numbers, 0 unsupported med tokens** |
+
+**Why `qwen2.5-1.5b-instruct-q4_k_m.gguf` (with `draft_max_new_tokens=512`) is the default on this machine:**
+- Meets BOTH hard owner targets with huge margin: **108.0 s (< 3 min)** cold total (14× faster than PyTorch BF16!) and **1.76 GB peak RSS (< 3 GB)** (zero Windows paging).
+- Completes ALL FOUR Scribenote sections (**Subjective, Objective, Assessment, Plan**) cleanly without hitting the token cap.
+- Local `ml-serving/models/<filename>` auto-discovery (`providers.py::_resolve_gguf_model_path`) picks up the pre-fetched file automatically with zero HuggingFace CDN stalls; `qwen2.5-3b-instruct-q4_k_m.gguf` remains pre-downloaded in `ml-serving/models/` as a one-line env swap (`VOXSOAP_SOAP_GGUF_FILE=qwen2.5-3b-instruct-q4_k_m.gguf`) for faster CPUs.
+- `spoken_numbers.py` fixed sentence-ending periods (`"five."` → `"1.035"`) and `"three-and-a-half"` → `"3.5"`, eliminating false-positive guard flags while keeping true unsupported numbers caught.
+
+### E. Gates
+
+- `py_compile`: 0 errors across all `ml-serving/*.py`.
+- Mocked pytest suite (`pytest ml-serving/tests -m "not real"`): **65 passed** (4 real-marker deselected), including async jobs, cancel, 409 single-flight, GGUF routing/auto-discovery, markdown heading strip, and spoken-number half/period normalization.
+- `npx tsc --noEmit`: 0 errors; `npm run lint`: 0 errors.
+- Live E2E proxy drill (`probe_e2e_async.mjs` through Next.js `:3000/api/voxsoap/*` → FastAPI `:8321`): **18/18 ALL PASSED** — `/health` 200 (`effective: "gguf"`, `qwen2.5-1.5b-instruct-q4_k_m.gguf`), FR-6 receptionist 403, `POST /draft/start` 202 in **125 ms**, concurrent `409 draft_busy`, cold 5-min Leo consult completed naturally at **507/512 tokens in 126.44 s** (ZERO 504; Subjective 562 chars, Objective 23/23 exact order with Weight 24.1 kg, Assessment 2 bullets, Plan 10 bullets, `complete_schema=true`, `unsupported_numbers=[]`, `unsupported_med_tokens=[]`), live `POST /draft/cancel` reached `cancelled` in **0.7 s** (zero zombie thread), and `POST /unload` dropped `python.exe` RSS back to **202.6 MB**.

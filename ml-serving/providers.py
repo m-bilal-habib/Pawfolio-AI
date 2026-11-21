@@ -34,7 +34,14 @@ import json
 import re
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
+
+from spoken_numbers import spoken_number_tokens
+from vet_glossary import (
+    build_whisper_initial_prompt,
+    clean_asr_transcript,
+    resolve_drug_name,
+)
 
 # Kept in byte-for-byte sync with train_transliteration_lora.py and
 # evaluate_transliteration.py (the EXACT same prefix must be used in serving).
@@ -177,40 +184,28 @@ def _vet_value_traced(value: str, transcript_norm: str) -> bool:
     return all(token in transcript_norm for token in tokens)
 
 
+def _vet_spoken_number_tokens(text: str) -> List[str]:
+    """Digit renderings of every spoken-number run in `text` (trace corpus).
+
+    Thin alias kept for the tests and call sites; the implementation is
+    shared with guards.py via spoken_numbers.py (2026-11-20).
+    """
+    return spoken_number_tokens(text)
+
+
 VET_SCRIBENOTE_SYSTEM_PROMPT = (
-    "You are a veterinary medical scribe. From the consultation transcript, "
-    "write a clinical note using EXACTLY these four headings, each on its own "
-    "line, in this order:\n"
-    "SUBJECTIVE:\n"
-    "OBJECTIVE_MENTIONED:\n"
-    "ASSESSMENT:\n"
-    "PLAN:\n"
-    "SUBJECTIVE: one detailed third-person clinical history paragraph "
-    "covering the patient's signalment (species, age), the presenting "
-    "complaint, its duration, the observed clinical signs, recent "
-    "grooming/bathing/exposures, and past medical history with prior "
-    "medications.\n"
-    "OBJECTIVE_MENTIONED: only the physical-exam or vital parameters the "
-    "transcript EXPLICITLY states, one per line as 'Name: value'. Use these "
-    "canonical names exactly when stated: Temperature, Heart Rate, Weight, "
-    "Respiratory Rate, Capillary Refill Time, Mucous Membranes, Hydration "
-    "Status, Body Condition Score, Pain Score, Fear Anxiety Stress Score, "
-    "Eyes, Ears, Nasal, Oral/Dental, Cardiovascular, Respiratory, "
-    "Neurological, Musculoskeletal, Lymphatic, Gastrointestinal, "
-    "Reproductive/Urinary, Integument, Masses. A line may be written ONLY "
-    "when the transcript literally provides that value; copy the spoken "
-    "value verbatim (never paraphrase or estimate numbers). OMIT every "
-    "parameter the transcript does not state, and FORBIDDEN placeholders: "
-    "never write 'Not examined', 'Normal', 'WNL', 'N/A', 'unremarkable', "
-    "'not noted' or 'unspecified' for an omitted parameter — the line must "
-    "not exist at all. NEVER write your own 'Not mentioned'.\n"
-    "ASSESSMENT: a bulleted list ('- ') of diagnoses or findings, suspected "
-    "causes, and preventative/vaccination status.\n"
-    "PLAN: a bulleted list ('- ') of treatments or vaccines administered "
-    "today, prescribed medications with exact dose, route, frequency and "
-    "duration, and any recheck instructions.\n"
-    "Rules: write in the third person; never invent findings or values "
-    "absent from the transcript; keep the four headings exactly as written."
+    "You are a veterinary medical scribe. Output ONE COMPACT minified single-line JSON object ONLY "
+    "(no markdown, no indentation, omit null or empty fields/arrays) strictly grounded in the transcript.\n"
+    "Schema:\n"
+    '{"subjective":{"clinical_summary":"Concise 3rd-person history preserving negations verbatim (e.g. no vomiting, normal appetite — NEVER invert polarity)","appetite":"...","water_intake":"...","vomiting_diarrhea":"...","duration":"...","known_allergies":"..."},'
+    '"objective":{"Weight":"...","Temperature":"..."},'
+    '"assessment":["short diagnosis/differential/vaccination bullet ONLY — do NOT put medications here"],'
+    '"plan":{"medications":[{"spoken_name":"COPY EXACT spoken drug name verbatim — NEVER substitute or invent another drug","dose":"...","route":"...","frequency":"...","duration":"..."}],'
+    '"vaccines_administered":["..."],"diagnostics":["..."],"procedures":["..."],"home_care":["..."],"follow_up":"..."}}\n'
+    "RULES:\n"
+    "1. SPARSE OBJECTIVE ONLY: include ONLY canonical keys EXPLICITLY measured or examined: Temperature, Heart Rate, Weight, Respiratory Rate, Capillary Refill Time, Mucous Membranes, Hydration Status, Body Condition Score, Pain Score, Fear Anxiety Stress Score, Eyes, Ears, Nasal, Oral/Dental, Cardiovascular, Respiratory, Neurological, Musculoskeletal, Lymphatic, Gastrointestinal, Reproductive/Urinary, Integument, Masses.\n"
+    "2. NEVER emit 'Not mentioned', 'Not examined', 'Normal', 'WNL', or 'N/A'; OMIT unexamined or explicitly skipped vitals (e.g. skipped temperature).\n"
+    "3. Capture EVERY spoken exam system finding (Cardiovascular, Respiratory, Gastrointestinal, Lymphatic, etc.) concisely using words/numbers from the transcript, preserve negations, and keep output compact."
 )
 
 # Case/punctuation-insensitive matching for model-emitted objective keys.
@@ -304,10 +299,11 @@ def _vet_split_sections(raw: str) -> Dict[str, str]:
         # A header colon (or a bare heading word) switches sections; a value
         # line such as "Temperature: 102.5" normalizes to "temperature" which
         # is NOT in the header set, so it cannot be confused with a heading.
-        if bucket and (sep == ":" or not rest):
+        if bucket and (sep == ":" or not rest.strip(" *#\t")):
             current = bucket
-            if rest.strip():
-                buckets[current].append(rest.strip())
+            cleaned_rest = rest.strip(" *#\t")
+            if cleaned_rest:
+                buckets[current].append(cleaned_rest)
             continue
         if current is not None:
             buckets[current].append(stripped)
@@ -363,38 +359,337 @@ def _vet_normalize_bullets(text: str) -> str:
     return "\n".join(bullets)
 
 
-def _vet_hydrated_story(
-    raw_text: str, transcript: Optional[str] = None
-) -> Tuple[str, Dict[str, str], int, int]:
-    """Build the hydrated (draft_text, sections, unknown, drops) tuple.
+_SKIP_VERB_RE = (
+    r"(?:skip(?:ped)?|omit(?:ted)?|defer(?:red)?|unable\s+to\s+(?:check|get|take|obtain)|"
+    r"did(?:n't|\s+not)\s+(?:take|check|get|measure|obtain|perform)|"
+    r"no\s+(?:rectal\s+)?(?:temp|weight|exam))"
+)
+_VITAL_SKIP_PATTERNS: Dict[str, Tuple[str, ...]] = {
+    "Temperature": ("temperature", "temp", "rectal temp"),
+    "Weight": ("weight", "weigh"),
+    "Heart Rate": ("heart rate", "pulse", "hr"),
+    "Respiratory Rate": ("respiratory rate", "resp rate", "rr"),
+    "Capillary Refill Time": ("capillary refill", "crt"),
+    "Oral/Dental": ("oral", "dental", "mouth", "teeth"),
+    "Ears": ("ears", "ear exam", "otoscopy"),
+    "Eyes": ("eyes", "ocular", "ophthalmic"),
+}
 
-    `transcript` (the ORIGINAL consultation transcript, available in the
-    serving draft path) enables the deterministic value-trace gate: a stated
-    value with no verbatim token trace in the transcript is dropped to
-    "Not mentioned" (counted in `drops`). Passing None keeps the gate inert
-    for pure unit calls — the placeholder collapse still applies.
-    """
-    buckets = _vet_split_sections(raw_text)
-    objective_values, unknown = _vet_parse_objective(buckets["objective"])
-    # Deterministic hydration: missing -> "Not mentioned" AND a bare model
-    # placeholder ("Normal", "WNL", "not examined", ...) ALSO collapses to
-    # "Not mentioned" — the canonical fill is the ONLY "not documented"
-    # representation in the note, so the Andre-VetNote renderer and the
-    # frontend null-mapping never see a fake data value. The trace gate then
-    # drops model-invented VALUES (e.g. "pink and moist" vitals) that have no
-    # verbatim trace in the consultation transcript — mirrored from the
-    # frontend FR-27 rule (untraceable claims are dropped, never rewritten).
+
+def _vet_is_skipped_vital(param: str, transcript: Optional[str]) -> bool:
+    """Return True when the transcript explicitly states a vital/exam was skipped."""
+    if not transcript:
+        return False
+    aliases = _VITAL_SKIP_PATTERNS.get(param)
+    if not aliases:
+        aliases = (param.lower(),)
+    lower = transcript.lower()
+    for alias in aliases:
+        esc = re.escape(alias)
+        if re.search(rf"\b{_SKIP_VERB_RE}\b[^.\n]{{0,24}}\b{esc}\b", lower):
+            return True
+        if re.search(rf"\b{esc}\b[^.\n]{{0,24}}\b(?:was\s+)?(?:skipped|omitted|deferred|not\s+(?:taken|performed|done|checked|measured))\b", lower):
+            return True
+    return False
+
+
+def _vet_try_parse_json(raw_text: str) -> Optional[Dict[str, Any]]:
+    """Parse sparse JSON output cleanly (tolerating ```json fences and mid-token truncation)."""
+    stripped = (raw_text or "").strip()
+    if stripped.startswith("```"):
+        stripped = re.sub(r"^```(?:json)?\s*", "", stripped, flags=re.IGNORECASE)
+        stripped = re.sub(r"\s*```$", "", stripped)
+        stripped = stripped.strip()
+    start_idx = stripped.find("{")
+    if start_idx < 0:
+        return None
+    stripped = stripped[start_idx:]
+    try:
+        parsed = json.loads(stripped)
+        return parsed if isinstance(parsed, dict) else None
+    except ValueError:
+        pass
+
+    # Deterministic truncation recovery: trim incomplete trailing field back to clean commas/closes
+    # outside of JSON string literals, then close remaining open '[' / '{' in reverse stack order.
+    cut_points: List[int] = [len(stripped)]
+    in_str = False
+    esc = False
+    for idx, ch in enumerate(stripped):
+        if esc:
+            esc = False
+            continue
+        if ch == "\\" and in_str:
+            esc = True
+            continue
+        if ch == '"':
+            in_str = not in_str
+        elif not in_str and ch in (",", "}", "]"):
+            cut_points.append(idx if ch == "," else idx + 1)
+
+    for end in reversed(cut_points):
+        sub = stripped[:end].rstrip().rstrip(",")
+        if not sub:
+            continue
+        stack: List[str] = []
+        s_in = False
+        s_esc = False
+        for ch in sub:
+            if s_esc:
+                s_esc = False
+                continue
+            if ch == "\\" and s_in:
+                s_esc = True
+                continue
+            if ch == '"':
+                s_in = not s_in
+            elif not s_in:
+                if ch == "{":
+                    stack.append("}")
+                elif ch == "[":
+                    stack.append("]")
+                elif ch in ("}", "]") and stack and stack[-1] == ch:
+                    stack.pop()
+        if s_in:
+            continue
+        repaired = sub + "".join(reversed(stack))
+        try:
+            parsed = json.loads(repaired)
+            if isinstance(parsed, dict):
+                return parsed
+        except ValueError:
+            continue
+    return None
+
+
+def _vet_format_subjective(subj: Any) -> str:
+    if isinstance(subj, str):
+        return subj.strip()
+    if not isinstance(subj, dict):
+        return ""
+    parts: List[str] = []
+    summary = str(subj.get("clinical_summary") or subj.get("summary") or "").strip()
+    if summary:
+        parts.append(summary)
+    extras: List[str] = []
+    for key, label in (
+        ("duration", "Duration"),
+        ("appetite", "Appetite"),
+        ("water_intake", "Water intake"),
+        ("vomiting_diarrhea", "GI (vomiting/diarrhea)"),
+        ("known_allergies", "Known allergies"),
+    ):
+        val = subj.get(key)
+        if isinstance(val, str) and val.strip() and val.strip().lower() not in ("null", "none", "n/a"):
+            clean_val = val.strip()
+            if clean_val.lower() not in summary.lower():
+                extras.append(f"{label}: {clean_val}")
+    if extras:
+        parts.append("; ".join(extras) + ".")
+    return " ".join(parts).strip()
+
+
+def _vet_hydrate_from_parsed_json(
+    data: Dict[str, Any], transcript: Optional[str] = None
+) -> Tuple[str, Dict[str, str], int, int, Dict[str, Any]]:
+    """Hydrate sparse JSON LLM output into the exact 23-param contract + drug annotations."""
+    subjective_text = _vet_format_subjective(data.get("subjective"))
+
+    # Objective: sparse dict -> canonical mapping + skipped-vital guard + trace gate
+    raw_obj = data.get("objective")
+    objective_values: Dict[str, str] = {}
+    unknown = 0
+    if isinstance(raw_obj, dict):
+        for raw_key, raw_val in raw_obj.items():
+            if raw_val is None:
+                continue
+            val_str = str(raw_val).strip() if not isinstance(raw_val, list) else ", ".join(str(x) for x in raw_val if x)
+            if not val_str:
+                continue
+            canonical = _CANONICAL_KEY_LOOKUP.get(_vet_normalize_key(str(raw_key)))
+            if canonical:
+                objective_values[canonical] = val_str
+            else:
+                unknown += 1
+
     transcript_norm = _vet_norm_trace(transcript) if transcript else ""
+    if transcript_norm:
+        spoken_numbers = _vet_spoken_number_tokens(transcript)
+        if spoken_numbers:
+            transcript_norm = f"{transcript_norm} {' '.join(spoken_numbers)}".strip()
+
     objective_map: Dict[str, str] = {}
     drops = 0
     for name in VET_OBJECTIVE_PARAMS:
+        if _vet_is_skipped_vital(name, transcript):
+            objective_map[name] = VET_NOT_MENTIONED
+            continue
+        value = _vet_value_or_not_mentioned(objective_values.get(name) or "")
+        if transcript and value != VET_NOT_MENTIONED and not _vet_value_traced(value, transcript_norm):
+            value = VET_NOT_MENTIONED
+            drops += 1
+        objective_map[name] = value
+
+    # Assessment bullets
+    raw_assess = data.get("assessment")
+    assess_lines: List[str] = []
+    if isinstance(raw_assess, list):
+        assess_lines = [str(item).strip() for item in raw_assess if str(item or "").strip()]
+    elif isinstance(raw_assess, str) and raw_assess.strip():
+        assess_lines = [line.strip() for line in raw_assess.splitlines() if line.strip()]
+    assessment_text = _vet_normalize_bullets("\n".join(assess_lines)) if assess_lines else "- Review pending clinician assessment."
+
+    # Plan bullets + structured plan + deterministic 2-stage drug matching
+    raw_plan = data.get("plan")
+    plan_lines: List[str] = []
+    drug_matches: List[Dict[str, Any]] = []
+    plan_structured: Dict[str, Any] = {
+        "medications": [],
+        "vaccines_administered": [],
+        "diagnostics": [],
+        "procedures": [],
+        "home_care": [],
+        "follow_up": None,
+    }
+    def _append_med_dict(med: Dict[str, Any]) -> None:
+        spoken = str(med.get("spoken_name") or med.get("medicine_name") or med.get("name") or "").strip()
+        if not spoken:
+            return
+        match_info = resolve_drug_name(spoken)
+        drug_matches.append(match_info)
+        plan_structured["medications"].append({**med, "match": match_info})
+        parts = [
+            str(med.get(k)).strip()
+            for k in ("dose", "route", "frequency")
+            if med.get(k) and str(med.get(k)).strip().lower() not in ("null", "none")
+        ]
+        dur = str(med.get("duration") or "").strip()
+        if dur and dur.lower() not in ("null", "none"):
+            parts.append(f"for {dur}")
+        instr = str(med.get("instructions") or "").strip()
+        if instr and instr.lower() not in ("null", "none"):
+            parts.append(f"({instr})")
+        detail = ", ".join(parts) if parts else "details not fully specified"
+        if match_info["status"] == "UNKNOWN":
+            plan_lines.append(f'[UNVERIFIED DRUG: "{spoken}"]: {detail}')
+        elif match_info["status"] == "NEEDS_REVIEW":
+            plan_lines.append(f"{spoken} [{match_info['prompt_text']}]: {detail}")
+        else:
+            canonical_note = (
+                f" (matched: {match_info['matched_canonical']})"
+                if match_info["matched_canonical"]
+                and match_info["matched_canonical"].lower() != spoken.lower()
+                else ""
+            )
+            plan_lines.append(f"{spoken}{canonical_note}: {detail}")
+
+    if isinstance(raw_plan, dict):
+        vaccines = [str(v).strip() for v in (raw_plan.get("vaccines_administered") or []) if str(v or "").strip()]
+        plan_structured["vaccines_administered"] = vaccines
+        if vaccines:
+            plan_lines.append(f"Administered vaccines today: {', '.join(vaccines)}")
+
+        meds = raw_plan.get("medications") or []
+        if isinstance(meds, list):
+            for med in meds:
+                if isinstance(med, dict):
+                    _append_med_dict(med)
+                elif isinstance(med, str) and med.strip():
+                    plan_lines.append(med.strip())
+
+        for key, prefix in (
+            ("diagnostics", "Diagnostic ordered"),
+            ("procedures", "Procedure performed"),
+            ("home_care", "Home care"),
+        ):
+            raw_items = raw_plan.get(key) or []
+            clean_items: List[str] = []
+            for item in raw_items:
+                if isinstance(item, dict):
+                    _append_med_dict(item)
+                elif str(item or "").strip():
+                    s_item = str(item).strip()
+                    clean_items.append(s_item)
+                    plan_lines.append(f"{prefix}: {s_item}")
+            plan_structured[key] = clean_items
+
+        fu = raw_plan.get("follow_up")
+        if isinstance(fu, str) and fu.strip() and fu.strip().lower() not in ("null", "none"):
+            plan_structured["follow_up"] = fu.strip()
+            plan_lines.append(f"Follow-up / recheck: {fu.strip()}")
+    elif isinstance(raw_plan, list):
+        for item in raw_plan:
+            if isinstance(item, dict):
+                _append_med_dict(item)
+            elif str(item or "").strip():
+                plan_lines.append(str(item).strip())
+    elif isinstance(raw_plan, str) and raw_plan.strip():
+        plan_lines = [line.strip() for line in raw_plan.splitlines() if line.strip()]
+
+    plan_text = _vet_normalize_bullets("\n".join(plan_lines)) if plan_lines else "- Recheck and clinician review."
+
+    objective_text = "\n".join(f"{name}: {value}" for name, value in objective_map.items())
+    sections: Dict[str, Any] = {
+        "subjective": subjective_text,
+        "objective_map": objective_map,
+        "objective_text": objective_text,
+        "assessment": assessment_text,
+        "plan": plan_text,
+    }
+    draft_text = (
+        "SUBJECTIVE:\n"
+        f"{sections['subjective']}\n\n"
+        "OBJECTIVE_MENTIONED:\n"
+        f"{objective_text}\n\n"
+        "ASSESSMENT:\n"
+        f"{sections['assessment']}\n\n"
+        "PLAN:\n"
+        f"{sections['plan']}"
+    )
+    meta = {
+        "drug_matches": drug_matches,
+        "plan_structured": plan_structured,
+        "subjective_details": data.get("subjective") if isinstance(data.get("subjective"), dict) else None,
+        "json_mode": True,
+    }
+    return draft_text, sections, unknown, drops, meta
+
+
+def _vet_hydrated_story(
+    raw_text: str, transcript: Optional[str] = None
+) -> Tuple[str, Dict[str, Any], int, int]:
+    """Build the hydrated (draft_text, sections, unknown, drops) tuple.
+
+    Supports both the new sparse JSON extraction output and the legacy
+    SUBJECTIVE/OBJECTIVE_MENTIONED/ASSESSMENT/PLAN text format cleanly.
+    """
+    parsed_json = _vet_try_parse_json(raw_text)
+    if parsed_json is not None:
+        draft_text, sections, unknown, drops, _ = _vet_hydrate_from_parsed_json(
+            parsed_json, transcript=transcript
+        )
+        return draft_text, sections, unknown, drops
+
+    buckets = _vet_split_sections(raw_text)
+    objective_values, unknown = _vet_parse_objective(buckets["objective"])
+    transcript_norm = _vet_norm_trace(transcript) if transcript else ""
+    if transcript_norm:
+        spoken_numbers = _vet_spoken_number_tokens(transcript)
+        if spoken_numbers:
+            transcript_norm = f"{transcript_norm} {' '.join(spoken_numbers)}".strip()
+    objective_map: Dict[str, str] = {}
+    drops = 0
+    for name in VET_OBJECTIVE_PARAMS:
+        if _vet_is_skipped_vital(name, transcript):
+            objective_map[name] = VET_NOT_MENTIONED
+            continue
         value = _vet_value_or_not_mentioned(objective_values.get(name) or "")
         if transcript and value != VET_NOT_MENTIONED and not _vet_value_traced(value, transcript_norm):
             value = VET_NOT_MENTIONED
             drops += 1
         objective_map[name] = value
     objective_text = "\n".join(f"{name}: {value}" for name, value in objective_map.items())
-    sections: Dict[str, str] = {
+    sections: Dict[str, Any] = {
         "subjective": buckets["subjective"],
         "objective_map": objective_map,
         "objective_text": objective_text,
@@ -480,6 +775,23 @@ class CompatibilityError(ProviderError):
     code = "adapter_compatibility_error"
 
 
+class DraftBusy(ProviderError):
+    """Single-flight guard: one draft at a time (avoids OOM/thrash stacking)."""
+
+    status_code = 409
+    code = "draft_busy"
+
+
+class DraftCancelled(Exception):
+    """Operator-cancelled draft. Raised from the decode loop within 1 token so
+    the worker thread exits (no zombie CPU burn) - never a ProviderError, the
+    async job manager maps it to status="cancelled"."""
+
+    def __init__(self, message: str = "draft cancelled"):
+        super().__init__(message)
+        self.message = message
+
+
 def manifest_read(adapter_dir: Optional[Path]) -> Optional[Dict[str, Any]]:
     """Read a training manifest. None when absent, marker-dict when corrupt.
 
@@ -553,13 +865,19 @@ class MLProvider:
             },
         }
         self._loaded: Dict[str, Optional[Dict[str, Any]]] = {k: None for k in COMPONENT_KEYS}
+        self._scale_cache: Dict[str, Tuple[str, str]] = {}
 
     # ---------- introspection (no heavy imports; safe for /health) ----------
 
     def scale_for(self, key: str) -> Tuple[str, str]:
         if key not in self.components:
             raise UnknownProvider(f"unknown component {key!r}")
-        return resolve_scale(manifest_read(self.components[key]["adapter_dir"]))
+        cached = self._scale_cache.get(key)
+        if cached is not None:
+            return cached
+        resolved = resolve_scale(manifest_read(self.components[key]["adapter_dir"]))
+        self._scale_cache[key] = resolved
+        return resolved
 
     def describe(self) -> Dict[str, Dict[str, Any]]:
         out: Dict[str, Dict[str, Any]] = {}
@@ -572,6 +890,7 @@ class MLProvider:
                         and (Path(adapter_dir) / "adapter_model.safetensors").is_file():
                     files_ok = True
                 scale_label, scale_source = resolve_scale(manifest_read(adapter_dir))
+                state = self._loaded.get(key)
                 out[key] = {
                     "adapter_dir": str(adapter_dir) if adapter_dir else None,
                     "configured": adapter_dir is not None,
@@ -580,8 +899,10 @@ class MLProvider:
                     "base_revision": comp["base_revision"],
                     "model_scale": scale_label,
                     "model_scale_source": scale_source,
-                    "loaded": self._loaded[key] is not None,
+                    "loaded": state is not None,
                 }
+                if key == "soap" and state is not None:
+                    out[key]["backend"] = state.get("backend", "torch")
             except Exception as err:  # never break /health over introspection
                 out[key] = {"error": f"{type(err).__name__}: {err}"}
         return out
@@ -781,6 +1102,287 @@ class MLProvider:
         self._loaded["roman"] = state
         return state
 
+    # ---------- fast CPU GGUF draft backend (owner fix 2026-11-19) ----------
+
+    @staticmethod
+    def _gguf_available() -> bool:
+        """True when llama-cpp-python imports cleanly in this venv."""
+        try:
+            import llama_cpp  # noqa: F401
+
+            return True
+        except Exception:
+            return False
+
+    def _soap_backend_for(self, fmt: str, device: str) -> str:
+        """Resolve the draft backend honestly (never a silent swap).
+
+        Rules:
+          * VOXSOAP_SOAP_BACKEND=torch -> torch (explicit operator choice);
+          * "medscribe" (legacy SOAP-LoRA adapter contract) -> torch ALWAYS;
+          * CUDA -> torch (this GGUF path is a CPU backend, n_gpu_layers=0);
+          * explicit "gguf" -> gguf, refusing with an honest 503 when
+            llama-cpp-python is missing;
+          * "auto" -> gguf on CPU when llama_cpp imports, else torch.
+        """
+        configured = str(getattr(self._cfg, "soap_backend", "auto") or "auto").strip().lower()
+        if configured == "torch":
+            return "torch"
+        if fmt != VET_NOTE_FORMAT:
+            return "torch"
+        if device != "cpu":
+            return "torch"
+        if configured == "gguf":
+            if not self._gguf_available():
+                raise InferenceError(
+                    "VOXSOAP_SOAP_BACKEND=gguf but llama-cpp-python is not installed in this "
+                    "Python environment. Install the pinned CPU wheel (ml-serving/"
+                    "requirements-serving-ml.txt) or set VOXSOAP_SOAP_BACKEND=torch. Nothing "
+                    "was silently substituted."
+                )
+            return "gguf"
+        return "gguf" if self._gguf_available() else "torch"
+
+    def soap_backend_summary(self) -> Dict[str, Any]:
+        """Honest backend provenance for /health and async job envelopes."""
+        configured = str(getattr(self._cfg, "soap_backend", "auto") or "auto").strip().lower()
+        state = self._loaded.get("soap")
+        if state is not None:
+            effective = str(state.get("backend", "torch"))
+        elif configured == "torch":
+            effective = "torch"
+        elif configured == "gguf":
+            effective = "gguf"
+        else:
+            effective = "gguf" if self._gguf_available() else "torch"
+        summary: Dict[str, Any] = {
+            "configured": configured,
+            "effective": effective,
+            "loaded": state is not None,
+            "gguf_repo": getattr(self._cfg, "soap_gguf_repo", None),
+            "gguf_file": getattr(self._cfg, "soap_gguf_file", None),
+        }
+        if state is not None and state.get("backend") == "gguf":
+            summary["gguf_file"] = state.get("model_file")
+            summary["n_ctx"] = state.get("n_ctx")
+            summary["n_threads"] = state.get("n_threads")
+            summary["n_batch"] = state.get("n_batch")
+            summary["n_ubatch"] = state.get("n_ubatch")
+        return summary
+
+    def _resolve_gguf_model_path(self) -> Path:
+        explicit = getattr(self._cfg, "soap_gguf_path", None)
+        if explicit:
+            path = Path(explicit)
+            if not path.is_file():
+                raise InferenceError(
+                    f"VOXSOAP_SOAP_GGUF_PATH points at {path} but the file does not exist - "
+                    "download the GGUF first or unset the override. Nothing was substituted."
+                )
+            return path
+        repo = str(getattr(self._cfg, "soap_gguf_repo", "Qwen/Qwen2.5-3B-Instruct-GGUF"))
+        filename = str(
+            getattr(self._cfg, "soap_gguf_file", "qwen2.5-3b-instruct-q4_k_m.gguf")
+        )
+        # Local ml-serving/models/<filename> auto-discovery (owner fix 2026-11-20):
+        # pre-fetched verified GGUF blobs live here so local launches never stall
+        # re-downloading from a throttled HuggingFace CDN.
+        local_candidate = Path(__file__).resolve().parent / "models" / filename
+        if local_candidate.is_file():
+            return local_candidate
+        try:
+            from huggingface_hub import hf_hub_download
+
+            cached = hf_hub_download(repo_id=repo, filename=filename)
+        except Exception as err:
+            raise InferenceError(
+                "The GGUF SOAP model could not be resolved from the HuggingFace cache "
+                f"({repo}/{filename}): {type(err).__name__}: {err}. Pre-download it with "
+                "huggingface_hub.hf_hub_download(...) or set VOXSOAP_SOAP_GGUF_PATH to a local "
+                ".gguf file. Nothing was silently substituted."
+            ) from err
+        return Path(cached)
+
+    def _load_soap_gguf(self) -> Dict[str, Any]:
+        device = self._resolve_device()
+        if device != "cpu":
+            raise InferenceError(
+                "the GGUF draft backend is the CPU fast path (n_gpu_layers=0); this process "
+                f"resolved device={device!r}. Use VOXSOAP_SOAP_BACKEND=torch on CUDA."
+            )
+        path = self._resolve_gguf_model_path()
+        try:
+            from llama_cpp import Llama
+        except Exception as err:
+            raise InferenceError(
+                f"llama-cpp-python is not importable: {type(err).__name__}: {err}. Install the "
+                "pinned CPU wheel from ml-serving/requirements-serving-ml.txt. Nothing was "
+                "silently substituted."
+            ) from err
+        n_ctx = max(512, int(getattr(self._cfg, "soap_n_ctx", 4096) or 4096))
+        cfg_threads = int(getattr(self._cfg, "soap_n_threads", 0) or 0)
+        n_threads = cfg_threads if cfg_threads > 0 else max(2, (_boot_os.cpu_count() or 4) - 1)
+        n_batch = max(1, int(getattr(self._cfg, "soap_n_batch", 128) or 128))
+        n_ubatch = max(1, int(getattr(self._cfg, "soap_n_ubatch", 128) or 128))
+        n_ubatch = min(n_ubatch, n_batch)
+        try:
+            llm = Llama(
+                model_path=str(path),
+                n_ctx=n_ctx,
+                n_threads=n_threads,
+                n_batch=n_batch,
+                n_ubatch=n_ubatch,
+                n_gpu_layers=0,
+                verbose=False,
+            )
+        except Exception as err:
+            raise InferenceError(
+                f"GGUF SOAP model load failed for {path}: {type(err).__name__}: {err}. "
+                "Nothing was silently substituted (no Gemini fallback)."
+            ) from err
+        state = {
+            "backend": "gguf",
+            "llm": llm,
+            "model_path": str(path),
+            "model_file": path.name,
+            "n_ctx": n_ctx,
+            "n_threads": n_threads,
+            "n_batch": n_batch,
+            "n_ubatch": n_ubatch,
+            "loaded_at": time.time(),
+        }
+        self._loaded["soap"] = state
+        return state
+
+    def _draft_gguf(
+        self,
+        state: Dict[str, Any],
+        transcript: str,
+        tokens_cap: int,
+        cancel_event: Optional[Any] = None,
+        progress_cb: Optional[Any] = None,
+    ) -> str:
+        """Stream a greedy chat completion from the resident GGUF model.
+
+        The SAME VET_SCRIBENOTE_SYSTEM_PROMPT + raw transcript are fed; the
+        caller pipes the text through the SAME deterministic hydration/guard
+        pipeline as the torch path. Cancellation is checked on EVERY chunk
+        (one token) and raises DraftCancelled so the worker exits immediately.
+        """
+        llm = state["llm"]
+        messages = [
+            {"role": "system", "content": VET_SCRIBENOTE_SYSTEM_PROMPT},
+            {"role": "user", "content": transcript},
+        ]
+        if cancel_event is not None and cancel_event.is_set():
+            raise DraftCancelled("draft cancelled before generation")
+        call_kwargs: Dict[str, Any] = {
+            "messages": messages,
+            "temperature": 0.0,
+            "repeat_penalty": 1.1,
+            "max_tokens": int(tokens_cap),
+            "stream": True,
+            "response_format": {"type": "json_object"},
+        }
+        try:
+            stream = llm.create_chat_completion(**call_kwargs)
+        except TypeError:
+            call_kwargs.pop("response_format", None)
+            stream = llm.create_chat_completion(**call_kwargs)
+        parts = []
+        generated = 0
+        try:
+            for chunk in stream:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise DraftCancelled("draft cancelled by the operator")
+                try:
+                    choice = (chunk.get("choices") or [{}])[0]
+                    delta = (choice.get("delta") or {}).get("content") or ""
+                except Exception:
+                    delta = ""
+                if delta:
+                    parts.append(delta)
+                    generated += 1
+                    if progress_cb is not None:
+                        try:
+                            progress_cb(generated)
+                        except Exception:
+                            pass  # observability must never break inference
+        finally:
+            close = getattr(stream, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
+        return "".join(parts).strip()
+
+    @staticmethod
+    def _torch_stopping_criteria(cancel_event, progress_cb, prompt_len):
+        """Cancel + live token progress for the torch generate() loop."""
+        from transformers import StoppingCriteria, StoppingCriteriaList
+
+        class _DraftStopping(StoppingCriteria):
+            def __call__(self, input_ids, scores, **kwargs):  # noqa: D401
+                try:
+                    generated = int(input_ids.shape[-1]) - int(prompt_len)
+                except Exception:
+                    generated = 0
+                if progress_cb is not None:
+                    try:
+                        progress_cb(max(0, generated))
+                    except Exception:
+                        pass
+                return bool(cancel_event is not None and cancel_event.is_set())
+
+        return StoppingCriteriaList([_DraftStopping()])
+
+    @staticmethod
+    def _finalize_vet_draft(
+        raw_text: str, transcript: str, tokens_cap: int
+    ) -> Dict[str, Any]:
+        """Shared deterministic post-processing for BOTH draft backends."""
+        parsed_json = _vet_try_parse_json(raw_text)
+        extra_meta: Dict[str, Any] = {}
+        if parsed_json is not None:
+            draft_text, sections, unknown_dropped, trace_dropped, extra_meta = (
+                _vet_hydrate_from_parsed_json(parsed_json, transcript=transcript)
+            )
+        else:
+            draft_text, sections, unknown_dropped, trace_dropped = _vet_hydrated_story(
+                raw_text, transcript=transcript
+            )
+        note = (
+            "assistive DRAFT - deterministic guard annotations attached; "
+            "vet confirmation is mandatory"
+        )
+        if unknown_dropped:
+            note += (
+                f" ({unknown_dropped} unrecognized objective line(s) dropped by "
+                "canonical-key matching)"
+            )
+        if trace_dropped:
+            note += (
+                f" ({trace_dropped} objective value(s) dropped: no verbatim trace "
+                "in the consultation transcript - untraceable claims are never "
+                "invented into the note)"
+            )
+        out: Dict[str, Any] = {
+            "draft": draft_text,
+            "sections": sections,
+            "format": VET_NOTE_FORMAT,
+            "generation": "greedy",
+            "max_new_tokens": tokens_cap,
+            "note": note,
+        }
+        if extra_meta.get("drug_matches"):
+            out["drug_matches"] = extra_meta["drug_matches"]
+        if extra_meta.get("plan_structured"):
+            out["plan_structured"] = extra_meta["plan_structured"]
+        if extra_meta.get("subjective_details"):
+            out["subjective_details"] = extra_meta["subjective_details"]
+        return out
+
     # ---------- inference ----------
 
     def _free_ram_gb(self) -> Optional[float]:
@@ -891,6 +1493,37 @@ class MLProvider:
             # it (documented: explicit 'en' is the English escape hatch).
             use_base_weights = lang_key == "en"
 
+            # Fix 3: Veterinary ASR domain biasing clamped strictly within
+            # Whisper's decoder `max_target_positions` (448) so `prompt_ids` +
+            # special prefix tokens (<|startoftranscript|>, <|lang|>,
+            # <|transcribe|>, <|notimestamps|>) + `max_new_tokens` NEVER
+            # exceeds 448 (root cause of HTTP 503 ValueError on ur audio).
+            model_max_positions = int(
+                getattr(getattr(model, "config", None), "max_target_positions", 448) or 448
+            )
+            decoder_prefix_reserve = 8
+            configured_asr_cap = max(1, int(self._cfg.asr_max_new_tokens))
+            max_prompt_tokens = max(
+                0, min(180, model_max_positions - configured_asr_cap - decoder_prefix_reserve)
+            )
+            domain_prompt = build_whisper_initial_prompt(lang_key)
+            prompt_ids = None
+            get_prompt_ids = getattr(processor, "get_prompt_ids", None)
+            if callable(get_prompt_ids) and max_prompt_tokens > 0:
+                try:
+                    raw_prompt_ids = get_prompt_ids(domain_prompt, return_tensors="pt")
+                    if raw_prompt_ids is not None and len(raw_prompt_ids) > max_prompt_tokens:
+                        raw_prompt_ids = raw_prompt_ids[:max_prompt_tokens]
+                    if raw_prompt_ids is not None and len(raw_prompt_ids) > 0:
+                        prompt_ids = raw_prompt_ids.to(device=model.device)
+                except Exception:
+                    prompt_ids = None
+            prompt_len = int(len(prompt_ids)) if prompt_ids is not None else 0
+            effective_asr_max_new_tokens = min(
+                configured_asr_cap,
+                max(1, model_max_positions - prompt_len - decoder_prefix_reserve),
+            )
+
             def _decode_window(window: "np.ndarray") -> str:
                 feats = processor.feature_extractor(
                     window,
@@ -905,12 +1538,14 @@ class MLProvider:
                 # cross-chunk conditioning, so a pause or greeting can never
                 # gate the rest of the note.
                 gen_kwargs: Dict[str, Any] = {
-                    "max_new_tokens": self._cfg.asr_max_new_tokens,
+                    "max_new_tokens": effective_asr_max_new_tokens,
                     "task": "transcribe",
                     "condition_on_prev_tokens": False,
                 }
                 if lang_whisper is not None:
                     gen_kwargs["language"] = lang_whisper
+                if prompt_ids is not None:
+                    gen_kwargs["prompt_ids"] = prompt_ids
                 if getattr(feats, "attention_mask", None) is not None:
                     gen_kwargs["attention_mask"] = feats.attention_mask.to(model.device)
                 with torch.no_grad():
@@ -994,7 +1629,7 @@ class MLProvider:
                 del chunk
                 if is_cpu:
                     gc.collect()
-            text = " ".join(decoded)
+            text = clean_asr_transcript(" ".join(decoded))
             if chunk_count == 0:
                 note = "empty input audio"
             elif chunk_count == 1:
@@ -1021,7 +1656,9 @@ class MLProvider:
             ) from err
 
     def draft(self, transcript: str, max_new_tokens: Optional[int] = None,
-              note_format: str = VET_NOTE_FORMAT) -> Dict[str, Any]:
+              note_format: str = VET_NOTE_FORMAT,
+              cancel_event: Optional[Any] = None,
+              progress_cb: Optional[Any] = None) -> Dict[str, Any]:
         try:
             if (note_format or "").strip().lower() not in VET_NOTE_FORMATS:
                 raise InferenceError(
@@ -1031,14 +1668,73 @@ class MLProvider:
             fmt = (note_format or "").strip().lower()
             # Owner budget fix (2026-11-05): resolve the device BEFORE loading
             # anything - on CPU the resident ASR Whisper is released here
-            # (unconditionally) so its ~1.2-2 GB is free when the bf16 3B SOAP
-            # model loads or generates next; the cold-load RAM peak is exactly
-            # when the 16 GB owner box starts paging.
-            is_cpu = self._resolve_device() == "cpu"
+            # (unconditionally) so its ~1.2-2 GB is free before any SOAP model
+            # loads; the cold-load RAM peak is exactly when the 16 GB owner box
+            # starts paging.
+            device = self._resolve_device()
+            is_cpu = device == "cpu"
             if is_cpu:
                 self._release_asr_before_draft()
                 gc.collect()
-            state = self._loaded["soap"] or self._load_soap()
+            # Owner fix (2026-11-19): vet_scribenote on CPU rides the quantized
+            # GGUF base (~2.1 GB, llama.cpp AVX2 decode) through the SAME prompt
+            # and the SAME deterministic hydration/guard pipeline; medscribe and
+            # CUDA keep the exact torch/PEFT behaviour (envelope says which).
+            backend = self._soap_backend_for(fmt, device)
+            # 2026-10-31 local-speed: an explicit request-level cap wins
+            # (validated 1..cfg cap at the API layer and echoed in the
+            # envelope). None -> the configured cap, clamped tighter on CPU.
+            # Owner Fix 2 (2026-11-01): the vet_scribenote shape got the 256 ->
+            # 448 CPU clamp; owner budget realignment (2026-11-05) moved the
+            # config default to 320. The clamp constants remain CEILINGS for
+            # env-raised configurations - never a silent edit of the note.
+            tokens_cap = self._cfg.draft_max_new_tokens
+            if max_new_tokens is not None:
+                tokens_cap = int(max_new_tokens)
+            elif is_cpu:
+                if backend == "gguf" and fmt == "vet_scribenote":
+                    # Quantized GGUF runs 5-15x faster on CPU than bf16 torch,
+                    # so full 5-minute consults can keep up to 640 tokens and
+                    # finish Subjective + Objective + Assessment + Plan cleanly.
+                    tokens_cap = min(640, tokens_cap)
+                else:
+                    tokens_cap = min(448 if fmt == "vet_scribenote" else 256, tokens_cap)
+
+            if backend == "gguf":
+                state = self._loaded["soap"]
+                if state is not None and state.get("backend") != "gguf":
+                    # a torch SOAP (medscribe) is resident - swap it out first;
+                    # mixing backends in one slot would double the RAM footprint.
+                    self.unload("soap")
+                    state = None
+                state = state or self._load_soap_gguf()
+                raw_text = self._draft_gguf(
+                    state,
+                    transcript,
+                    tokens_cap,
+                    cancel_event=cancel_event,
+                    progress_cb=progress_cb,
+                )
+                if cancel_event is not None and cancel_event.is_set():
+                    raise DraftCancelled("draft cancelled by the operator")
+                payload = self._finalize_vet_draft(raw_text, transcript, tokens_cap)
+                payload["backend"] = "gguf"
+                payload["gguf_model"] = state.get("model_file")
+                # Honest provenance: a quantized BASE GGUF is NOT the unquantized
+                # PEFT adapter the training manifest labels FULL - say so in-band
+                # rather than letting the manifest label imply otherwise.
+                payload["model_scale"] = (
+                    f"FULL-BASE-GGUF({state.get('model_file')}; base weights - LoRA adapter "
+                    "NOT applied; same vet_scribenote prompt + deterministic hydration)"
+                )
+                return payload
+
+            # ---- legacy torch/PEFT path (medscribe parity + CUDA) ----------
+            state = self._loaded["soap"]
+            if state is not None and state.get("backend") == "gguf":
+                self.unload("soap")
+                state = None
+            state = state or self._load_soap()
             torch = self._real_stack()
             model = state["model"]
             tok = state["tokenizer"]
@@ -1067,25 +1763,6 @@ class MLProvider:
                 return_dict=True,
             )
             prompt_ids, prompt_mask = _unwrap_chat_prompt(prompt)
-            # 2026-10-31 local-speed: an explicit request-level cap wins
-            # (validated 1..cfg cap at the API layer and echoed in the
-            # envelope). None -> the configured cap, clamped tighter on CPU.
-            # Honest, explicit, and visible in the response - never a silent
-            # edit of the note.
-            # Owner Fix 2 (2026-11-01): the vet_scribenote shape needs the
-            # 23-line hydrated objective TWICE the sketch budget - the CPU
-            # clamp was raised 256 -> 448. Owner budget realignment
-            # (2026-11-05): draft_max_new_tokens CONFIG DEFAULT is now 320
-            # (the 23-parameter Objective hydration is DETERMINISTIC and
-            # code-side, so the contract shape never depended on generating
-            # those tokens; 320 keeps the active clinical findings + plan and
-            # cuts ~35% off CPU decode on the budget-critical box). The clamp
-            # constants remain CEILINGS for env-raised configurations.
-            tokens_cap = self._cfg.draft_max_new_tokens
-            if max_new_tokens is not None:
-                tokens_cap = int(max_new_tokens)
-            elif is_cpu:
-                tokens_cap = min(448 if fmt == "vet_scribenote" else 256, tokens_cap)
             gen_kwargs: Dict[str, Any] = {
                 "input_ids": prompt_ids.to(model.device),
                 "max_new_tokens": tokens_cap,
@@ -1094,21 +1771,17 @@ class MLProvider:
             }
             if prompt_mask is not None:
                 gen_kwargs["attention_mask"] = prompt_mask.to(model.device)
+            if cancel_event is not None or progress_cb is not None:
+                gen_kwargs["stopping_criteria"] = self._torch_stopping_criteria(
+                    cancel_event, progress_cb, int(prompt_ids.shape[-1])
+                )
             if is_cpu:
                 # Owner reliability fix (2026-11-04): bound the intra-op pool
-                # for the LONG DRAFT so headroom stays for the uvicorn loop
-                # (on the 16 GB owner box a fully saturated pool made
-                # /health answers late enough to trip the engine's 2 s
-                # pre-check). Fix-1 ASR saturation is untouched - the next
-                # /transcribe re-applies it defensively. Env override:
-                # VOXSOAP_DRAFT_THREADS. Never UP-sizes: an explicitly lower
-                # pool stays lower.
+                # for the LONG DRAFT so headroom stays for the uvicorn loop.
                 # Owner budget fix (2026-11-05): default max(2, cpus-1) - ONE
                 # logical core stays clear for the loop + Windows UI instead
-                # of two; the 2026-11-04 drills measured healthy mid-draft
-                # /health answers (5-202 ms across 27 polls) at the 3-thread
-                # bound on the 4-logical-core owner box, so cpu-1 is the new
-                # safe default there.
+                # of two. Env override: VOXSOAP_DRAFT_THREADS. Never UP-sizes:
+                # an explicitly lower pool stays lower.
                 cap_env = _boot_os.environ.get("VOXSOAP_DRAFT_THREADS", "").strip()
                 draft_threads = (
                     max(1, int(cap_env))
@@ -1128,6 +1801,8 @@ class MLProvider:
                         out = model.generate(**gen_kwargs)
                 else:
                     out = model.generate(**gen_kwargs)
+            if cancel_event is not None and cancel_event.is_set():
+                raise DraftCancelled("draft cancelled by the operator")
             continuation = out[:, prompt_ids.shape[-1]:]
             # clean_up_tokenization_spaces pinned for the same reason as ASR:
             # frozen to the verified 4.48.3 default the eval pipeline measured.
@@ -1139,37 +1814,19 @@ class MLProvider:
                     "draft": text,
                     "generation": "greedy",
                     "max_new_tokens": tokens_cap,
+                    "backend": "torch",
                     "note": "assistive DRAFT - deterministic guard annotations attached; vet confirmation is mandatory",
                 }
             # Owner Fix 2 post-processing: deterministically hydrate ALL 23
             # canonical objective parameters (missing -> "Not mentioned") and
             # ship both the formatted draft string and the structured sections
             # object the frontend maps into the main SOAP workspace cards.
-            draft_text, sections, unknown_dropped, trace_dropped = _vet_hydrated_story(text, transcript=transcript)
-            note = (
-                "assistive DRAFT - deterministic guard annotations attached; "
-                "vet confirmation is mandatory"
-            )
-            if unknown_dropped:
-                note += (
-                    f" ({unknown_dropped} unrecognized objective line(s) dropped by "
-                    "canonical-key matching)"
-                )
-            if trace_dropped:
-                note += (
-                    f" ({trace_dropped} objective value(s) dropped: no verbatim trace "
-                    "in the consultation transcript - untraceable claims are never "
-                    "invented into the note)"
-                )
-            return {
-                "draft": draft_text,
-                "sections": sections,
-                "format": VET_NOTE_FORMAT,
-                "generation": "greedy",
-                "max_new_tokens": tokens_cap,
-                "note": note,
-            }
+            payload = self._finalize_vet_draft(text, transcript, tokens_cap)
+            payload["backend"] = "torch"
+            return payload
         except ProviderError:
+            raise
+        except DraftCancelled:
             raise
         except Exception as err:
             raise InferenceError(

@@ -81,15 +81,40 @@ class ServingConfig:
     max_audio_mb: float = 25.0
     transcript_max_chars: int = 14000  # prepare_soap_data.py MAX_CHARS cap
     asr_max_new_tokens: int = 256      # evaluate_asr.py generate recipe
-    draft_max_new_tokens: int = 320    # owner budget realignment 2026-11-05: the 23-param
-    # Objective hydration is code-side and deterministic, so 320 tokens keeps
-    # the active clinical findings + plan while cutting ~35% off CPU decode
-    # (the 512 phase-3 anti-truncation default predates the hydration fix).
+    draft_max_new_tokens: int = 512    # GGUF CPU fast path (2026-11-20): at ~4.8 tok/s
+    # 512 tokens finishes in ~1.8 min and prevents truncating ASSESSMENT/PLAN on
+    # dense 5-minute consultations (the old 320 cap was a bf16-torch workaround).
     # SOAP base dtype: "auto" = fp16 on CUDA, bfloat16 on CPU (2026-10-31
     # local-speed fix: bf16 halves the 3B CPU RAM footprint ~12.4 -> ~6.2 GB
     # and is FASTER on x86_64/oneDNN). Override honestly:
     # VOXSOAP_SOAP_DTYPE=bfloat16|float16|float32.
     soap_dtype: str = "auto"
+    # ---- Fast CPU draft backend (owner fix 2026-11-19) ---------------------
+    # The owner i5-6300U (Skylake 2C/4T, no native BF16, no GPU) pages its
+    # 16 GB RAM under Chrome + Next dev, stretching a 320-token bf16 draft to
+    # ~950-1,530 s. The vet_scribenote path ALREADY runs the base weights
+    # (disable_adapter), so a quantized GGUF of the same Qwen2.5-Instruct
+    # family gives the SAME clinical grounding in ~2.1 GB with llama.cpp AVX2
+    # decode. "auto" = gguf on CPU for vet_scribenote when llama_cpp imports;
+    # CUDA and the legacy "medscribe" PEFT path stay torch. Backend choice is
+    # always echoed honestly in the draft envelope (backend/gguf_model).
+    soap_backend: str = "auto"  # "auto" | "gguf" | "torch"
+    soap_gguf_repo: str = "Qwen/Qwen2.5-1.5B-Instruct-GGUF"
+    soap_gguf_file: str = "qwen2.5-1.5b-instruct-q4_k_m.gguf"
+    # Explicit local .gguf path (skips the HF-cache download entirely).
+    soap_gguf_path: Optional[Path] = None
+    # KV-cache window: system prompt + a 5-min consult (~1k tokens) + output.
+    soap_n_ctx: int = 4096
+    # 0 -> resolved in providers.py as max(2, cpu_count-1). On the 2C/4T
+    # owner box benchmark 2-3 threads beats 4 (Hyper-Threading contention).
+    soap_n_threads: int = 0
+    # llama.cpp batch sizes (2026-11-20 RSS gate). The vocabulary is 151,936
+    # tokens: at the llama.cpp default n_batch=512 the output/logits buffers
+    # alone cost ~311 MB, pushing the measured peak working set to ~3.44 GB.
+    # n_batch=128/n_ubatch=128 shrinks those buffers while still ingesting the
+    # ~1.4k-token prompt in a few passes.
+    soap_n_batch: int = 128
+    soap_n_ubatch: int = 128
     roman_max_new_tokens: int = 256    # evaluate_transliteration.py recipe
 
 
@@ -115,6 +140,35 @@ def load_config() -> ServingConfig:
             f"VOXSOAP_DEFAULT_PROVIDER={provider!r} is invalid; allowed values: {', '.join(VALID_PROVIDERS)}. "
             "The default provider must be explicit - hidden fallbacks are forbidden."
         )
+    soap_backend = _env_str("VOXSOAP_SOAP_BACKEND", "auto").strip().lower()
+    if soap_backend not in ("auto", "gguf", "torch"):
+        raise ValueError(
+            f"VOXSOAP_SOAP_BACKEND={soap_backend!r} is invalid; allowed values: auto, gguf, torch."
+        )
+    try:
+        soap_n_ctx = int(_env_str("VOXSOAP_SOAP_N_CTX", "4096"))
+    except ValueError as err:
+        raise ValueError("VOXSOAP_SOAP_N_CTX must be an integer (KV-cache window, default 4096).") from err
+    if soap_n_ctx < 512:
+        raise ValueError(f"VOXSOAP_SOAP_N_CTX={soap_n_ctx} is too small; the scribenote prompt needs >= 512.")
+    try:
+        soap_n_threads = int(_env_str("VOXSOAP_SOAP_N_THREADS", "0"))
+    except ValueError as err:
+        raise ValueError("VOXSOAP_SOAP_N_THREADS must be an integer (0 = auto).") from err
+    try:
+        soap_n_batch = int(_env_str("VOXSOAP_SOAP_N_BATCH", "128"))
+        soap_n_ubatch = int(_env_str("VOXSOAP_SOAP_N_UBATCH", "128"))
+    except ValueError as err:
+        raise ValueError(
+            "VOXSOAP_SOAP_N_BATCH / VOXSOAP_SOAP_N_UBATCH must be integers."
+        ) from err
+    if soap_n_batch < 1 or soap_n_ubatch < 1:
+        raise ValueError("VOXSOAP_SOAP_N_BATCH / VOXSOAP_SOAP_N_UBATCH must be >= 1.")
+    if soap_n_ubatch > soap_n_batch:
+        raise ValueError(
+            f"VOXSOAP_SOAP_N_UBATCH={soap_n_ubatch} must be <= "
+            f"VOXSOAP_SOAP_N_BATCH={soap_n_batch} (llama.cpp contract)."
+        )
     return ServingConfig(
         default_provider=provider,
         asr_base_model=_env_str("VOXSOAP_ASR_BASE_MODEL", "openai/whisper-small"),
@@ -139,7 +193,17 @@ def load_config() -> ServingConfig:
         max_audio_mb=float(_env_str("VOXSOAP_MAX_AUDIO_MB", "25.0")),
         transcript_max_chars=int(_env_str("VOXSOAP_TRANSCRIPT_MAX_CHARS", "14000")),
         asr_max_new_tokens=int(_env_str("VOXSOAP_ASR_MAX_NEW_TOKENS", "256")),
-        draft_max_new_tokens=int(_env_str("VOXSOAP_DRAFT_MAX_NEW_TOKENS", "320")),
+        draft_max_new_tokens=int(_env_str("VOXSOAP_DRAFT_MAX_NEW_TOKENS", "512")),
         soap_dtype=_env_str("VOXSOAP_SOAP_DTYPE", "auto").strip().lower(),
+        soap_backend=soap_backend,
+        soap_gguf_repo=_env_str("VOXSOAP_SOAP_GGUF_REPO", "Qwen/Qwen2.5-1.5B-Instruct-GGUF"),
+        soap_gguf_file=_env_str(
+            "VOXSOAP_SOAP_GGUF_FILE", "qwen2.5-1.5b-instruct-q4_k_m.gguf"
+        ),
+        soap_gguf_path=_env_path("VOXSOAP_SOAP_GGUF_PATH"),
+        soap_n_ctx=soap_n_ctx,
+        soap_n_threads=soap_n_threads,
+        soap_n_batch=soap_n_batch,
+        soap_n_ubatch=soap_n_ubatch,
         roman_max_new_tokens=int(_env_str("VOXSOAP_ROMAN_MAX_NEW_TOKENS", "256")),
     )
