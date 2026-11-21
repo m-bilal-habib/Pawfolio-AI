@@ -1,6 +1,6 @@
 // File: d:\Pawfolio AI\src\app\api\clinic\vox-soap\extract\route.ts
 import { NextRequest, NextResponse } from 'next/server';
-import { voxSoapEngine } from '@/lib/vox-soap/vox-soap.engine';
+import { resolveTranscribeProvider, voxSoapEngine } from '@/lib/vox-soap/vox-soap.engine';
 import { voxSoapStore } from '@/lib/vox-soap/vox-soap.catalog';
 import { ClinicStaffRole, StaffSessionContext } from '@/lib/vox-soap/vox-soap.types';
 
@@ -23,6 +23,49 @@ const ALLOWED_AUDIO_MIMES = new Set([
   'audio/aiff',
   'audio/x-aiff',
 ]);
+
+/**
+ * Browsers and OS registries rarely report a bare MIME: MediaRecorder emits
+ * "audio/webm;codecs=opus", Windows WAVE files surface as "audio/wave" or
+ * "audio/vnd.wave". The allowlist comparison always sees the NORMALIZED base
+ * type, never the raw string (2026-10-31 E2E fix: the raw
+ * "audio/webm;codecs=opus" tag was rejected 415 at stop-recording).
+ */
+function normalizeAudioMime(rawMime: string): string {
+  const base = rawMime.split(';')[0].trim().toLowerCase();
+  return base === 'audio/wave' || base === 'audio/vnd.wave' ? 'audio/wav' : base;
+}
+
+/** Extension fallback for files whose reported type carries no information
+ * (empty File.type or generic application/octet-stream — common on Windows
+ * for .m4a/.aac/.flac recordings whose registry mapping is missing). Every
+ * value is a member of ALLOWED_AUDIO_MIMES. */
+const EXTENSION_TO_MIME: Record<string, string> = {
+  wav: 'audio/wav',
+  mp3: 'audio/mp3',
+  webm: 'audio/webm',
+  ogg: 'audio/ogg',
+  oga: 'audio/ogg',
+  opus: 'audio/ogg',
+  mp4: 'audio/mp4',
+  m4a: 'audio/mp4',
+  aac: 'audio/aac',
+  flac: 'audio/flac',
+};
+
+/** Resolves what an uploaded audio File actually is: strip parameters from
+ * the reported type first; only when the type says nothing (empty or the
+ * generic octet-stream bucket) trust the file extension. */
+function resolveUploadAudioMime(file: File): { mime: string | null; reported: string } {
+  const reported = normalizeAudioMime(file.type);
+  if (ALLOWED_AUDIO_MIMES.has(reported)) return { mime: reported, reported };
+  const fileExt = (file.name.split('.').pop() ?? '').toLowerCase();
+  if ((reported === '' || reported === 'application/octet-stream') && fileExt in EXTENSION_TO_MIME) {
+    const byExt = EXTENSION_TO_MIME[fileExt];
+    return { mime: byExt, reported };
+  }
+  return { mime: null, reported };
+}
 
 function extractStaffSession(req: NextRequest): StaffSessionContext {
   const roleHeader = (req.headers.get('x-staff-role') ?? 'veterinarian') as ClinicStaffRole;
@@ -65,6 +108,12 @@ export async function POST(req: NextRequest) {
     let audioMimeType: string | undefined;
     let recordingId: string | undefined;
     let consentAt: string | undefined;
+    // Local-first routing knobs (2026-10-31): language tags the Whisper
+    // decoder ('ur' default — the original scaffold behaviour); the provider
+    // override falls through to VOXSOAP_TRANSCRIBE_PROVIDER / default 'ml'
+    // when the field is absent.
+    let language: 'ur' | 'en' | 'auto' = 'ur';
+    let transcribeProvider: string | undefined;
 
     if (contentType.includes('multipart/form-data')) {
       const formData = await req.formData();
@@ -81,6 +130,14 @@ export async function POST(req: NextRequest) {
       if (typeof rawConsentAt === 'string' && rawConsentAt.trim()) {
         consentAt = rawConsentAt.trim();
       }
+      const rawLanguage = formData.get('language');
+      if (typeof rawLanguage === 'string' && rawLanguage.trim()) {
+        language = rawLanguage.trim().toLowerCase() as 'ur' | 'en' | 'auto';
+      }
+      const rawTranscribeProvider = formData.get('transcribeProvider');
+      if (typeof rawTranscribeProvider === 'string' && rawTranscribeProvider.trim()) {
+        transcribeProvider = rawTranscribeProvider.trim().toLowerCase();
+      }
 
       const audioFile = formData.get('audio');
       if (audioFile instanceof File) {
@@ -91,14 +148,17 @@ export async function POST(req: NextRequest) {
             { status: 413 }
           );
         }
-        if (!ALLOWED_AUDIO_MIMES.has(audioFile.type)) {
+        const resolved = resolveUploadAudioMime(audioFile);
+        if (!resolved.mime) {
           return NextResponse.json(
-            { error: `Unsupported audio MIME type: ${audioFile.type}` },
+            {
+              error: `Unsupported audio MIME type: ${resolved.reported || '(empty)'} — accepted audio: WebM, WAV, MP3, M4A, AAC, OGG, FLAC, AIFF.`,
+            },
             { status: 415 }
           );
         }
         audioBuffer = Buffer.from(await audioFile.arrayBuffer());
-        audioMimeType = audioFile.type;
+        audioMimeType = resolved.mime;
       }
     } else {
       const body = await req.json();
@@ -110,6 +170,48 @@ export async function POST(req: NextRequest) {
       if (typeof body.consentAt === 'string' && body.consentAt.trim()) {
         consentAt = body.consentAt.trim();
       }
+      if (typeof body.language === 'string' && body.language.trim()) {
+        language = body.language.trim().toLowerCase() as 'ur' | 'en' | 'auto';
+      }
+      if (typeof body.transcribeProvider === 'string' && body.transcribeProvider.trim()) {
+        transcribeProvider = body.transcribeProvider.trim().toLowerCase();
+      }
+    }
+
+    // Honest 400s BEFORE any model work — mirrors the ml-serving gates:
+    // unsupported values are request errors, never silent clamps.
+    if (language !== 'ur' && language !== 'en' && language !== 'auto') {
+      return NextResponse.json(
+        { error: `unsupported language ${language}; allowed: ur | en | auto` },
+        { status: 400 }
+      );
+    }
+    let resolvedProvider: 'ml' | 'gemini';
+    try {
+      resolvedProvider = resolveTranscribeProvider(transcribeProvider);
+    } catch (err) {
+      return NextResponse.json(
+        { error: err instanceof Error ? err.message : String(err) },
+        { status: 400 }
+      );
+    }
+    // Local-ml audio contract (2026-10-31): the CLIENT must deliver 16 kHz
+    // mono PCM WAV — the ml-serving server never resamples, because a
+    // misread rate would corrupt ASR output. Anything else is an honest 415
+    // before any model work.
+    if (
+      resolvedProvider === 'ml' &&
+      audioBuffer &&
+      normalizeAudioMime(audioMimeType ?? '') !== 'audio/wav'
+    ) {
+      return NextResponse.json(
+        {
+          error:
+            `Local-ML transcription requires the 16 kHz mono PCM WAV contract — got '${audioMimeType}'. ` +
+            'The panels deliver WAV client-side (decodeAndResampleToWav16k / startPcm16Capture); the ml-serving server never resamples.',
+        },
+        { status: 415 }
+      );
     }
 
     if (!audioBuffer && (!transcriptText || transcriptText.trim().length < 10)) {
@@ -133,6 +235,8 @@ export async function POST(req: NextRequest) {
         audioMimeType,
         recordingId,
         consentAt,
+        transcribeProvider: resolvedProvider,
+        asrLanguage: language,
       });
       if (queued.alreadyQueued) {
         return NextResponse.json(
@@ -163,6 +267,8 @@ export async function POST(req: NextRequest) {
       transcriptText,
       recordingId,
       consentAt,
+      transcribeProvider: resolvedProvider,
+      asrLanguage: language,
     });
 
     if (idempotencyKey) {

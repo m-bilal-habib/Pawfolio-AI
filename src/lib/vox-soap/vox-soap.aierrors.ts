@@ -28,5 +28,10 @@ export function aiErrorSummaryFromAudit(
   } catch {
     // Not JSON — use the raw string as-is.
   }
-  return raw.length > 180 ? `${raw.slice(0, 180)}…` : raw;
+  // 320-char cap (owner fix 2026-11-04): the actionable remediation tail in
+  // local-ML errors ("...Restart both windows (start-voxsoap-local.bat) and
+  // retry — then press ↻ Retry transcription...") was being cut mid-word at
+  // 180 ('and retry i…'), hiding the instructions it exists to show. The
+  // full unredacted error remains in the immutable audit log either way.
+  return raw.length > 320 ? `${raw.slice(0, 320)}…` : raw;
 }

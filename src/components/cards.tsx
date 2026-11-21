@@ -6,6 +6,7 @@ import {
   ChevronDown,
   FileImage,
   FileText,
+  Mic,
   Pill,
   RefreshCw,
   Stethoscope,
@@ -55,7 +56,7 @@ export function PatientCard({ pet }: { pet: Pet }) {
           </p>
         </div>
       </div>
-      <div className="flex items-center gap-2">
+      <div className="flex flex-wrap items-center gap-2">
         {pet.badges.includes("Allergies") && (
           <span className="rounded-full bg-error/15 px-2.5 py-0.5 text-xs font-semibold text-red-400">
             Allergies
@@ -67,6 +68,13 @@ export function PatientCard({ pet }: { pet: Pet }) {
           className="rounded-lg border border-primary px-3.5 py-1.5 text-sm font-semibold text-primary-dark transition-colors hover:bg-primary hover:text-canvas"
         >
           View Patient
+        </Link>
+        <Link
+          href={`/clinic/vox-soap?petId=${pet.id}&action=ml-assist`}
+          className="inline-flex items-center gap-1.5 rounded-lg bg-primary px-3.5 py-1.5 text-sm font-bold text-canvas transition-colors hover:bg-primary-dark"
+        >
+          <Mic className="h-3.5 w-3.5" />
+          New SOAP Note
         </Link>
       </div>
     </motion.div>

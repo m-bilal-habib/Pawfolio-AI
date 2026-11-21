@@ -2,6 +2,8 @@
 'use client';
 
 import React, { useState, useEffect, useRef, useCallback } from 'react';
+import Link from 'next/link';
+import { useRouter } from 'next/navigation';
 import type {
   ClinicStaffRole,
   PatientSnapshotContext,
@@ -12,10 +14,12 @@ import type {
 import { NewRecordingPanel } from './NewRecordingPanel';
 import { UploadAudioPanel } from './UploadAudioPanel';
 import { RichTextEditor } from './RichTextEditor';
+import { MLAssistPanel } from './MLAssistPanel';
 import { escapePlainToRichHtml } from '@/lib/vox-soap/vox-soap.richtext';
 import { VOX_SOAP_STAFF } from '@/lib/vox-soap/vox-soap.staff';
 import { useAuth } from '@/lib/auth';
 import { WORKFLOW_STATUS_LABELS } from '@/lib/vox-soap/vox-soap.workflow';
+import { pets as clinicPets } from '@/lib/data';
 
 /**
  * VoxSOAP note workspace — Scribenote-style editor, reskinned to the Pawfolio
@@ -58,9 +62,28 @@ const OBJECTIVE_LABELS: Array<{ key: string; label: string }> = [
 /** sessionStorage key used by the dashboard to hand over the fresh draft. */
 const SELECT_VISIT_KEY = 'pawfolio.voxsoap.selectVisit';
 
-export const VoxSoapWorkspace: React.FC<{ defaultPetId?: string }> = ({
+const SAMPLE_LEO_CONSULTATION =
+  "Hi Alicia, come on in. Good to see you. How is Leo doing today? Well, it's been about three days now. Leo has been shaking his head a lot and scratching at his right ear. Sometimes he whimpers when I touch the ear, and I noticed there is a pretty noticeable odor coming from it. I did give him a bath about a week ago at the groomer. No vomiting or diarrhea, eating and drinking normally. He has had summer skin allergies before, treated with Apoquel 16 mg, and he is due for DHPP and Rabies vaccinations today. Let me check his weight first: he weighs 24.5 kg. Right ear canal is very red and inflamed with brown waxy debris and foul odor; left ear looks clean. This is acute otitis externa of the right ear secondary to moisture after the bath. We will clean his ears, prescribe Posatex 4 drops in the right ear once daily for 7 days, administer DHPP and Rabies today, and recheck in 10 days.";
+
+const WORKSPACE_PATIENTS: Array<{ id: string; label: string; routeId: string | null }> = [
+  { id: 'pet-leo-001', label: 'Leo (Demo Canine · 3.5y)', routeId: null },
+  ...clinicPets.map((p) => ({
+    id: p.id,
+    label: `${p.name} (${p.species} · ${p.age})`,
+    routeId: p.id,
+  })),
+];
+
+export const VoxSoapWorkspace: React.FC<{
+  defaultPetId?: string;
+  initialVisitId?: string;
+  initialAction?: 'record' | 'upload' | 'ml-assist';
+}> = ({
   defaultPetId = 'pet-leo-001',
+  initialVisitId,
+  initialAction,
 }) => {
+  const router = useRouter();
   // FR-1/FR-6: the signed-in profile IS the identity used everywhere. The
   // auth gate is role-based demo auth (see src/lib/auth.tsx), so the role
   // resolves the real profile name — never a hardcoded persona like "Dr. B".
@@ -70,6 +93,7 @@ export const VoxSoapWorkspace: React.FC<{ defaultPetId?: string }> = ({
   const staffId = staffProfile?.staffId ?? 'dr.ahmed@pawfolio.ai';
   const staffName = staffProfile?.staffName ?? 'Dr. Ahmed';
 
+  const [selectedPetId, setSelectedPetId] = useState<string>(defaultPetId);
   const [snapshot, setSnapshot] = useState<PatientSnapshotContext | null>(null);
   const [visitHistory, setVisitHistory] = useState<VoxSoapVisitRecord[]>([]);
   const [activeVisit, setActiveVisit] = useState<VoxSoapVisitRecord | null>(null);
@@ -105,6 +129,11 @@ export const VoxSoapWorkspace: React.FC<{ defaultPetId?: string }> = ({
   const [isConfirming, setIsConfirming] = useState<boolean>(false);
   const [recordingPanelOpen, setRecordingPanelOpen] = useState<boolean>(false);
   const [uploadPanelOpen, setUploadPanelOpen] = useState<boolean>(false);
+  // Phase 5: LOCAL ML assistive draft flow (Whisper + GGUF SOAP on this
+  // machine through /api/voxsoap/*). Completely separate from the Gemini
+  // extract pipeline; its panel owns the honesty envelope/badges.
+  const [mlPanelOpen, setMlPanelOpen] = useState<boolean>(false);
+  const [mlInitialTranscript, setMlInitialTranscript] = useState<string | undefined>(undefined);
   const [isExporting, setIsExporting] = useState<boolean>(false);
   const [statusBanner, setStatusBanner] = useState<{
     type: 'success' | 'warning' | 'error' | 'info';
@@ -112,12 +141,31 @@ export const VoxSoapWorkspace: React.FC<{ defaultPetId?: string }> = ({
     detail: string;
   } | null>(null);
 
-  // Visits fresh from the dashboard navigation are pre-selected by id.
-  const pendingSelectRef = useRef<string | null>(null);
+  // Visits fresh from the dashboard navigation or URL query are pre-selected by id.
+  const pendingSelectRef = useRef<string | null>(initialVisitId ?? null);
+
+  useEffect(() => {
+    setSelectedPetId(defaultPetId);
+    setActiveVisit(null);
+    setEditableOrders([]);
+  }, [defaultPetId]);
+
+  useEffect(() => {
+    if (!initialAction) return;
+    if (clinicRole === 'Receptionist') return;
+    if (initialAction === 'ml-assist') {
+      setMlInitialTranscript(undefined);
+      setMlPanelOpen(true);
+    } else if (initialAction === 'record') {
+      setRecordingPanelOpen(true);
+    } else if (initialAction === 'upload') {
+      setUploadPanelOpen(true);
+    }
+  }, [initialAction, clinicRole]);
 
   const syncClinicState = useCallback(async () => {
     try {
-      const res = await fetch(`/api/clinic/vox-soap/state?petId=${defaultPetId}`);
+      const res = await fetch(`/api/clinic/vox-soap/state?petId=${encodeURIComponent(selectedPetId)}`);
       if (!res.ok) return;
       const data = await res.json();
       const visits: VoxSoapVisitRecord[] = data.visits ?? [];
@@ -125,8 +173,7 @@ export const VoxSoapWorkspace: React.FC<{ defaultPetId?: string }> = ({
       setVisitHistory(visits);
       setAuditTrail(data.auditTrail ?? []);
 
-      // 1) Hand-off from the dashboard: select exactly the visit the user
-      //    just recorded/uploaded (never a guessed first row).
+      // 1) Hand-off from the dashboard or URL: select exactly the target visit.
       let pendingId = pendingSelectRef.current;
       if (!pendingId) {
         try {
@@ -158,7 +205,7 @@ export const VoxSoapWorkspace: React.FC<{ defaultPetId?: string }> = ({
     } catch {
       // Silent background sync
     }
-  }, [defaultPetId, activeVisit]);
+  }, [selectedPetId, activeVisit]);
 
   useEffect(() => {
     syncClinicState();
@@ -214,7 +261,7 @@ export const VoxSoapWorkspace: React.FC<{ defaultPetId?: string }> = ({
           'x-clinic-id': 'clinic-lhr-01',
         },
         body: JSON.stringify({
-          petId: defaultPetId,
+          petId: selectedPetId,
           transcript: transcriptInput,
         }),
       });
@@ -502,6 +549,71 @@ export const VoxSoapWorkspace: React.FC<{ defaultPetId?: string }> = ({
     });
   }, []);
 
+  /** Owner Fix 3.3 (2026-11-01): the ML Assistive Draft panel applies its
+   * REVIEWED draft text straight onto the four SOAP cards. The mapping is the
+   * SAME deterministic vet-scribenote contract the server hydration uses
+   * (vox-soap.vetnote.groundedFromVetNoteText), so the cards show exactly the
+   * note the veterinarian reviewed in the panel. Unrecognized objective lines
+   * are surfaced in the audit note (never dropped). Provenance honesty: an
+   * assistive-source marker is appended to groundingAuditNote; the record
+   * stays Draft (recordState unchanged) and veterinary confirmation remains
+   * mandatory; applied medication orders intentionally carry honest
+   * UNKNOWN/uncanfirmable validation until the sign-off flow re-validates
+   * them server-side (the client patch never invents a MATCH badge). */
+  const handleApplyMlAssistDraft = useCallback(
+    async (draftText: string, transcriptText?: string) => {
+      if (!draftText.trim()) return;
+      try {
+        const res = await fetch('/api/clinic/vox-soap/ml-apply', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-staff-role': staffRole,
+            'x-staff-id': staffId,
+            'x-staff-name': staffName,
+            'x-clinic-id': 'clinic-lhr-01',
+          },
+          body: JSON.stringify({
+            petId: selectedPetId,
+            draftText,
+            transcriptText: transcriptText ?? activeVisit?.rawTranscript ?? '',
+            baseVisitId: activeVisit?.recordState === 'Draft' ? activeVisit.visitId : undefined,
+          }),
+        });
+        const payload = await res.json();
+        if (!res.ok || !payload.visit) {
+          setStatusBanner({
+            type: 'error',
+            title: `Could not apply SOAP draft (HTTP ${res.status})`,
+            detail: payload.error ?? 'Failed to apply the local AI draft to the workspace.',
+          });
+          return;
+        }
+        const saved: VoxSoapVisitRecord = payload.visit;
+        sectionEditsRef.current = {};
+        setHasUnsavedEdits(false);
+        setActiveVisit(saved);
+        setEditableOrders(saved.plan.medication_orders);
+        setOpenAccordion('client');
+        setStatusBanner({
+          type: 'info',
+          title: 'Local AI SOAP draft applied — ready for vet review',
+          detail:
+            'All four SOAP sections (Subjective, Objective, Assessment, Plan) are populated as a Draft. Review any flagged medications, edit if needed, then click "Mark as Done" to sign off.',
+        });
+        setMlPanelOpen(false);
+        await syncClinicState();
+      } catch (err) {
+        setStatusBanner({
+          type: 'error',
+          title: 'Failed to apply SOAP draft',
+          detail: err instanceof Error ? err.message : String(err),
+        });
+      }
+    },
+    [activeVisit, selectedPetId, staffRole, staffId, staffName, syncClinicState]
+  );
+
   const handlePanelFallback = useCallback(() => {
     setShowTranscriptDrawer(true);
   }, []);
@@ -596,16 +708,50 @@ export const VoxSoapWorkspace: React.FC<{ defaultPetId?: string }> = ({
     }
   })();
 
+  const selectedPatientMeta =
+    WORKSPACE_PATIENTS.find((p) => p.id === selectedPetId) ?? null;
+  const activeStep: 1 | 2 | 3 =
+    !activeVisit ||
+    activeVisit.workflowStatus === 'Unsynced' ||
+    activeVisit.workflowStatus === 'Transcribing'
+      ? 1
+      : activeVisit.recordState === 'Verified' ||
+        activeVisit.workflowStatus === 'ReadyToExport' ||
+        activeVisit.workflowStatus === 'Exported'
+      ? 3
+      : 2;
+
   return (
     <div className="min-h-screen flex bg-canvas text-ink font-sans selection:bg-primary/30 selection:text-ink">
       {/* Main Clinical Workspace */}
       <div className="flex-1 flex flex-col min-w-0 pb-28">
-        {/* Top Navigation Bar */}
-        <header className="px-6 py-4 flex flex-wrap items-center justify-between gap-4 border-b border-line bg-canvas/90 backdrop-blur sticky top-0 z-30">
-          <div className="flex items-center gap-3">
-            <span className="text-2xl font-display font-extrabold tracking-tight text-ink">
-              Pawfolio<span className="text-primary ml-1.5 text-lg font-sans font-bold">VoxSOAP</span>
+        {/* Top Context & Patient Switcher Bar */}
+        <header className="px-4 sm:px-8 py-4 flex flex-wrap items-center justify-between gap-4 border-b border-line bg-canvas/90 backdrop-blur">
+          <div className="flex flex-wrap items-center gap-3">
+            <span className="text-xl sm:text-2xl font-display font-extrabold tracking-tight text-ink">
+              Pawfolio<span className="text-primary ml-1.5 text-base sm:text-lg font-sans font-bold">VoxSOAP Scribe</span>
             </span>
+            <label htmlFor="voxsoap-patient-select" className="sr-only">
+              Select patient
+            </label>
+            <select
+              id="voxsoap-patient-select"
+              value={selectedPetId}
+              onChange={(e) => {
+                const nextId = e.target.value;
+                setSelectedPetId(nextId);
+                setActiveVisit(null);
+                setEditableOrders([]);
+                router.replace(`/clinic/vox-soap?petId=${encodeURIComponent(nextId)}`);
+              }}
+              className="rounded-full bg-surface border border-line px-3 py-1.5 text-xs font-semibold text-ink focus:outline-none focus:border-primary"
+            >
+              {WORKSPACE_PATIENTS.map((p) => (
+                <option key={p.id} value={p.id}>
+                  {p.label}
+                </option>
+              ))}
+            </select>
             {snapshot && (
               <span className="px-3 py-1 rounded-full text-xs font-semibold bg-primary/15 text-primary border border-primary/30">
                 {snapshot.petName} • {snapshot.ageYears}y •{' '}
@@ -616,31 +762,101 @@ export const VoxSoapWorkspace: React.FC<{ defaultPetId?: string }> = ({
             )}
           </div>
 
-          <div className="flex items-center gap-4">
-            {/* Real signed-in profile (FR-1) — the auth gate's role IS the
-                identity; no in-workspace role impersonation switcher. */}
-            <div className="flex items-center gap-2 text-sm font-semibold text-ink">
-              <span className="px-2.5 py-1 rounded-full bg-primary/15 text-primary border border-primary/30 text-xs font-bold capitalize">
-                {clinicRole ?? 'guest'}
-              </span>
-              <span>▾ {staffName}</span>
-              <div className="w-9 h-9 rounded-full bg-primary/20 text-primary flex items-center justify-center font-bold">
-                {staffName.replace(/^Dr\.\s*/i, '').charAt(0) || '👤'}
-              </div>
-            </div>
+          <div className="flex flex-wrap items-center gap-3">
+            {selectedPatientMeta?.routeId ? (
+              <Link
+                href={`/clinic/patients/${selectedPatientMeta.routeId}`}
+                className="text-xs font-semibold text-primary-dark hover:underline"
+              >
+                View {snapshot?.petName ?? 'Patient'}&apos;s Profile →
+              </Link>
+            ) : (
+              <Link
+                href="/clinic/patients"
+                className="text-xs font-semibold text-primary-dark hover:underline"
+              >
+                All Patients →
+              </Link>
+            )}
+            <Link
+              href="/clinic/dashboard"
+              className="text-xs font-semibold text-muted hover:text-ink"
+            >
+              ← Back to Dashboard
+            </Link>
           </div>
         </header>
 
         {/* Main Content Container */}
         <main className="max-w-5xl w-full mx-auto px-4 sm:px-8 pt-6 space-y-6">
-          <h1 className="font-display text-2xl sm:text-3xl font-extrabold tracking-tight text-ink">
-            {activeVisit ? 'Edit Note' : 'Medical Notes'}
-          </h1>
+          <div className="flex flex-wrap items-end justify-between gap-3">
+            <div>
+              <h1 className="font-display text-2xl sm:text-3xl font-extrabold tracking-tight text-ink">
+                {activeVisit ? 'Review & Confirm SOAP Note' : 'VoxSOAP Consultation Notes'}
+              </h1>
+              <p className="mt-1 text-xs sm:text-sm text-muted">
+                Record or upload a consultation, verify the AI-structured SOAP draft, and sign off to publish pet-parent care cards.
+              </p>
+            </div>
+          </div>
 
-          {/* Sticky Medical Record Header & Transcript Pill Bar */}
+          {/* 3-Step Visual Workflow Stepper (Learnability & Memorability) */}
+          <ol
+            aria-label="VoxSOAP workflow steps"
+            className="grid gap-3 sm:grid-cols-3"
+          >
+            {[
+              {
+                step: 1 as const,
+                title: '1. Capture Consultation',
+                subtitle: 'Record mic or upload audio',
+              },
+              {
+                step: 2 as const,
+                title: '2. Review Transcript & SOAP',
+                subtitle: 'Check S, O, A & Plan checks',
+              },
+              {
+                step: 3 as const,
+                title: '3. Confirm & Share',
+                subtitle: 'Vet sign-off & owner care cards',
+              },
+            ].map((item) => {
+              const isCurrent = activeStep === item.step;
+              const isDone = activeStep > item.step;
+              return (
+                <li
+                  key={item.step}
+                  className={`rounded-xl border px-4 py-3 transition-colors ${
+                    isCurrent
+                      ? 'border-primary bg-primary/10'
+                      : isDone
+                      ? 'border-success/40 bg-success/5'
+                      : 'border-line bg-surface/60 opacity-80'
+                  }`}
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <span
+                      className={`text-xs font-bold ${
+                        isCurrent ? 'text-primary-dark' : isDone ? 'text-success' : 'text-ink'
+                      }`}
+                    >
+                      {item.title}
+                    </span>
+                    <span className="text-[10px] font-bold uppercase tracking-wider text-muted">
+                      {isDone ? '✓ Done' : isCurrent ? 'Current' : 'Next'}
+                    </span>
+                  </div>
+                  <p className="mt-0.5 text-xs text-muted">{item.subtitle}</p>
+                </li>
+              );
+            })}
+          </ol>
+
+          {/* Sticky Medical Record Header & Capture Actions */}
           <div className="bg-surface border border-line rounded-2xl p-4 sm:p-5 shadow-md space-y-4">
             <div className="flex flex-wrap items-center justify-between gap-3">
-              <div className="flex items-center gap-3">
+              <div className="flex flex-wrap items-center gap-3">
                 <div className="w-7 h-7 rounded-md bg-primary flex items-center justify-center font-bold text-canvas">
                   +
                 </div>
@@ -650,11 +866,8 @@ export const VoxSoapWorkspace: React.FC<{ defaultPetId?: string }> = ({
                 <span
                   className={`px-3 py-0.5 rounded-full text-xs font-bold uppercase tracking-wide border ${recordStatePillClass}`}
                 >
-                  {activeVisit ? `${activeVisit.recordState} (v${activeVisit.version})` : 'REVIEW'}
+                  {activeVisit ? `${activeVisit.recordState} (v${activeVisit.version})` : 'NEW CONSULTATION'}
                 </span>
-                {/* Scribenote-style pipeline pill: where this note is in
-                    Unsynced → Transcribing → Available for Review → Ready to
-                    Export → Exported (IS-13 workflow layer). */}
                 {activeVisit && (
                   <span
                     className={`px-3 py-0.5 rounded-full text-xs font-bold uppercase tracking-wide border ${workflowPillClass}`}
@@ -664,45 +877,32 @@ export const VoxSoapWorkspace: React.FC<{ defaultPetId?: string }> = ({
                 )}
               </div>
 
-              <div className="flex items-center gap-4 text-xs text-muted font-medium">
+              <div className="flex flex-wrap items-center gap-3 text-xs text-muted font-medium">
                 <span>
                   {activeVisit
-                    ? `✓ ${activeVisit.sourceType.replace(/_/g, ' ')}`
-                    : 'No note processed yet'}
+                    ? activeVisit.sourceType === 'ML_Local_Draft'
+                      ? '✓ Local AI Draft (Pending Vet Review)'
+                      : `✓ ${activeVisit.sourceType.replace(/_/g, ' ')}`
+                    : 'Ready to start'}
                 </span>
-                {audioMeta && <span>🎧 {audioMeta} · scrubbed after transcription</span>}
+                {audioMeta && <span>🎧 {audioMeta} · Audio auto-deleted after transcription</span>}
               </div>
             </div>
 
-            {/* Transcript Pill + New Recording / Upload Buttons */}
-            <div className="flex flex-wrap items-center gap-3">
-              <div className="flex-1 min-w-[260px] bg-sidebar border border-line rounded-full px-4 py-2.5 flex items-center gap-3">
-                <div className="w-7 h-7 rounded-full flex items-center justify-center bg-primary/20 text-primary text-sm">
-                  🎧
-                </div>
-                <span className="text-xs font-semibold font-mono shrink-0 text-muted">
-                  {activeVisit && audioMeta ? audioMeta : 'No audio processed yet'}
-                </span>
-                <div className="flex-1 h-1.5 bg-canvas rounded-full overflow-hidden">
-                  <div
-                    className={`h-full transition-all ${
-                      isRecording ? 'w-full bg-error animate-pulse' : activeVisit ? 'w-1/3 bg-primary' : 'w-0'
-                    }`}
-                  />
-                </div>
-                <span className="text-[11px] text-muted shrink-0 hidden sm:block">
-                  Deleted_After_Transcription
-                </span>
-              </div>
-
+            {/* Simplified Primary Capture Row (clear hierarchy) */}
+            <div className="flex flex-wrap items-center gap-2.5">
               <button
                 type="button"
-                onClick={handleExtractFromTranscript}
-                disabled={isExtracting || transcriptInput.trim().length < 10}
-                title="Extract Grounded SOAP Draft from Consultation Transcript (FR-30 fallback)"
-                className="w-10 h-10 rounded-full bg-primary hover:bg-primary-dark text-canvas flex items-center justify-center shadow-md transition disabled:opacity-40 font-bold"
+                onClick={() => {
+                  setMlInitialTranscript(undefined);
+                  setMlPanelOpen(true);
+                }}
+                disabled={isRecording || isExtracting}
+                title="Recommended: record mic or upload audio locally to generate a structured 4-part SOAP draft"
+                className="px-5 py-2.5 rounded-full bg-primary hover:bg-primary-dark text-canvas font-bold text-sm flex items-center gap-2 shadow-md transition disabled:opacity-40"
               >
-                {isExtracting ? '…' : '✨'}
+                <span>🎙️</span>
+                <span>Record or Upload Consultation</span>
               </button>
 
               {!isRecording ? (
@@ -710,35 +910,48 @@ export const VoxSoapWorkspace: React.FC<{ defaultPetId?: string }> = ({
                   type="button"
                   onClick={() => setRecordingPanelOpen(true)}
                   disabled={isExtracting}
-                  title="Dedicated New Recording panel (capture-hardened)"
-                  className="px-4 py-2.5 rounded-full bg-primary hover:bg-primary-dark text-canvas font-bold text-sm flex items-center gap-2 shadow-md transition"
+                  title="Auto-save mic recording straight into this patient's visit list"
+                  className="px-4 py-2.5 rounded-full bg-sidebar hover:bg-[#33281f] text-ink font-semibold text-xs sm:text-sm flex items-center gap-2 border border-line transition"
                 >
-                  <span>🎙️</span>
-                  <span>New Recording</span>
+                  <span>⏺</span>
+                  <span>Quick Mic</span>
                 </button>
               ) : (
                 <button
                   type="button"
                   onClick={() => setRecordingPanelOpen(true)}
-                  className="px-4 py-2.5 rounded-full bg-error hover:bg-error/90 text-canvas font-bold text-sm flex items-center gap-2 animate-pulse shadow-md"
+                  className="px-4 py-2.5 rounded-full bg-error hover:bg-error/90 text-canvas font-bold text-xs sm:text-sm flex items-center gap-2 animate-pulse shadow-md"
                 >
                   <span>⏺</span>
                   <span>LIVE ({recordingSeconds}s)</span>
                 </button>
               )}
 
-              {/* Scribenote parity: web-only audio upload path. Client-side
-                  validation mirrors the server (MIME whitelist + 25 MB, NFR-3). */}
               <button
                 type="button"
                 onClick={() => setUploadPanelOpen(true)}
                 disabled={isRecording || isExtracting}
-                title="Upload an existing consultation audio file (WebM / WAV / MP3 / M4A / AAC / OGG / FLAC, max 25 MB)"
-                className="px-4 py-2.5 rounded-full bg-sidebar hover:bg-[#33281f] text-ink font-bold text-sm flex items-center gap-2 border border-line shadow-md transition disabled:opacity-40"
+                title="Upload an existing consultation audio file (WAV / MP3 / M4A / WebM / OGG, max 25 MB)"
+                className="px-4 py-2.5 rounded-full bg-sidebar hover:bg-[#33281f] text-ink font-semibold text-xs sm:text-sm flex items-center gap-2 border border-line transition disabled:opacity-40"
               >
                 <span>📎</span>
-                <span>Upload Audio</span>
+                <span>Quick Upload</span>
               </button>
+
+              <button
+                type="button"
+                onClick={() => setShowTranscriptDrawer((prev) => !prev)}
+                disabled={isExtracting}
+                title="Type or paste a consultation transcript manually"
+                className="px-4 py-2.5 rounded-full bg-sidebar hover:bg-[#33281f] text-muted hover:text-ink font-semibold text-xs sm:text-sm flex items-center gap-2 border border-line transition disabled:opacity-40"
+              >
+                <span>📝</span>
+                <span>Type / Paste Transcript</span>
+              </button>
+
+              <div className="ml-auto hidden sm:flex items-center gap-2 text-[11px] text-muted">
+                <span>🔒 Audio auto-deleted after transcription (Privacy Protected)</span>
+              </div>
             </div>
 
             {/* Metadata Inputs & Sign-off / Export Row */}
@@ -886,33 +1099,43 @@ export const VoxSoapWorkspace: React.FC<{ defaultPetId?: string }> = ({
             </div>
           )}
 
-          {/* Empty state — no invented demo record; capture CTAs only. */}
+          {/* Empty state — welcoming, clear 3-step onboarding with sample option. */}
           {!activeVisit && (
-            <section className="rounded-2xl border border-line bg-surface p-10 text-center space-y-4">
+            <section className="rounded-2xl border border-line bg-surface p-8 sm:p-10 text-center space-y-4">
               <div className="text-5xl">🎙️</div>
-              <h2 className="font-display text-xl font-bold text-ink">No consultation notes yet</h2>
+              <h2 className="font-display text-xl sm:text-2xl font-extrabold text-ink">
+                Start {snapshot?.petName ? `${snapshot.petName}'s` : 'a'} Consultation Note
+              </h2>
               <p className="max-w-xl mx-auto text-sm text-muted leading-relaxed">
-                Everything in this workspace is grounded in a real consultation. Record live audio
-                or upload an existing audio file — Gemini transcribes it, every claim is verified
-                verbatim against the transcript, and unspoken exam fields stay &ldquo;Not
-                mentioned&rdquo; (FR-27/28).
+                Speak naturally or upload an audio recording of the exam. Pawfolio&apos;s local AI transcribes the visit and turns it into a structured{' '}
+                <strong className="text-ink">Subjective, Objective, Assessment &amp; Plan</strong> draft — nothing is guessed, and nothing becomes official until you sign off.
               </p>
               <div className="flex flex-wrap items-center justify-center gap-3 pt-2">
                 <button
                   type="button"
-                  onClick={() => setRecordingPanelOpen(true)}
-                  className="px-5 py-2.5 rounded-xl bg-primary hover:bg-primary-dark text-canvas font-bold text-sm"
+                  onClick={() => {
+                    setMlInitialTranscript(undefined);
+                    setMlPanelOpen(true);
+                  }}
+                  className="px-6 py-3 rounded-xl bg-primary hover:bg-primary-dark text-canvas font-bold text-sm shadow-md transition"
                 >
-                  🎙️ New Recording
+                  🎙️ Record or Upload Consultation
                 </button>
                 <button
                   type="button"
-                  onClick={() => setUploadPanelOpen(true)}
-                  className="px-5 py-2.5 rounded-xl bg-sidebar hover:bg-[#33281f] text-ink font-bold text-sm border border-line"
+                  onClick={() => {
+                    setMlInitialTranscript(SAMPLE_LEO_CONSULTATION);
+                    setMlPanelOpen(true);
+                  }}
+                  className="px-5 py-3 rounded-xl bg-sidebar hover:bg-[#33281f] text-ink font-bold text-sm border border-line transition"
+                  title="Pre-load a realistic veterinary consultation transcript to test local AI SOAP generation immediately"
                 >
-                  📎 Upload Audio
+                  ✨ Try Sample Consultation (Leo)
                 </button>
               </div>
+              <p className="text-xs text-muted">
+                Audio is processed locally on your clinic machine and auto-deleted after transcription.
+              </p>
             </section>
           )}
 
@@ -927,7 +1150,7 @@ export const VoxSoapWorkspace: React.FC<{ defaultPetId?: string }> = ({
                     </span>
                     <h2 className="font-display font-bold text-ink">Subjective</h2>
                     <span className="hidden sm:inline text-xs text-muted">
-                      History — verbatim quoted or empty (FR-28)
+                      History &amp; presenting complaint (quoted from consultation)
                     </span>
                   </div>
                   <button
@@ -975,7 +1198,7 @@ export const VoxSoapWorkspace: React.FC<{ defaultPetId?: string }> = ({
                     </span>
                     <h2 className="font-display font-bold text-ink">Objective</h2>
                     <span className="hidden sm:inline text-xs text-muted">
-                      FR-28 Null-Safe Grounding (23 parameters)
+                      23 standard exam checks (unstated items stay &lsquo;Not mentioned&rsquo;)
                     </span>
                   </div>
                   <div className="flex items-center gap-2">
@@ -1047,7 +1270,7 @@ export const VoxSoapWorkspace: React.FC<{ defaultPetId?: string }> = ({
                     </span>
                     <h2 className="font-display font-bold text-ink">Assessment</h2>
                     <span className="hidden sm:inline text-xs text-muted">
-                      Only verdicts quoted from the transcript survive grounding
+                      Diagnoses &amp; clinical reasoning (traceable to transcript)
                     </span>
                   </div>
                 </div>
@@ -1096,7 +1319,7 @@ export const VoxSoapWorkspace: React.FC<{ defaultPetId?: string }> = ({
                     </span>
                     <h2 className="font-display font-bold text-ink">Plan</h2>
                     <span className="hidden sm:inline text-xs text-muted">
-                      Deterministic order validation &amp; fuzzy catalog check (FR-10)
+                      Treatments, prescriptions &amp; follow-up (checked against clinic formulary)
                     </span>
                   </div>
                 </div>
@@ -1190,12 +1413,26 @@ export const VoxSoapWorkspace: React.FC<{ defaultPetId?: string }> = ({
                             {v.drugValidationStatus === 'NEEDS_REVIEW' && v.matchedCanonicalDrug && (
                               <div className="p-3 rounded-lg bg-canvas border border-warning/50 flex flex-wrap items-center justify-between gap-2 text-xs">
                                 <div className="text-ink">
-                                  Phonetic typo detected:{' '}
-                                  <strong className="text-warning">
-                                    &ldquo;{order.medicine_name}&rdquo;
-                                  </strong>{' '}
-                                  closely matches reviewed catalog entry{' '}
-                                  <strong className="text-success">{v.matchedCanonicalDrug}</strong>.
+                                  {v.suggestedPrompt ? (
+                                    <span>
+                                      <strong className="text-warning">{v.suggestedPrompt}</strong>{' '}
+                                      <span className="text-muted">(verbatim spoken: &ldquo;{order.medicine_name}&rdquo;)</span>
+                                    </span>
+                                  ) : (
+                                    <>
+                                      Phonetic typo detected:{' '}
+                                      <strong className="text-warning">
+                                        &ldquo;{order.medicine_name}&rdquo;
+                                      </strong>{' '}
+                                      closely matches reviewed catalog entry{' '}
+                                      <strong className="text-success">{v.matchedCanonicalDrug}</strong>.
+                                    </>
+                                  )}
+                                  {v.allergyConflictDetected && v.allergyConflictReason && (
+                                    <div className="text-rose-400 font-semibold mt-1">
+                                      ⚠ {v.allergyConflictReason}
+                                    </div>
+                                  )}
                                 </div>
                                 <button
                                   type="button"
@@ -1206,6 +1443,12 @@ export const VoxSoapWorkspace: React.FC<{ defaultPetId?: string }> = ({
                                 >
                                   ✓ Replace with &ldquo;{v.matchedCanonicalDrug}&rdquo;
                                 </button>
+                              </div>
+                            )}
+
+                            {v.drugValidationStatus === 'UNKNOWN' && order.medicine_name && (
+                              <div className="p-3 rounded-lg bg-canvas border border-rose-500/40 text-xs text-rose-200">
+                                <strong>[UNVERIFIED DRUG: &ldquo;{order.medicine_name}&rdquo;]</strong> — No confident match in clinic formulary; edit manually or confirm before Mark as Done (zero substitution applied).
                               </div>
                             )}
 
@@ -1324,10 +1567,10 @@ export const VoxSoapWorkspace: React.FC<{ defaultPetId?: string }> = ({
                 <div>
                   <div className="font-display font-bold text-base text-ink flex items-center gap-2">
                     <span>🏠</span>
-                    <span>Client Summary &amp; Deterministic Care Cards (FR-15 / FR-16)</span>
+                    <span>Pet-Parent Summary &amp; Care Cards</span>
                   </div>
                   <p className="text-xs text-muted mt-0.5">
-                    Generated by fixed rules only after the Veterinarian clicks
+                    Plain-language home schedule generated automatically once the veterinarian clicks
                     &ldquo;Mark as Done&rdquo;.
                   </p>
                 </div>
@@ -1381,10 +1624,10 @@ export const VoxSoapWorkspace: React.FC<{ defaultPetId?: string }> = ({
                 <div>
                   <div className="font-display font-bold text-base text-ink flex items-center gap-2">
                     <span>📤</span>
-                    <span>Export Note &amp; Immutable Provenance Audit Log (FR-26)</span>
+                    <span>Export Note &amp; Verification Audit Log</span>
                   </div>
                   <p className="text-xs text-muted mt-0.5">
-                    Inspect every state transition, role check, and version supersession (
+                    Inspect every state transition, role check, and version history (
                     {auditTrail.length} events).
                   </p>
                 </div>
@@ -1417,20 +1660,20 @@ export const VoxSoapWorkspace: React.FC<{ defaultPetId?: string }> = ({
         </main>
 
         {/* Floating Bottom Center "Show Transcript ^" Drawer Trigger */}
-        <div className="fixed bottom-0 left-16 sm:left-20 right-0 z-40 flex flex-col items-center pointer-events-none">
+        <div className="fixed bottom-0 left-0 lg:left-60 right-0 z-40 flex flex-col items-center pointer-events-none">
           <button
             type="button"
             onClick={() => setShowTranscriptDrawer((prev) => !prev)}
             className="pointer-events-auto px-6 py-2.5 rounded-t-2xl bg-primary hover:bg-primary-dark text-canvas font-bold text-sm shadow-2xl flex items-center gap-2 border border-b-0 border-primary-dark/50"
           >
-            <span>{showTranscriptDrawer ? 'Hide Transcript ▾' : 'Show Transcript ▴'}</span>
+            <span>{showTranscriptDrawer ? 'Hide Transcript ▾' : 'Manual Transcript Entry ▴'}</span>
           </button>
 
           {showTranscriptDrawer && (
             <div className="pointer-events-auto w-full max-w-4xl bg-abyss border-t border-x border-line p-5 shadow-2xl space-y-3">
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <span className="text-xs font-bold uppercase tracking-wider text-muted">
-                  Consultation Transcript Fallback (FR-30)
+                  Manual Transcript Entry (No Audio Required)
                 </span>
                 <div className="flex items-center gap-2">
                   <button
@@ -1460,13 +1703,13 @@ export const VoxSoapWorkspace: React.FC<{ defaultPetId?: string }> = ({
             Transcribing statuses, and completes a recording shell via /extract. */}
         <NewRecordingPanel
           open={recordingPanelOpen}
-          defaultPetId={defaultPetId}
+          defaultPetId={selectedPetId}
           staffRole={staffRole}
           staffId={staffId}
           staffName={staffName}
           isExtracting={isExtracting}
           accent="amber"
-          contextLabel="Voice note • demo patient Leo"
+          contextLabel={`Voice note • ${snapshot?.petName ?? 'Patient'}`}
           onClose={() => setRecordingPanelOpen(false)}
           onCompleted={handlePanelRecorded}
           onFallbackRequested={handlePanelFallback}
@@ -1477,14 +1720,31 @@ export const VoxSoapWorkspace: React.FC<{ defaultPetId?: string }> = ({
             whitelist, 25 MB guard, and grounded statuses. */}
         <UploadAudioPanel
           open={uploadPanelOpen}
-          defaultPetId={defaultPetId}
+          defaultPetId={selectedPetId}
           staffRole={staffRole}
           staffId={staffId}
           staffName={staffName}
           accent="amber"
-          contextLabel="Upload • demo patient Leo"
+          contextLabel={`Upload • ${snapshot?.petName ?? 'Patient'}`}
           onClose={() => setUploadPanelOpen(false)}
           onCompleted={handlePanelRecorded}
+        />
+
+        {/* Phase 5: LOCAL ML assistive draft panel — 16 kHz PCM WAV capture
+            into the localhost VoxSOAP service (proxy /api/voxsoap/*). */}
+        <MLAssistPanel
+          open={mlPanelOpen}
+          staffRole={staffRole}
+          staffId={staffId}
+          staffName={staffName}
+          accent="amber"
+          contextLabel={`${snapshot?.petName ?? 'Patient'} • Local AI Scribe`}
+          initialTranscript={mlInitialTranscript}
+          onClose={() => {
+            setMlPanelOpen(false);
+            setMlInitialTranscript(undefined);
+          }}
+          onApplyDraft={handleApplyMlAssistDraft}
         />
       </div>
     </div>

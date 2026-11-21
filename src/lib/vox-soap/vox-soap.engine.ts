@@ -1,6 +1,7 @@
 // File: d:\Pawfolio AI\src\lib\vox-soap\vox-soap.engine.ts
 import { GoogleGenAI } from '@google/genai';
 import { z } from 'zod';
+import http from 'node:http';
 import {
   CLINIC_APPROVED_VACCINES,
   CLINIC_REVIEWED_DRUG_CATALOG,
@@ -11,6 +12,7 @@ import {
   GroundedSoapExtractionSchema,
 } from './vox-soap.schema';
 import {
+  PatientSnapshotContext,
   StaffSessionContext,
   VoxSoapVisitRecord,
 } from './vox-soap.types';
@@ -23,6 +25,7 @@ import {
   buildGroundingAuditNote,
   verifyGroundedClaims,
 } from './vox-soap.workflow';
+import { groundedFromVetSections } from './vox-soap.vetnote';
 
 export interface VoxSoapExtractionInput {
   petId: string;
@@ -34,6 +37,76 @@ export interface VoxSoapExtractionInput {
   recordingId?: string;
   /** ISO client timestamp proving recording consent (NFR-5 / consent kit). */
   consentAt?: string;
+  /**
+   * Explicit transcription-provider override. The default resolves through
+   * `resolveTranscribeProvider()`: **local-first** (`VOXSOAP_TRANSCRIBE_PROVIDER`,
+   * default "ml") — the 2026-10-31 owner mandate makes keyless local
+   * development NEVER touch or mention Gemini during audio transcription.
+   */
+  transcribeProvider?: 'ml' | 'gemini';
+  /** /transcribe language contract (validated upstream, "ur" default). */
+  asrLanguage?: 'ur' | 'en' | 'auto';
+}
+
+/** Local-first transcription routing (2026-10-31). Gemini is now an
+ * EXPLICIT opt-in transport (`VOXSOAP_TRANSCRIBE_PROVIDER=gemini`), never a
+ * fallback — the reverse of the old behaviour, which complained about a
+ * missing GEMINI_API_KEY and degraded to the deterministic parser whenever
+ * the key was absent. */
+export type TranscribeProvider = 'ml' | 'gemini';
+
+export function resolveTranscribeProvider(override?: string | null): TranscribeProvider {
+  const value = (override ?? process.env.VOXSOAP_TRANSCRIBE_PROVIDER ?? 'ml')
+    .trim()
+    .toLowerCase();
+  if (value === 'ml' || value === 'gemini') return value;
+  throw new Error(
+    `unsupported transcribe provider ${value}; allowed: ml | gemini (got via override ${String(
+      override ?? 'unset'
+    )})`
+  );
+}
+
+const ML_BASE_URL = process.env.VOXSOAP_BASE_URL ?? 'http://127.0.0.1:8321';
+/** A 13-minute recording = 26 Whisper windows; fp32 CPU decode is
+ * window-serial. The budget mirrors the proxy's 900 s honest ceiling. */
+const ML_TRANSCRIBE_TIMEOUT_MS = Number(process.env.VOXSOAP_ML_TRANSCRIBE_TIMEOUT_MS ?? 900_000);
+/** Owner Fix 2 (2026-11-01): the local /draft budget — bf16 CPU 3B inference
+ * takes minutes; mirrors the same honest 900 s ceiling as transcription. */
+const ML_DRAFT_TIMEOUT_MS = Number(process.env.VOXSOAP_ML_DRAFT_TIMEOUT_MS ?? 900_000);
+
+/** Strips MediaRecorder/OS parameters and vendor wave aliases — the ML audio
+ * contract compares BASE MIME only (same normalization as the proxy panels). */
+function normalizeBaseMime(rawMime: string): string {
+  const base = rawMime.split(';')[0].trim().toLowerCase();
+  return base === 'audio/wave' || base === 'audio/vnd.wave' ? 'audio/wav' : base;
+}
+
+/** Shape of the ml-serving /transcribe envelope (honest: ok=false is surfaced
+ * as a thrown error; text/windows are validated before any use). */
+interface MlTranscribeEnvelope {
+  ok?: unknown;
+  text?: unknown;
+  windows?: unknown;
+  message?: string;
+  error?: string;
+}
+
+/** Shape of the ml-serving /draft vet_scribenote envelope (owner Fix 2): the
+ * hydrated sections object is validated at this boundary before mapping —
+ * anything missing is an honest error, never a silently empty card. */
+interface MlVetDraftEnvelope {
+  ok?: unknown;
+  draft?: unknown;
+  sections?: {
+    subjective?: unknown;
+    objective_map?: unknown;
+    objective_text?: unknown;
+    assessment?: unknown;
+    plan?: unknown;
+  } | null;
+  message?: string;
+  error?: string;
 }
 
 /**
@@ -545,12 +618,84 @@ MANDATORY CLINICAL SAFETY & GROUNDING RULES:
     let usedModelForAudit: string | null = null;
     let aiErrorMessage: string | null = null;
 
-    try {
-      if (!this.aiClients.length) {
-        throw new Error('GEMINI_API_KEY is not configured; switching to deterministic fallback parser.');
-      }
+    // Local-first routing diagnostics (2026-10-31): declared OUTSIDE the try so
+    // the audit metadata stays populated even when the ml path fails midway.
+    let effectiveProvider: TranscribeProvider | null = null;
+    const asrLanguage: 'ur' | 'en' | 'auto' = input.asrLanguage ?? 'ur';
+    let mlTranscriptionWindows: number | null = null;
+    // Owner Fix 2/3 (2026-11-01): the verbatim transcript is stashed OUTSIDE
+    // the try so a failed local /draft still preserves it verbatim in the
+    // honest fallback template (the transcript was real — never discarded).
+    let mlLocalTranscript: string | null = null;
 
-      const contents: Array<Record<string, unknown> | string> = [];
+    try {
+      effectiveProvider = resolveTranscribeProvider(input.transcribeProvider);
+
+      if (effectiveProvider === 'ml' && input.audioBuffer && input.audioMimeType) {
+        // ---- LOCAL-ML TRANSCRIPTION BRANCH (2026-10-31 owner mandate) ----
+        // The engine calls the local ml-serving Whisper DIRECTLY and NEVER
+        // touches Gemini in this mode: local-first means local-only. The
+        // transcript is preserved verbatim and the deterministic template
+        // keeps the visit honest until a vet structures/reviews it.
+        //
+        // Audio-mime contract BEFORE any state change or model work: the
+        // service decodes 16 kHz mono PCM WAV only and never resamples, so a
+        // non-WAV payload always means the client bypassed the delivery
+        // contract (the route 415s earlier; this is defense-in-depth).
+        if (normalizeBaseMime(input.audioMimeType) !== 'audio/wav') {
+          throw new Error(
+            `local-ML transcription requires the 16 kHz mono PCM WAV contract — got '${input.audioMimeType}'. Deliver audio client-side (decodeAndResampleToWav16k / startPcm16Capture); the ml-serving server never resamples.`
+          );
+        }
+
+        // Scribenote-style status persistence: the shell flips to
+        // 'Transcribing' the moment local transcription begins.
+        if (shellVisit) {
+          voxSoapStore.saveVisit({
+            ...shellVisit,
+            workflowStatus: 'Transcribing',
+            workflowRecording: {
+              ...shellVisit.workflowRecording,
+              audioMimeType: input.audioMimeType ?? shellVisit.workflowRecording.audioMimeType,
+              audioSizeBytes:
+                input.audioBuffer?.length ?? shellVisit.workflowRecording.audioSizeBytes,
+              consentAt: input.consentAt ?? shellVisit.workflowRecording.consentAt,
+            },
+            updatedAt: new Date().toISOString(),
+          });
+        }
+
+        const transcription = await this.mlTranscribe(input.audioBuffer, asrLanguage);
+        mlTranscriptionWindows = transcription.windows;
+        const localTranscript = transcription.text.trim();
+        if (!localTranscript) {
+          throw new Error(
+            'The local ML service finished but returned an empty transcript — nothing invented; check the recording and retry.'
+          );
+        }
+        mlLocalTranscript = localTranscript;
+        usedModelForAudit = `voxsoap-local-ml:whisper(language=${asrLanguage})`;
+        // Owner Fixes 2+3 (2026-11-01): structure through the LOCAL /draft
+        // (format "vet_scribenote" — base-weights Qwen + deterministically
+        // hydrated 23-parameter veterinary objective). NEVER the medscribe
+        // adapter bias, NEVER Gemini; a failure here is thrown into the
+        // honest catch (aiError audited + deterministic template that now
+        // keeps the full transcript, since mlLocalTranscript is stashed).
+        const localDraft = await this.mlLocalDraft(localTranscript);
+        usedModelForAudit = `voxsoap-local-ml:whisper(language=${asrLanguage})→qwen-draft(vet_scribenote)`;
+        sourceType = 'ML_Local_Draft';
+        extracted = groundedFromVetSections(localDraft, localTranscript);
+      } else {
+        // ---- GEMINI STRUCTURING PATH (unchanged behaviour) ----
+        // Reached for the explicit 'gemini' provider (audio or text) AND for
+        // 'ml' text-only payloads — with no audio there is nothing to
+        // transcribe, so such requests keep their existing structuring
+        // behaviour (deliberately NOT silently rerouted anywhere). The key
+        // check lives HERE so keyless ml-audio mode never mentions Gemini.
+        if (!this.aiClients.length) {
+          throw new Error('GEMINI_API_KEY is not configured; switching to deterministic fallback parser.');
+        }
+        const contents: Array<Record<string, unknown> | string> = [];
       if (input.audioBuffer && input.audioMimeType) {
         contents.push({
           inlineData: {
@@ -637,6 +782,7 @@ MANDATORY CLINICAL SAFETY & GROUNDING RULES:
 
       const cleanJson = rawText.replace(/^```json\s*|\s*```$/g, '').trim();
       extracted = GroundedSoapExtractionSchema.parse(JSON.parse(cleanJson));
+      }
     } catch (aiError) {
       const message = aiError instanceof Error ? aiError.message : String(aiError);
       aiErrorMessage = message.slice(0, 480);
@@ -650,7 +796,7 @@ MANDATORY CLINICAL SAFETY & GROUNDING RULES:
         : input.transcriptText && input.transcriptText.trim()
         ? 'Text_Only_Input'
         : 'Manual_Fallback';
-      extracted = this.buildManualFallbackTemplate(input.transcriptText ?? '');
+      extracted = this.buildManualFallbackTemplate(input.transcriptText ?? mlLocalTranscript ?? '');
     } finally {
       // Ephemeral audio cleanup: zero out buffer reference immediately after transcription
       if (input.audioBuffer) {
@@ -737,6 +883,8 @@ MANDATORY CLINICAL SAFETY & GROUNDING RULES:
       action:
         sourceType === 'Manual_Fallback_Draft'
           ? 'AI_FALLBACK_TRIGGERED'
+          : sourceType === 'ML_Local_Draft'
+          ? 'ML_LOCAL_TRANSCRIPTION_DRAFT'
           : 'DICTATION_DRAFT_CREATED',
       previousState: shellVisit ? shellVisit.recordState : null,
       newState: 'Draft',
@@ -749,6 +897,10 @@ MANDATORY CLINICAL SAFETY & GROUNDING RULES:
         audioSizeRatioDeleted: audioRetentionStatus === 'Deleted_After_Transcription',
         aiModel: usedModelForAudit,
         aiError: aiErrorMessage,
+        transcriptionProvider: effectiveProvider ?? 'unset',
+        ...(effectiveProvider === 'ml'
+          ? { asrLanguage, transcriptionWindows: mlTranscriptionWindows }
+          : {}),
       },
     });
 
@@ -769,21 +921,323 @@ MANDATORY CLINICAL SAFETY & GROUNDING RULES:
     return visitRecord;
   }
 
+  /**
+   * Owner connectivity fix (2026-11-04): a 2-second /health pre-check BEFORE
+   * any multi-megabyte POST to the local service. A dead/hung/OOM-crashed
+   * service surfaces in ~2 s with an explicit, actionable message instead of
+   * after a long upload/failure cycle. Network failures are logged with the
+   * OS error code (ECONNREFUSED / ECONNRESET / ETIMEDOUT) into the server
+   * console for diagnosis.
+   */
+  private async assertLocalServiceHealthy(component: 'transcribe' | 'draft'): Promise<void> {
+    try {
+      const health = await fetch(`${ML_BASE_URL}/health`, {
+        cache: 'no-store',
+        signal: AbortSignal.timeout(2000),
+      });
+      if (health.ok) return; // service reachable and healthy — proceed
+      const detail = (await health.text().catch(() => '')).slice(0, 160);
+      console.error(
+        `[VoxSOAP Engine] ${ML_BASE_URL}/health answered HTTP ${health.status} before ${component} :: ${detail}`
+      );
+      throw new Error(
+        `Local ML service answered HTTP ${health.status} on its /health at ${ML_BASE_URL} before the ${component} upload — the service is up but UNHEALTHY. Check the ML console for crashes or memory errors, restart start-voxsoap-local.bat, then press ↻ Retry transcription. Nothing was invented; nothing was sent to any other provider.`
+      );
+    } catch (err) {
+      // The unhealthy-service throw is re-raised verbatim (exact identity
+      // preserved); ONLY genuine network failures are classified here.
+      if (err instanceof Error && err.message.startsWith('Local ML service answered HTTP')) throw err;
+      const causeCode =
+        (err as { cause?: { code?: string } })?.cause?.code ??
+        (err instanceof Error && err.name === 'TimeoutError' ? 'ETIMEDOUT (2 s pre-check budget)' : 'unknown');
+      console.error(
+        `[VoxSOAP Engine] /health pre-check to ${ML_BASE_URL} failed before ${component} (code=${causeCode}):`,
+        err
+      );
+      throw new Error(
+        `Local ML service at ${ML_BASE_URL} could not be reached. Restart both windows (start-voxsoap-local.bat) and retry — then press ↻ Retry transcription to re-send this exact ${component === 'transcribe' ? 'file' : 'transcript'}. (engine pre-check code=${causeCode})`
+      );
+    }
+  }
+
+  /**
+   * Owner transport fix (2026-11-04): undici's global fetch enforces a FIXED
+   * 300 s `headersTimeout` — a minutes-long local ml call gets its socket
+   * killed with `UND_ERR_HEADERS_TIMEOUT` (observed live on /draft at
+   * exactly 300 s in the 5-minute drill) and `AbortSignal.timeout` CANNOT
+   * raise that cap. Both long local calls therefore ride `node:http` (no
+   * headersTimeout), with the whole budget enforced via `req.setTimeout`
+   * and a sentinel `TIMEOUT_BUDGET_<N>s` error that the callers classify as
+   * an honest processing-timeout (distinct from a connection refusal,
+   * which arrives as a flat ECONNREFUSED `.code` on the request error).
+   */
+  private requestLocal(
+    urlString: string,
+    contentTypeHeader: string,
+    body: Buffer,
+    budgetMs: number
+  ): Promise<{ status: number; body: string }> {
+    return new Promise((resolve, reject) => {
+      const url = new URL(urlString);
+      const req = http.request(
+        {
+          host: url.hostname,
+          port: Number(url.port || 80),
+          path: `${url.pathname}${url.search}`,
+          method: 'POST',
+          // `connection: close` mirrors the committed probe contract: the
+          // service answers once, nobody reuses the socket.
+          headers: {
+            'content-type': contentTypeHeader,
+            'content-length': String(body.length),
+            connection: 'close',
+          },
+        },
+        (res) => {
+          const chunks: Buffer[] = [];
+          res.on('data', (chunk: Buffer) => chunks.push(chunk));
+          res.on('error', (resErr) => reject(resErr));
+          res.on('end', () => {
+            resolve({ status: res.statusCode ?? 0, body: Buffer.concat(chunks).toString('utf8') });
+          });
+        }
+      );
+      // During a long CPU decode the service is SILENT, so socket
+      // inactivity == the whole processing window: this one timeout IS the
+      // honest budget (nothing beneath it can cut in). Firing destroys the
+      // request with our sentinel error.
+      req.setTimeout(budgetMs, () => {
+        req.destroy(new Error(`TIMEOUT_BUDGET_${Math.round(budgetMs / 1000)}s`));
+      });
+      req.on('error', (reqErr) => reject(reqErr));
+      req.end(body);
+    });
+  }
+
+  /** Multipart twin of the committed probe contract on the node:http
+   * transport — the SAME wire format (audio + language fields) the
+   * local service already ingests. */
+  private postMultipartLocal(
+    pathname: string,
+    fields: Record<string, string>,
+    file: { field: string; filename: string; contentType: string; bytes: Buffer },
+    budgetMs: number
+  ): Promise<{ status: number; body: string }> {
+    const boundary = `----voxsoap-local-${Date.now().toString(36)}-${Math.random().toString(16).slice(2, 10)}`;
+    const parts: Buffer[] = [];
+    for (const [name, value] of Object.entries(fields)) {
+      parts.push(
+        Buffer.from(
+          `--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${value}\r\n`,
+          'utf8'
+        )
+      );
+    }
+    parts.push(
+      Buffer.concat([
+        Buffer.from(
+          `--${boundary}\r\nContent-Disposition: form-data; name="${file.field}"; filename="${file.filename}"\r\nContent-Type: ${file.contentType}\r\n\r\n`,
+          'utf8'
+        ),
+        file.bytes,
+        Buffer.from(`\r\n--${boundary}--\r\n`, 'utf8'),
+      ])
+    );
+    return this.requestLocal(
+      `${ML_BASE_URL}${pathname}`,
+      `multipart/form-data; boundary=${boundary}`,
+      Buffer.concat(parts),
+      budgetMs
+    );
+  }
+
+  /** JSON sibling used by the long-running /draft call — same budget rules,
+   * same node:http behaviour (no undici headersTimeout). */
+  private postJsonLocal(
+    pathname: string,
+    payload: Record<string, unknown>,
+    budgetMs: number
+  ): Promise<{ status: number; body: string }> {
+    return this.requestLocal(
+      `${ML_BASE_URL}${pathname}`,
+      'application/json',
+      Buffer.from(JSON.stringify(payload), 'utf8'),
+      budgetMs
+    );
+  }
+
+  /**
+   * Local-first transcription (2026-10-31): POST the 16 kHz WAV straight to
+   * the local ml-serving FastAPI process — the SAME multipart contract the
+   * committed probe (`ml-serving/probe_local_service.mjs`) exercises. No
+   * Gemini contact anywhere in this path, no server resampling: the service
+   * decodes 16 kHz mono PCM WAV only. Any failure is THROWN honestly into
+   * this run's catch (audited `aiError`, Manual_Fallback_Draft template,
+   * never a reroute to Gemini).
+   */
+  private async mlTranscribe(
+    audioBuffer: Buffer,
+    language: 'ur' | 'en' | 'auto'
+  ): Promise<{ text: string; windows: number | null }> {
+    // Owner connectivity fix (2026-11-04): fail in ~2 s with an actionable
+    // message when the service is down, BEFORE uploading multi-megabyte
+    // payloads (an ECONNREFUSED never wastes the whole transcription budget).
+    await this.assertLocalServiceHealthy('transcribe');
+
+    // Owner transport fix (2026-11-04): undici's FIXED 300 s headersTimeout
+    // kills any minutes-long fetch (`UND_ERR_HEADERS_TIMEOUT`) and
+    // AbortSignal.timeout cannot raise that cap — the multipart upload rides
+    // node:http with the full budget enforced by req.setTimeout. The wire
+    // body is the SAME contract (audio + language) the committed probe sends.
+    let response: { status: number; body: string };
+    try {
+      response = await this.postMultipartLocal(
+        '/transcribe',
+        { language },
+        { field: 'audio', filename: 'consultation-16k.wav', contentType: 'audio/wav', bytes: audioBuffer },
+        ML_TRANSCRIBE_TIMEOUT_MS
+      );
+    } catch (err) {
+      const isBudgetTimeout = err instanceof Error && /^TIMEOUT_BUDGET_/.test(err.message);
+      // node:http errors carry a FLAT .code (ECONNREFUSED) — read it first;
+      // nested undici-style causes only exist on the fetch paths.
+      const causeCode = isBudgetTimeout
+        ? `processing-timeout (${err instanceof Error ? err.message : 'TIMEOUT_BUDGET'})`
+        : (err as NodeJS.ErrnoException).code ??
+          (err as { cause?: { code?: string } })?.cause?.code ??
+          'unknown';
+      console.error(`[VoxSOAP Engine] POST ${ML_BASE_URL}/transcribe failed (code=${causeCode}):`, err);
+      // A processing-timeout (the budget elapsing while the CPU decode ran)
+      // and a connection refusal are DISTINCT diagnoses: the first means the
+      // model was busy; the second means the process was never there.
+      const reason = isBudgetTimeout
+        ? `the local Whisper did not answer within the ${Math.round(ML_TRANSCRIBE_TIMEOUT_MS / 1000)} s budget (processing-timeout — this recording's 20 s chunk decode is slower than this budget on CPU)`
+        : `the local ML service at ${ML_BASE_URL} could not be reached (code=${causeCode})`;
+      throw new Error(
+        `Local ML transcription failed — ${reason}. Nothing was invented: restart both windows (start-voxsoap-local.bat) and retry by pressing ↻ Retry transcription (re-sends this exact file).`
+      );
+    }
+
+    let envelope: MlTranscribeEnvelope | null = null;
+    try {
+      envelope = JSON.parse(response.body) as MlTranscribeEnvelope;
+    } catch {
+      envelope = null;
+    }
+    if (response.status < 200 || response.status >= 300 || !envelope || envelope.ok !== true) {
+      const detail = (envelope?.message ?? envelope?.error ?? response.body).toString().slice(0, 240);
+      throw new Error(
+        `Local ML /transcribe answered HTTP ${response.status} (ok=${String(envelope?.ok)}): ${detail}`
+      );
+    }
+    const text = typeof envelope.text === 'string' ? envelope.text : '';
+    const windows = typeof envelope.windows === 'number' ? envelope.windows : null;
+    return { text, windows };
+  }
+
+  /**
+   * Owner Fix 2 (2026-11-01): the LOCAL vet-scribenote draft — the engine
+   * POSTs the transcript to the local ml-serving /draft with
+   * `format: "vet_scribenote"` (base-weights Qwen + hydrated 23-parameter
+   * objective) and returns the validated section object. Controlled errors
+   * are THROWN honestly; the caller's catch keeps the transcript verbatim
+   * (stashed mlLocalTranscript) in the deterministic template — never a
+   * silent reroute to Gemini in either direction.
+   */
+  private async mlLocalDraft(transcript: string): Promise<{
+    subjective: string;
+    objective_map: Record<string, unknown> | null;
+    objective_text: string;
+    assessment: string;
+    plan: string;
+  }> {
+    // Owner connectivity fix (2026-11-04): the same 2-second /health
+    // pre-check before the minutes-long draft POST (a dead service fails
+    // fast with the actionable message instead of burning the budget).
+    await this.assertLocalServiceHealthy('draft');
+
+    // Owner transport fix (2026-11-04): the draft rides node:http too — that
+    // is exactly where the live 5-min drill caught undici killing the call
+    // at 300 s (`UND_ERR_HEADERS_TIMEOUT`). Same budget semantics as the
+    // transcription call above.
+    let response: { status: number; body: string };
+    try {
+      response = await this.postJsonLocal('/draft', { transcript, format: 'vet_scribenote' }, ML_DRAFT_TIMEOUT_MS);
+    } catch (err) {
+      const isBudgetTimeout = err instanceof Error && /^TIMEOUT_BUDGET_/.test(err.message);
+      const causeCode = isBudgetTimeout
+        ? `processing-timeout (${err instanceof Error ? err.message : 'TIMEOUT_BUDGET'})`
+        : (err as NodeJS.ErrnoException).code ??
+          (err as { cause?: { code?: string } })?.cause?.code ??
+          'unknown';
+      console.error(`[VoxSOAP Engine] POST ${ML_BASE_URL}/draft failed (code=${causeCode}):`, err);
+      const reason = isBudgetTimeout
+        ? `the local SOAP model did not answer within the ${Math.round(
+            ML_DRAFT_TIMEOUT_MS / 1000
+          )} s budget (processing-timeout — not a connection refusal)`
+        : `the local ML service at ${ML_BASE_URL} could not be reached for /draft (code=${causeCode})`;
+      throw new Error(
+        `Local ML draft failed — ${reason}. Nothing was invented: the honest fallback template keeps the transcript verbatim for manual structuring; restart both windows (start-voxsoap-local.bat) and retry.`
+      );
+    }
+
+    let envelope: MlVetDraftEnvelope | null = null;
+    try {
+      envelope = JSON.parse(response.body) as MlVetDraftEnvelope;
+    } catch {
+      envelope = null;
+    }
+    if (response.status === 409) {
+      const detail = (envelope?.message ?? envelope?.error ?? response.body).toString().slice(0, 240);
+      throw new Error(
+        `Local ML /draft is busy — another draft is already in flight on this machine (single-flight guard, HTTP 409). ${detail} Wait for it to finish or cancel it in the ML Assistive Draft panel, then retry. Nothing was invented and nothing was rerouted.`
+      );
+    }
+    if (response.status < 200 || response.status >= 300 || !envelope || envelope.ok !== true) {
+      const detail = (envelope?.message ?? envelope?.error ?? response.body).toString().slice(0, 240);
+      throw new Error(
+        `Local ML /draft answered HTTP ${response.status} (ok=${String(envelope?.ok)}): ${detail}`
+      );
+    }
+    const sections = envelope.sections && typeof envelope.sections === 'object' ? envelope.sections : null;
+    if (!sections) {
+      throw new Error(
+        'Local ML /draft returned no structured sections — the vet_scribenote contract mismatch (a draft without sections is never mapped onto the cards).'
+      );
+    }
+    const str = (value: unknown): string => (typeof value === 'string' ? value : '');
+    return {
+      subjective: str(sections.subjective),
+      objective_map:
+        sections.objective_map && typeof sections.objective_map === 'object'
+          ? (sections.objective_map as Record<string, unknown>)
+          : null,
+      objective_text: str(sections.objective_text),
+      assessment: str(sections.assessment),
+      plan: str(sections.plan),
+    };
+  }
+
   private buildManualFallbackTemplate(rawText: string): GroundedSoapExtractionOutput {
     return {
       verbatim_transcript: rawText || '[Manual Fallback Mode: Audio/AI unavailable]',
       subjective: {
         pet_name: null,
         age_mentioned: null,
+        // Owner Fix 3 (2026-11-01): NO truncation — the presenting complaint
+        // and the grounded source quote carry the FULL verbatim transcript.
+        // The old slice(0, 160)/slice(0, 120) produced the mid-word cut ("How
+        // is Leo doing today? He looks like he got a lot of energy... Yeah, h")
+        // the owner reported; the whole transcript is now preserved and the
+        // workspace quote strip renders it verbatim.
         presenting_complaint: rawText
-          ? `Manual review required for transcript: ${rawText.slice(0, 160)}...`
+          ? `Manual review required for transcript: ${rawText}`
           : 'AI service unavailable. Please enter presenting complaint manually.',
         symptom_duration: null,
         previous_medical_history: null,
-        // No fake "grounded quote" on the fallback path: without a real
-        // transcript there is no verbatim text to cite, and with one the
-        // slice IS verbatim (then the UI's quote strip stays honest).
-        source_quote: rawText.slice(0, 120),
+        // Same honesty rule: no fake "grounded quote" on the fallback path;
+        // with a real transcript the FULL text is the verbatim quote.
+        source_quote: rawText,
       },
       objective: {
         temperature: null,

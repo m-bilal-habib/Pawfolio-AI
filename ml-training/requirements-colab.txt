@@ -1,0 +1,81 @@
+# Pinned Colab training dependencies for the VoxSOAP ML experiment
+# (feature/voxsoap-model-integration.md §7.1.5).
+#
+# Stage 2 (notebook) reads THIS FILE - single source of truth - and installs
+# with --only-binary=:all: so pip NEVER compiles anything from source on
+# Colab. Every pin below was verified on PyPI on 2026-10-24 to (a) exist and
+# (b) ship wheels usable on Colab's Python 3.13 manylinux x86_64 runtime:
+# pure-python py3-none-any, pyX-none-manylinux, cp313-cp313 manylinux, or
+# abi3. Registry-existence checks alone caught jiwer==3.1.1 and
+# librosa==0.10.4 (both never published); the WHEEL-TAG check caught
+# sentencepiece==0.2.0 (52 wheels, none beyond cp312 -> doomed source build
+# on py3.13, run 4).
+#
+# DELIBERATE ABSENCES (both runtime-owned on Colab, both guarded by Stage 2
+# PIN-GUARDs so they can never quietly re-enter this file):
+#   torch / torchao / protobuf - see the rationale below.
+
+transformers==4.48.3
+datasets==3.3.2
+accelerate==1.3.0
+peft==0.18.1
+evaluate==0.4.3
+jiwer==3.1.0
+librosa==0.10.2.post1
+soundfile==0.13.1
+sentencepiece==0.2.1
+bitsandbytes==0.49.2
+
+# Pin rationale (registry-verified on PyPI 2026-10-24, release dates in brackets):
+# - transformers 4.48.3 [2025-02] is contemporary with the 0.45.x bitsandbytes
+#   line; peft 0.18.1 [2026-01] is contemporary with the 0.49.x line.
+# - bitsandbytes: 0.45.0 -> 0.49.2 because Colab's torch is 2.11.0+cu130 and
+#   0.49.2 [2026-02] is the newest release from the peft-0.18.1 era. Its
+#   wheels are py3-none-manylinux_2_24 (abi-independent, py3.13-usable).
+#   STILL UNVERIFIED at runtime until Stage 12 runs QLoRA - if it fails,
+#   record the error and re-pin against the newest release (0.50.2 [2026-08]).
+# - librosa 0.10.2.post1 [2024-05]: 0.10.4 was never published on PyPI
+#   (registry 404; the line jumps 0.10.2.post1 -> 0.11.0), and the 1.0.0
+#   major [2026-08] is intentionally NOT pinned.
+# - soundfile 0.12.1 -> 0.13.1 [2025-01]: soundfile FLAC decode is proven
+#   live in notebook Stages 6/7 (runs 2-5) - runs 2-4 decoded on the
+#   runtime's PREINSTALLED soundfile (Stage 2 had failed first in those
+#   runs), run 5 decoded on the pinned 0.13.1. Wheels are
+#   py2.py3-none-manylinux_2_28 (py3.13-usable).
+# - sentencepiece 0.2.0 -> 0.2.1 [2025-08] [RUN-4 FIX]: 0.2.0's wheels stop
+#   at cp312, so Colab's py3.13 pip fell back to a C++/CMake source build,
+#   failed, and (pip being atomic per invocation) rolled back the WHOLE
+#   transaction - leaving jiwer/bitsandbytes uninstalled for Stages 8/12.
+#   0.2.1 ships cp313-cp313-manylinux_2_27.manylinux_2_28_x86_64 wheels
+#   (registry-verified; installed and verified live in run 5, Stage 2).
+#   0.2.2 [2026-07] is also verified, as a fallback.
+# - protobuf: RUNTIME-OWNED [RUN-5 FIX]. Colab's TensorFlow is compiled
+#   against its image's protobuf gencode (6.31.1 on the current image). Our
+#   5.29.3 pin downgraded the RUNTIME below that gencode major and the
+#   transformers Trainer import path crashed hard:
+#   "Detected mismatched Protobuf Gencode/Runtime major versions ... gencode
+#   6.31.1 runtime 5.29.3" (Stages 9/12, run 5). Registry check: NO pinned
+#   package requires protobuf as a RUNTIME dep (transformers/peft list it
+#   only under extras, which a plain `pip install -r` never installs), so
+#   leaving it unpinned keeps the working preinstalled pair. Stage 2
+#   hard-fails if protobuf ever reappears in this file, and records the
+#   runtime's protobuf version in the environment report.
+# - torchao is intentionally NOT pinned [RUN-4 FIX]: Colab preinstalls
+#   torchao==0.10.0, and peft 0.18.1 raises an unconditional ImportError
+#   (torchao<=0.16 unsupported) inside get_peft_model() even though this
+#   pipeline never imports torchao. Stage 2 uninstalls it and asserts
+#   absence BEFORE any peft import - we use bitsandbytes, not torchao.
+# - torch/torchaudio come from the Colab preinstalled GPU image; we do NOT
+#   pin them here to avoid breaking the preinstalled CUDA build.
+# - USE_TF=0 / USE_FLAX=0 are forced OFF at runtime (notebook cell 1 and the
+#   train/eval scripts, before any transformers import): transformers
+#   4.48.3 honors these env vars and the TF-availability gates are the only
+#   reason Colab's TensorFlow would ever be imported by this pipeline.
+#   (TRANSFORMERS_NO_TF is not a real flag in 4.48.3 - verified in source.)
+# - bitsandbytes is Linux/Colab-only (QLoRA). It is intentionally absent from
+#   any Windows/local requirements until a serving target is chosen (Phase 4).
+# - Transitive binaries verified py3.13 wheel-safe (2026-10-24): tokenizers
+#   0.21.x [cp39-abi3], rapidfuzz 3.14.x [cp313] (jiwer), msgpack 1.2.x
+#   [cp313] and soxr 1.1.x [cp312-abi3] (librosa), safetensors 0.8.x
+#   [cp310-abi3] (transformers), numba 0.68.x [cp313] (librosa, usually
+#   preinstalled/satisfied by floors). huggingface_hub is a pure wheel.

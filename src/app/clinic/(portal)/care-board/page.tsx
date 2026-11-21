@@ -1,11 +1,16 @@
 "use client";
 
 import { AnimatePresence, motion } from "framer-motion";
-import { Check, Clock, X } from "lucide-react";
+import { Check, Clock, Mic, X } from "lucide-react";
+import Link from "next/link";
 import { useState } from "react";
 import { CareTaskCard } from "@/components/cards";
 import { EmptyState, OwnerReportedLabel, staggerChild, staggerParent } from "@/components/ui";
-import { careOrders, careTasks } from "@/lib/data";
+import { careOrders, careTasks, pets } from "@/lib/data";
+
+function petIdForName(petName: string): string {
+  return pets.find((p) => p.name.toLowerCase() === petName.toLowerCase())?.id ?? "buddy";
+}
 
 const logIcon = {
   Given: Check,
@@ -24,19 +29,32 @@ export default function CareBoard() {
 
   return (
     <div className="space-y-6">
-      <div>
-        <h1 className="font-display text-3xl font-extrabold text-ink">Care Board</h1>
-        <p className="mt-1 text-sm text-muted">Confirmed care on the left, open work on the right.</p>
+      <div className="flex flex-wrap items-end justify-between gap-4">
+        <div>
+          <h1 className="font-display text-3xl font-extrabold text-ink">Care Board</h1>
+          <p className="mt-1 text-sm text-muted">Confirmed care on the left, open work on the right.</p>
+        </div>
+        <Link
+          href="/clinic/vox-soap"
+          className="inline-flex items-center gap-2 rounded-full border border-primary/50 bg-primary/10 px-4 py-2 text-xs font-bold text-primary-dark transition-colors hover:bg-primary hover:text-canvas"
+        >
+          <Mic className="h-3.5 w-3.5" />
+          Open VoxSOAP Scribe
+        </Link>
       </div>
 
       <div className="grid gap-6 xl:grid-cols-2">
         <motion.section variants={staggerParent} initial="hidden" animate="show" className="space-y-4">
           <h2 className="font-display text-lg font-bold text-ink">Confirmed care</h2>
-          {careOrders.map((o) => (
+          {careOrders.map((o) => {
+            const petId = petIdForName(o.petName);
+            return (
             <motion.div key={o.id} variants={staggerChild} className="rounded-2xl border border-line bg-surface p-5 shadow-sm">
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <p className="font-semibold text-ink">
-                  {o.petName}
+                  <Link href={`/clinic/patients/${petId}`} className="hover:text-primary-dark hover:underline">
+                    {o.petName}
+                  </Link>
                   <span className="ml-2 text-sm font-normal text-muted">{o.medicine}</span>
                 </p>
                 <span className="rounded-full bg-primary/10 px-2.5 py-0.5 text-xs font-semibold text-primary-dark">
@@ -64,7 +82,8 @@ export default function CareBoard() {
                 })}
               </ul>
             </motion.div>
-          ))}
+            );
+          })}
         </motion.section>
 
         <section className="space-y-4">

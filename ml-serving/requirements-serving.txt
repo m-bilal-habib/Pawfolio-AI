@@ -1,0 +1,17 @@
+# VoxSOAP ML serving - Phase 4 scaffold API layer.
+# Installable on any Python >= 3.11 (also on the current 32-bit 3.15, which is
+# used ONLY for the mocked contract tests - it cannot run real inference).
+fastapi>=0.110
+uvicorn>=0.29
+python-multipart>=0.0.9
+httpx>=0.27
+pytest>=8.0
+
+# ---- REAL INFERENCE layer (NOT here - this API install stays torch-free) ----
+# NOT installable under the 32-bit interpreter. Exact, verified pins live in
+# requirements-serving-ml.txt - INSTALL THAT FILE INSTEAD of letting pip
+# resolve a latest version: an unpinned `transformers>=4.44` resolve crashed
+# the real /draft gate on 2026-10-30 (BatchEncoding return-shape drift beyond
+# 4.48.3; the serving code now handles both shapes AND the runtime is pinned).
+# protobuf is intentionally NOT pinned here (runtime-owned dependency; see the
+# check_run9 / stage-2 notes in the feature contract reports).

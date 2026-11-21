@@ -88,7 +88,14 @@ function Navbar() {
           ))}
         </nav>
 
-        <div className="hidden items-center gap-3 lg:flex">
+        <div className="hidden items-center gap-2.5 lg:flex">
+          <Link
+            href="/clinic/login?next=/clinic/vox-soap"
+            className="inline-flex items-center gap-1.5 rounded-full border border-line bg-surface px-3.5 py-2 text-sm font-semibold text-primary-dark transition-colors hover:border-primary/60 hover:bg-primary/10"
+          >
+            <Mic className="h-3.5 w-3.5" />
+            VoxSOAP AI
+          </Link>
           <Link
             href="/clinic/login"
             className="rounded-full border border-primary/60 px-4 py-2 text-sm font-semibold text-primary-dark transition-colors hover:bg-primary hover:text-canvas"
@@ -132,15 +139,24 @@ function Navbar() {
                   {l.label}
                 </a>
               ))}
-              <div className="flex gap-3 pt-2">
+              <div className="flex flex-wrap gap-2 pt-2">
+                <Link
+                  href="/clinic/login?next=/clinic/vox-soap"
+                  onClick={() => setOpen(false)}
+                  className="w-full rounded-full border border-line bg-surface px-4 py-2 text-center text-sm font-semibold text-primary-dark"
+                >
+                  🎙️ Try VoxSOAP AI Scribe
+                </Link>
                 <Link
                   href="/clinic/login"
+                  onClick={() => setOpen(false)}
                   className="flex-1 rounded-full border border-primary/60 px-4 py-2 text-center text-sm font-semibold text-primary-dark"
                 >
                   Clinic Login
                 </Link>
                 <Link
                   href="/owner/login"
+                  onClick={() => setOpen(false)}
                   className="flex-1 rounded-full bg-accent px-4 py-2 text-center text-sm font-semibold text-canvas"
                 >
                   Pet Owner Login
@@ -379,16 +395,23 @@ function Hero() {
             </div>
 
             <div className="mt-9 flex flex-wrap gap-3">
-              <a
-                href="#how-it-works"
+              <Link
+                href="/clinic/login?next=/clinic/vox-soap"
                 className="inline-flex items-center gap-2 rounded-full bg-primary px-6 py-3 text-sm font-bold text-canvas transition-all hover:gap-3 hover:bg-primary-dark"
               >
-                See how it works
+                <Mic className="h-4 w-4" />
+                Try VoxSOAP AI Scribe
                 <ArrowRight className="h-4 w-4" />
+              </Link>
+              <a
+                href="#how-it-works"
+                className="inline-flex items-center gap-2 rounded-full border border-primary/50 px-5 py-3 text-sm font-semibold text-primary-dark transition-colors hover:bg-primary/10"
+              >
+                See how it works
               </a>
               <a
                 href="#patients"
-                className="inline-flex items-center gap-2 rounded-full border border-line px-6 py-3 text-sm font-semibold text-muted transition-colors hover:border-primary/50 hover:text-ink"
+                className="inline-flex items-center gap-2 rounded-full border border-line px-5 py-3 text-sm font-semibold text-muted transition-colors hover:border-primary/50 hover:text-ink"
               >
                 Meet the patients
               </a>
@@ -995,13 +1018,22 @@ function Portals() {
                 </li>
               ))}
             </ul>
-            <Link
-              href="/clinic/login"
-              className="mt-8 inline-flex items-center gap-2 rounded-full bg-primary px-6 py-3 text-sm font-bold text-canvas transition-all hover:gap-3 hover:bg-primary-dark"
-            >
-              Open the clinic portal
-              <ArrowRight className="h-4 w-4" />
-            </Link>
+            <div className="mt-8 flex flex-wrap items-center gap-3">
+              <Link
+                href="/clinic/login"
+                className="inline-flex items-center gap-2 rounded-full bg-primary px-6 py-3 text-sm font-bold text-canvas transition-all hover:gap-3 hover:bg-primary-dark"
+              >
+                Open the clinic portal
+                <ArrowRight className="h-4 w-4" />
+              </Link>
+              <Link
+                href="/clinic/login?next=/clinic/vox-soap"
+                className="inline-flex items-center gap-2 rounded-full border border-primary/50 px-5 py-3 text-sm font-semibold text-primary-dark transition-colors hover:bg-primary/10"
+              >
+                <Mic className="h-4 w-4" />
+                Try VoxSOAP AI Scribe
+              </Link>
+            </div>
           </motion.div>
 
           <motion.div
@@ -1222,13 +1254,26 @@ function Footer() {
 
           <div>
             <p className="font-display text-sm font-bold tracking-widest text-ink uppercase">
-              Principles
+              Portals &amp; Principles
             </p>
             <ul className="mt-4 space-y-2.5 text-sm text-muted">
-              <li>AI drafts, the veterinarian decides</li>
-              <li>Care schedules come from fixed rules</li>
+              <li>
+                <Link href="/clinic/login" className="font-semibold text-primary-dark hover:underline">
+                  Clinic Portal →
+                </Link>
+              </li>
+              <li>
+                <Link href="/clinic/login?next=/clinic/vox-soap" className="font-semibold text-primary-dark hover:underline">
+                  VoxSOAP AI Scribe →
+                </Link>
+              </li>
+              <li>
+                <Link href="/owner/login" className="font-semibold text-accent-dark hover:underline">
+                  Pet Owner Portal →
+                </Link>
+              </li>
+              <li className="pt-1">AI drafts, the veterinarian decides</li>
               <li>Every record labelled, versioned and audited</li>
-              <li>Access checked on every request, by role</li>
             </ul>
           </div>
         </div>

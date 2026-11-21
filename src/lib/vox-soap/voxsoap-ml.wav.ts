@@ -1,0 +1,457 @@
+// File: d:\Pawfolio AI\src\lib\vox-soap\voxsoap-ml.wav.ts
+
+/**
+ * Phase 5 capture utility for the LOCAL VoxSOAP ML service.
+ *
+ * The ML contract is HARD: browser audio must arrive as 16 kHz mono PCM WAV
+ * (the FastAPI app rejects every other rate with an honest 400 and NEVER
+ * resamples server-side — ml-serving/app.py). Resampling therefore lives
+ * CLIENT-side:
+ *
+ *   1. the AudioContext is created with `sampleRate: 16000` so most browsers
+ *      deliver native 16 kHz Float32 frames through an AudioWorklet;
+ *   2. browsers that cannot be forced to 16 kHz record at the device rate and
+ *      the samples are resampled with an OfflineAudioContext BEFORE encoding.
+ *
+ * The encoder writes a canonical 44-byte PCM WAV header (s16le, mono). Pure
+ * functions are exported separately so tests can encode without a mic.
+ */
+
+const TARGET_SAMPLE_RATE = 16_000;
+
+export const VOXSOAP_TARGET_SAMPLE_RATE = TARGET_SAMPLE_RATE;
+
+/** Accepted upload containers for the ML upload path (normalized base MIME).
+ * Mirrors the browser-decodable set: whatever Chrome can decodeAudioData is
+ * fair game, because the pipeline below canonically re-encodes to 16 kHz
+ * mono PCM WAV before upload. */
+const ACCEPTED_UPLOAD_MIMES = new Set([
+  'audio/wav',
+  'audio/x-wav',
+  'audio/mp3',
+  'audio/mpeg',
+  'audio/mp4',
+  'audio/x-m4a',
+  'audio/webm',
+  'audio/ogg',
+  'audio/opus',
+  'audio/aac',
+  'audio/flac',
+]);
+
+/** Extension fallback for files whose File.type is empty or the generic
+ * application/octet-stream bucket (Windows registry gaps on .m4a/.aac). */
+const UPLOAD_EXT_TO_MIME: Record<string, string> = {
+  wav: 'audio/wav',
+  wave: 'audio/wav',
+  mp3: 'audio/mp3',
+  webm: 'audio/webm',
+  ogg: 'audio/ogg',
+  oga: 'audio/ogg',
+  opus: 'audio/ogg',
+  mp4: 'audio/mp4',
+  m4a: 'audio/mp4',
+  aac: 'audio/aac',
+  flac: 'audio/flac',
+};
+
+/** Strips codec/registry parameters ("audio/webm;codecs=opus" → "audio/webm")
+ * and canonicalizes vendor wave aliases — mirrors normalizeAudioMime in the
+ * /extract route and normalizeMime in UploadAudioPanel. */
+export function normalizeAudioMime(rawMime: string): string {
+  const base = rawMime.split(';')[0].trim().toLowerCase();
+  return base === 'audio/wave' || base === 'audio/vnd.wave' ? 'audio/wav' : base;
+}
+
+/** Resolves an uploaded File's audio type: reported MIME first (parameter-
+ * stripped), extension ONLY when the type carried no information. Returns
+ * null when NEITHER answers the accepted set — the caller rejects honestly. */
+export function resolveUploadAudioMime(file: File): string | null {
+  const reported = normalizeAudioMime(file.type);
+  if (ACCEPTED_UPLOAD_MIMES.has(reported)) return reported;
+  const fileExt = (file.name.split('.').pop() ?? '').toLowerCase();
+  if ((reported === '' || reported === 'application/octet-stream') && fileExt in UPLOAD_EXT_TO_MIME) {
+    return UPLOAD_EXT_TO_MIME[fileExt];
+  }
+  return null;
+}
+
+/** Rough deliverable size in bytes for a given duration at 16 kHz s16le mono
+ * (32,000 B/s — the same math the panel uses for its size guard). */
+export function pcm16kBytesForSeconds(seconds: number): number {
+  return Math.max(0, Math.round(seconds * TARGET_SAMPLE_RATE * 2));
+}
+
+export function pcm16kSecondsForBytes(bytes: number): number {
+  return bytes / (TARGET_SAMPLE_RATE * 2);
+}
+
+/** Encodes accumulated Float32 sample chunks as 16-bit PCM mono WAV. */
+export function encodeWavMono16(chunks: Float32Array[], sampleRate: number): Blob {
+  let frames = 0;
+  for (const chunk of chunks) frames += chunk.length;
+  const dataBytes = frames * 2;
+  const buffer = new ArrayBuffer(44 + dataBytes);
+  const view = new DataView(buffer);
+  const ascii = (offset: number, text: string) => {
+    for (let i = 0; i < text.length; i += 1) view.setUint8(offset + i, text.charCodeAt(i));
+  };
+  ascii(0, 'RIFF');
+  view.setUint32(4, 36 + dataBytes, true);
+  ascii(8, 'WAVE');
+  ascii(12, 'fmt ');
+  view.setUint32(16, 16, true); // PCM fmt chunk size
+  view.setUint16(20, 1, true); // audio format: PCM
+  view.setUint16(22, 1, true); // channels: mono
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true); // byte rate
+  view.setUint16(32, 2, true); // block align
+  view.setUint16(34, 16, true); // bits per sample
+  ascii(36, 'data');
+  view.setUint32(40, dataBytes, true);
+  let offset = 44;
+  for (const chunk of chunks) {
+    for (let i = 0; i < chunk.length; i += 1) {
+      const sample = Math.max(-1, Math.min(1, chunk[i]));
+      view.setInt16(offset, sample < 0 ? sample * 0x8000 : sample * 0x7fff, true);
+      offset += 2;
+    }
+  }
+  return new Blob([buffer], { type: 'audio/wav' });
+}
+
+function mergeChunks(chunks: Float32Array[]): Float32Array {
+  let frames = 0;
+  for (const chunk of chunks) frames += chunk.length;
+  const merged = new Float32Array(frames);
+  let offset = 0;
+  for (const chunk of chunks) {
+    merged.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return merged;
+}
+
+export interface WavSignalAnalysis {
+  byteSize: number;
+  sampleCount: number;
+  durationSeconds: number;
+  rms: number;
+  peak: number;
+  isSilent: boolean;
+  isTooShort: boolean;
+}
+
+const SILENT_PEAK_THRESHOLD = 0.002;
+const SILENT_RMS_THRESHOLD = 0.0005;
+const MIN_CLIP_SECONDS = 0.5;
+
+/** Compute peak, RMS and duration directly from Float32 PCM chunks. */
+export function analyzePcmSamples(
+  chunks: Float32Array[],
+  sampleRate: number
+): WavSignalAnalysis {
+  let sampleCount = 0;
+  let sumSq = 0;
+  let peak = 0;
+  for (const chunk of chunks) {
+    sampleCount += chunk.length;
+    for (let i = 0; i < chunk.length; i += 1) {
+      const abs = Math.abs(chunk[i]);
+      if (abs > peak) peak = abs;
+      sumSq += chunk[i] * chunk[i];
+    }
+  }
+  const rms = sampleCount > 0 ? Math.sqrt(sumSq / sampleCount) : 0;
+  const durationSeconds = sampleRate > 0 ? sampleCount / sampleRate : 0;
+  const isSilent = sampleCount === 0 || (peak < SILENT_PEAK_THRESHOLD && rms < SILENT_RMS_THRESHOLD);
+  const isTooShort = durationSeconds < MIN_CLIP_SECONDS;
+  return {
+    byteSize: 44 + sampleCount * 2,
+    sampleCount,
+    durationSeconds: Number(durationSeconds.toFixed(2)),
+    rms: Number(rms.toFixed(5)),
+    peak: Number(peak.toFixed(5)),
+    isSilent,
+    isTooShort,
+  };
+}
+
+/** Verify an encoded 16 kHz mono 16-bit PCM WAV Blob has >44 bytes, >=0.5s duration, and non-zero signal. */
+export async function analyzeWavBlob(wav: Blob): Promise<WavSignalAnalysis> {
+  if (wav.size <= 44) {
+    return {
+      byteSize: wav.size,
+      sampleCount: 0,
+      durationSeconds: 0,
+      rms: 0,
+      peak: 0,
+      isSilent: true,
+      isTooShort: true,
+    };
+  }
+  const buf = await wav.arrayBuffer();
+  const view = new DataView(buf);
+  const sampleRate = view.byteLength >= 28 ? view.getUint32(24, true) || TARGET_SAMPLE_RATE : TARGET_SAMPLE_RATE;
+  const dataBytes = Math.max(0, view.byteLength - 44);
+  const sampleCount = Math.floor(dataBytes / 2);
+  let sumSq = 0;
+  let peak = 0;
+  for (let i = 0; i < sampleCount; i += 1) {
+    const s = view.getInt16(44 + i * 2, true) / 32768;
+    const abs = Math.abs(s);
+    if (abs > peak) peak = abs;
+    sumSq += s * s;
+  }
+  const rms = sampleCount > 0 ? Math.sqrt(sumSq / sampleCount) : 0;
+  const durationSeconds = sampleRate > 0 ? sampleCount / sampleRate : 0;
+  return {
+    byteSize: wav.size,
+    sampleCount,
+    durationSeconds: Number(durationSeconds.toFixed(2)),
+    rms: Number(rms.toFixed(5)),
+    peak: Number(peak.toFixed(5)),
+    isSilent: sampleCount === 0 || (peak < SILENT_PEAK_THRESHOLD && rms < SILENT_RMS_THRESHOLD),
+    isTooShort: durationSeconds < MIN_CLIP_SECONDS,
+  };
+}
+
+export interface Pcm16CaptureOptions {
+  /** Optional real-time RMS/peak level callback for VU metering (throttled per audio frame). */
+  onLevel?: (rms: number, peak: number) => void;
+}
+
+export interface Pcm16CaptureHandle {
+  /** Actual rate of the capture context — 16 kHz when the browser honoured
+   * the forced rate, otherwise the device rate (resampled before upload). */
+  readonly contextSampleRate: number;
+  /** Capture backend selected at start ('worklet' | 'script-processor'). */
+  readonly captureMode: 'worklet' | 'script-processor';
+  setPaused: (paused: boolean) => void;
+  /** Stops capture, resamples if needed, and returns the 16 kHz PCM WAV.
+   * Throws honestly (no fabricated silence) when nothing was captured. */
+  stop: () => Promise<Blob>;
+  /** Drops everything and releases the AudioContext (mic tracks live in the
+   * caller's MediaStream, same as the Gemini-flow panels). */
+  cancel: () => void;
+}
+
+/** Decodes ANY browser-decodable audio container (WAV / MP3 / M4A / WebM /
+ * OGG / FLAC …), mixes every channel down to mono, resamples to 16 kHz via
+ * an OfflineAudioContext, and encodes the canonical 16-bit PCM mono WAV the
+ * ML contract requires (client-side resample only — the server never
+ * resamples). Throws honestly when the browser cannot decode the container —
+ * no silence is fabricated. */
+export async function decodeAndResampleToWav16k(file: File): Promise<Blob> {
+  if (typeof window === 'undefined') {
+    throw new Error('Audio upload decoding is a browser-only API.');
+  }
+  const Ctor =
+    window.AudioContext ??
+    (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+  if (!Ctor) {
+    throw new Error('The Web Audio API is unavailable in this browser — the uploaded file was NOT processed.');
+  }
+  const decodeContext = new Ctor();
+  try {
+    const arrayBuffer = await file.arrayBuffer();
+    let decoded: AudioBuffer;
+    try {
+      decoded = await decodeContext.decodeAudioData(arrayBuffer);
+    } catch {
+      const reported = normalizeAudioMime(file.type) || 'unknown type';
+      throw new Error(
+        `The browser could not decode this file (${reported}). Export the consultation as WAV, MP3, M4A, WebM or OGG and retry — nothing was invented.`
+      );
+    }
+    const frames = decoded.length;
+    if (frames === 0) {
+      throw new Error('The uploaded file decoded to zero samples — nothing was uploaded, nothing invented.');
+    }
+    // Mono mixdown: average every channel into one stream.
+    const channelCount = Math.max(1, decoded.numberOfChannels);
+    const mono = new Float32Array(frames);
+    for (let ch = 0; ch < channelCount; ch += 1) {
+      const data = decoded.getChannelData(ch);
+      for (let i = 0; i < frames; i += 1) mono[i] += data[i] / channelCount;
+    }
+    const decodedRate = decoded.sampleRate;
+    if (decodedRate === TARGET_SAMPLE_RATE) {
+      return encodeWavMono16([mono], TARGET_SAMPLE_RATE);
+    }
+    // Resample client-side via an OfflineAudioContext (exact same recipe the
+    // live-capture stop() path uses) so the 16 kHz contract holds.
+    const frameCount = Math.max(1, Math.ceil((frames / decodedRate) * TARGET_SAMPLE_RATE));
+    const offline = new OfflineAudioContext(1, frameCount, TARGET_SAMPLE_RATE);
+    const scratch = offline.createBuffer(1, frames, decodedRate);
+    scratch.getChannelData(0).set(mono);
+    const source = offline.createBufferSource();
+    source.buffer = scratch;
+    source.connect(offline.destination);
+    source.start();
+    const rendered = await offline.startRendering();
+    return encodeWavMono16([rendered.getChannelData(0)], TARGET_SAMPLE_RATE);
+  } finally {
+    void decodeContext.close().catch(() => undefined);
+  }
+}
+
+/** Starts capturing `stream` as Float32 chunks via AudioWorkletNode with automatic
+ * ScriptProcessorNode fallback. Caller owns the MediaStream lifecycle. */
+export async function startPcm16Capture(
+  stream: MediaStream,
+  options?: Pcm16CaptureOptions
+): Promise<Pcm16CaptureHandle> {
+  if (typeof window === 'undefined') {
+    throw new Error('Microphone capture is a browser-only API.');
+  }
+  const Ctor =
+    window.AudioContext ??
+    (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+  if (!Ctor) {
+    throw new Error('The Web Audio API is unavailable in this browser.');
+  }
+
+  let context: AudioContext;
+  try {
+    context = new Ctor({ sampleRate: TARGET_SAMPLE_RATE });
+  } catch {
+    // Some engines reject forced rates outright — record at the device rate;
+    // the stop() path resamples to 16 kHz before encoding.
+    context = new Ctor();
+  }
+  // Explicitly resume inside user gesture so Chrome/Edge Windows drivers start delivering frames.
+  if (context.state !== 'running') {
+    await context.resume();
+  }
+
+  const source = context.createMediaStreamSource(stream);
+  // Zero-gain tap into the destination keeps the pull-chain alive across
+  // engines while guaranteeing no monitoring echo leaves the machine.
+  const muter = context.createGain();
+  muter.gain.value = 0;
+
+  const chunks: Float32Array[] = [];
+  let paused = false;
+  let stopped = false;
+
+  const pushFrame = (samples: Float32Array) => {
+    if (stopped || paused || samples.length === 0) return;
+    chunks.push(samples);
+    if (options?.onLevel) {
+      let sumSq = 0;
+      let peak = 0;
+      for (let i = 0; i < samples.length; i += 1) {
+        const s = samples[i];
+        const abs = Math.abs(s);
+        if (abs > peak) peak = abs;
+        sumSq += s * s;
+      }
+      options.onLevel(Math.sqrt(sumSq / samples.length), peak);
+    }
+  };
+
+  let captureMode: 'worklet' | 'script-processor' = 'worklet';
+  let worklet: AudioWorkletNode | null = null;
+  let processorNode: ScriptProcessorNode | null = null;
+
+  try {
+    if (!context.audioWorklet) throw new Error('AudioWorklet unsupported');
+    await context.audioWorklet.addModule('/worklets/pcm-recorder.js');
+    worklet = new AudioWorkletNode(context, 'pcm-recorder');
+    worklet.port.onmessage = (event: MessageEvent) => {
+      const data = event.data;
+      if (data instanceof ArrayBuffer && data.byteLength > 0) {
+        pushFrame(new Float32Array(data));
+      } else if (data instanceof Float32Array && data.length > 0) {
+        pushFrame(data);
+      }
+    };
+    source.connect(worklet);
+    worklet.connect(muter);
+    muter.connect(context.destination);
+  } catch {
+    // Clean deterministic fallback if AudioWorklet registration fails in this browser/origin.
+    captureMode = 'script-processor';
+    processorNode = context.createScriptProcessor(4096, 1, 1);
+    processorNode.onaudioprocess = (event: AudioProcessingEvent) => {
+      const channel = event.inputBuffer.getChannelData(0);
+      if (channel && channel.length > 0) {
+        pushFrame(channel.slice(0));
+      }
+    };
+    source.connect(processorNode);
+    processorNode.connect(muter);
+    muter.connect(context.destination);
+  }
+
+  const teardown = () => {
+    if (stopped && context.state === 'closed') return;
+    stopped = true;
+    try {
+      if (worklet) {
+        worklet.port.onmessage = null;
+        source.disconnect(worklet);
+        worklet.disconnect(muter);
+      }
+      if (processorNode) {
+        processorNode.onaudioprocess = null;
+        source.disconnect(processorNode);
+        processorNode.disconnect(muter);
+      }
+      muter.disconnect(context.destination);
+    } catch {
+      // Graph already torn down by close() — non-fatal.
+    }
+    if (context.state !== 'closed') {
+      void context.close().catch(() => undefined);
+    }
+  };
+
+  const encode = async (): Promise<Blob> => {
+    const deviceRate = context.sampleRate;
+    if (chunks.length === 0) {
+      throw new Error('No audio samples were captured — nothing was uploaded, nothing invented.');
+    }
+    let wav: Blob;
+    if (deviceRate === TARGET_SAMPLE_RATE) {
+      wav = encodeWavMono16(chunks, TARGET_SAMPLE_RATE);
+    } else {
+      // Browser could not deliver native 16 kHz: resample CLIENT-side via an
+      // OfflineAudioContext (the ML service contract stays untouched).
+      const merged = mergeChunks(chunks);
+      const frameCount = Math.max(1, Math.ceil((merged.length / deviceRate) * TARGET_SAMPLE_RATE));
+      const offline = new OfflineAudioContext(1, frameCount, TARGET_SAMPLE_RATE);
+      const audioBuffer = offline.createBuffer(1, merged.length, deviceRate);
+      audioBuffer.getChannelData(0).set(merged);
+      const bufferSource = offline.createBufferSource();
+      bufferSource.buffer = audioBuffer;
+      bufferSource.connect(offline.destination);
+      bufferSource.start();
+      const rendered = await offline.startRendering();
+      wav = encodeWavMono16([rendered.getChannelData(0)], TARGET_SAMPLE_RATE);
+    }
+    if (wav.size <= 44) {
+      throw new Error('Recorded WAV buffer contained no audio payload (<= 44 bytes) — check your microphone.');
+    }
+    return wav;
+  };
+
+  return {
+    get contextSampleRate() {
+      return context.sampleRate;
+    },
+    get captureMode() {
+      return captureMode;
+    },
+    setPaused(nextPaused: boolean) {
+      paused = Boolean(nextPaused);
+    },
+    stop: async () => {
+      const blob = await encode();
+      teardown();
+      return blob;
+    },
+    cancel: () => teardown(),
+  };
+}

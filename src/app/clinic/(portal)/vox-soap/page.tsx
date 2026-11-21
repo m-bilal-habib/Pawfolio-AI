@@ -7,6 +7,36 @@ export const metadata = {
   description: 'Voice & audio → verbatim-grounded SOAP notes, order verification & care cards',
 };
 
-export default function ClinicVoxSoapPage() {
-  return <VoxSoapWorkspace defaultPetId="pet-leo-001"/>;
+type SearchParams = Promise<{
+  petId?: string | string[];
+  visitId?: string | string[];
+  action?: string | string[];
+}>;
+
+function firstParam(val: string | string[] | undefined): string | undefined {
+  if (Array.isArray(val)) return val[0];
+  return val;
+}
+
+export default async function ClinicVoxSoapPage({
+  searchParams,
+}: {
+  searchParams?: SearchParams;
+}) {
+  const resolved = (await searchParams) ?? {};
+  const petId = firstParam(resolved.petId)?.trim() || 'pet-leo-001';
+  const visitId = firstParam(resolved.visitId)?.trim() || undefined;
+  const actionRaw = firstParam(resolved.action)?.trim();
+  const initialAction =
+    actionRaw === 'record' || actionRaw === 'upload' || actionRaw === 'ml-assist'
+      ? actionRaw
+      : undefined;
+
+  return (
+    <VoxSoapWorkspace
+      defaultPetId={petId}
+      initialVisitId={visitId}
+      initialAction={initialAction}
+    />
+  );
 }
